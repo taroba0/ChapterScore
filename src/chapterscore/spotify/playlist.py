@@ -147,14 +147,16 @@ def create_playlist_from_tracks(
             hint="Try a different lyrics mode or overall mode for broader search results.",
         )
 
-    # Pre-flight scope check (token cache)
+    # Pre-flight scope check against CLI file token when present.
+    # Web session tokens may not write the file cache — skip if empty.
     granted = token_scopes()
     if granted and not has_playlist_permission(granted):
         raise SpotifyAPIError(
             "Spotify token is missing playlist-modify scopes.",
             hint=(
                 f"Granted: {', '.join(granted) or '(none)'}\n"
-                "Run: chapterscore logout && chapterscore auth --force"
+                "CLI: chapterscore logout && chapterscore auth --force\n"
+                "Web: click Login with Spotify again and accept all permissions."
             ),
         )
     missing = missing_scopes(granted) if granted else []

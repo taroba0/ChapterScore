@@ -17,6 +17,8 @@ from chapterscore.models import (
     PlaylistResult,
     RankedTrack,
 )
+import spotipy
+
 from chapterscore.spotify.auth import get_spotify
 from chapterscore.spotify.playlist import build_playlist_description, create_playlist_from_tracks
 from chapterscore.spotify.selection import select_tracks_for_analysis
@@ -52,12 +54,16 @@ def generate_playlist(
     dry_run: bool = False,
     use_cache: bool = True,
     progress: ProgressCb = _noop,
+    spotify_client: spotipy.Spotify | None = None,
 ) -> GenerateResult:
     """
     Full ChapterScore pipeline.
 
     If dry_run=True, skips Spotify auth/playlist creation and only returns
     book + analysis (useful for testing analysis without credentials).
+
+    ``spotify_client``: optional pre-authenticated client (e.g. from Streamlit
+    browser OAuth). When omitted, uses CLI file-token auth via ``get_spotify()``.
     """
     settings = get_settings()
 
@@ -84,7 +90,7 @@ def generate_playlist(
         return GenerateResult(book=book, analysis=analysis, tracks=[])
 
     progress("Connecting to Spotify…")
-    sp = get_spotify()
+    sp = spotify_client if spotify_client is not None else get_spotify()
 
     n_overall = tracks or settings.chapterscore_tracks_overall
     n_chapter = tracks_per_chapter or settings.chapterscore_tracks_per_chapter

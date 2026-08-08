@@ -39,7 +39,11 @@ class Settings(BaseSettings):
     # Spotify
     spotify_client_id: str = ""
     spotify_client_secret: str = ""
+    # CLI OAuth local callback (spotipy opens a tiny server on this URI)
     spotify_redirect_uri: str = "http://127.0.0.1:8888/callback"
+    # Web OAuth redirect — Streamlit app origin (e.g. https://your-app.streamlit.app/)
+    # If empty, the web UI auto-detects from request headers / localhost:8501
+    spotify_web_redirect_uri: str = ""
     # Base scopes; auth.required_scope_string() always merges REQUIRED_SCOPES on top.
     spotify_scope: str = (
         "playlist-modify-public playlist-modify-private "

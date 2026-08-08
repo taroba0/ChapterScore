@@ -84,7 +84,7 @@ chapterscore doctor          # check config + network
 chapterscore auth --force    # browser OAuth (accept all playlist scopes)
 ```
 
-### 4a. Web UI
+### 4a. Web UI (browser Spotify login)
 
 ```bash
 cd ChapterScore
@@ -93,6 +93,10 @@ streamlit run web/app.py
 ```
 
 Open the URL Streamlit prints (usually **http://localhost:8501**).
+
+1. Click **Login with Spotify** (sidebar or main page).
+2. Approve the scopes on Spotify’s site.
+3. You return to the app logged in — generate a real playlist.
 
 | Field | Notes |
 |--------|--------|
@@ -103,9 +107,42 @@ Open the URL Streamlit prints (usually **http://localhost:8501**).
 | Minimum hours | Default `1.5` (set `0` to disable) |
 | Dry run | Analyze only — no Spotify write |
 
-Click **Generate Playlist**. Progress updates live; when finished you’ll see the playlist name, track count, vibe summary, and a Spotify link.
+#### Spotify Redirect URIs (required)
 
-> Spotify OAuth is still done via the CLI (`chapterscore auth --force`). The web app reuses that cached token.
+In [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) → your app → **Settings** → **Redirect URIs**, add **all** that you use:
+
+| Environment | Redirect URI (exact) |
+|-------------|----------------------|
+| CLI | `http://127.0.0.1:8888/callback` |
+| Web local | `http://localhost:8501/` |
+| Web local (alt) | `http://127.0.0.1:8501/` |
+| Streamlit Cloud | `https://YOUR-APP-NAME.streamlit.app/` |
+
+The sidebar shows the exact redirect URI the app will use. **Trailing slash matters** — copy it exactly.
+
+#### Streamlit Community Cloud secrets
+
+**App settings → Secrets** (TOML):
+
+```toml
+SPOTIFY_CLIENT_ID = "..."
+SPOTIFY_CLIENT_SECRET = "..."
+XAI_API_KEY = "..."
+
+# Recommended: pin the cloud redirect so it never drifts
+SPOTIFY_WEB_REDIRECT_URI = "https://YOUR-APP-NAME.streamlit.app/"
+```
+
+Also add your Spotify account under the app’s **User Management** allowlist (Development mode).
+
+#### Test login on the deployed site
+
+1. Open `https://YOUR-APP-NAME.streamlit.app/`
+2. Confirm the sidebar **Redirect URI** matches a URI in the Spotify Dashboard
+3. Click **Login with Spotify** → approve → land back on the app with “Logged in as …”
+4. Generate a playlist (dry-run off) → open the Spotify link
+
+Web tokens live in `st.session_state` for the browser session only (refresh token is used to renew access). CLI file-token auth is unchanged.
 
 ### 4b. CLI
 
