@@ -67,3 +67,26 @@ def test_enforce_lyrics_yes_clears_high_instrumentalness():
     )
     fixed = _enforce_lyrics_preference(analysis, LyricsPreference.YES)
     assert fixed.overall_search_queries[0].instrumentalness_min is None
+
+
+def test_enforce_anti_generic_fills_avoid_styles():
+    from chapterscore.models import EmotionalAct
+
+    analysis = BookVibeAnalysis(
+        book_title="X",
+        overall_mood="intimate",
+        overall_energy=0.3,
+        anti_generic_notes=["NOT epic battle music", "NOT trailer orchestra"],
+        avoid_styles=[],
+        emotional_acts=[
+            EmotionalAct(act_id=1, label="Open", mood="quiet", energy_level=0.3),
+        ],
+        overall_search_queries=[
+            SearchQuerySpec(query="quiet piano", energy=0.3),
+        ],
+    )
+    fixed = _enforce_lyrics_preference(analysis, LyricsPreference.INSTRUMENTAL_ONLY)
+    assert fixed.avoid_styles
+    assert any("epic" in s.lower() or "battle" in s.lower() for s in fixed.avoid_styles)
+    # Act queries also get instrumental floor
+    assert fixed.overall_search_queries[0].instrumentalness_min >= 0.75

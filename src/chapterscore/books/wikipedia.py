@@ -106,11 +106,14 @@ def fetch_wikipedia_plot(
         if not page_title:
             return "", [], None
 
-        # Get plain-text extracts for plot-like sections via parse API
-        plot = _extract_plot_sections(client, page_title)
+        plot = _extract_sections_by_pattern(
+            client,
+            page_title,
+            r"^(plot|synopsis|summary|overview|story|premise|storyline)",
+            max_chars=12000,
+        )
         chapters = _extract_chapters_from_html(client, page_title)
 
-        # Always grab a lead summary as fallback
         if not plot:
             try:
                 summary = get_json(
@@ -130,8 +133,73 @@ def fetch_wikipedia_plot(
             client.close()
 
 
-def _extract_plot_sections(client: httpx.Client, page_title: str) -> str:
-    """Pull Plot / Synopsis / Summary section plain text."""
+def fetch_wikipedia_enrichment(
+    book_title: str,
+    author: str | None = None,
+    *,
+    client: httpx.Client | None = None,
+    page_title: str | None = None,
+) -> dict[str, str]:
+    """
+    Pull Reception / Themes / Style / Background sections for literary texture.
+
+    Returns dict with optional keys: reception, themes, background, lead.
+    """
+    own_client = client is None
+    client = client or create_client()
+    try:
+        page = page_title or search_wikipedia_page(client, book_title, author)
+        if not page:
+            return {}
+        out: dict[str, str] = {}
+        reception = _extract_sections_by_pattern(
+            client,
+            page,
+            r"^(reception|critical\s+reception|critical\s+response|reviews?|"
+            r"literary\s+significance|awards|accolades|legacy)",
+            max_chars=8000,
+        )
+        themes = _extract_sections_by_pattern(
+            client,
+            page,
+            r"^(themes?|analysis|style|structure|characters?|setting|"
+            r"writing\s+style|narrative|motifs?|symbols?|background|development|"
+            r"publication|composition|influences?)",
+            max_chars=8000,
+        )
+        if reception:
+            out["reception"] = reception
+        if themes:
+            out["themes"] = themes
+        try:
+            summary = get_json(
+                client,
+                REST_SUMMARY.format(title=page.replace(" ", "_")),
+            )
+            if isinstance(summary, dict) and summary.get("extract"):
+                out["lead"] = summary["extract"]
+                if summary.get("description"):
+                    out["wiki_description"] = str(summary["description"])
+        except Exception:
+            pass
+        return out
+    except Exception as exc:
+        logger = __import__("logging").getLogger(__name__)
+        logger.debug("Wikipedia enrichment failed: %s", exc)
+        return {}
+    finally:
+        if own_client:
+            client.close()
+
+
+def _extract_sections_by_pattern(
+    client: httpx.Client,
+    page_title: str,
+    pattern: str,
+    *,
+    max_chars: int = 12000,
+) -> str:
+    """Pull matching Wikipedia section plain text."""
     try:
         data = get_json(
             client,
@@ -147,16 +215,12 @@ def _extract_plot_sections(client: httpx.Client, page_title: str) -> str:
         return ""
 
     sections = ((data.get("parse") or {}).get("sections") or []) if isinstance(data, dict) else []
-    wanted_re = re.compile(
-        r"^(plot|synopsis|summary|overview|story|premise|storyline)",
-        re.IGNORECASE,
-    )
+    wanted_re = re.compile(pattern, re.IGNORECASE)
     texts: list[str] = []
     for sec in sections:
         line = sec.get("line") or ""
         if not wanted_re.search(line):
             continue
-        # Skip nested subsections of non-plot parents if index is deep — still OK
         index = sec.get("index")
         if index is None:
             continue
@@ -175,7 +239,6 @@ def _extract_plot_sections(client: httpx.Client, page_title: str) -> str:
             )
             html = ((sec_data.get("parse") or {}).get("text") or {}).get("*") or ""
             soup = BeautifulSoup(html, "lxml")
-            # Remove refs, tables, navboxes
             for tag in soup.select("sup.reference, table, .navbox, .hatnote, style, script"):
                 tag.decompose()
             text = soup.get_text("\n", strip=True)
@@ -186,9 +249,8 @@ def _extract_plot_sections(client: httpx.Client, page_title: str) -> str:
             continue
 
     combined = "\n\n".join(texts)
-    # Cap size for LLM context
-    if len(combined) > 12000:
-        combined = combined[:12000] + "\n…[truncated]"
+    if len(combined) > max_chars:
+        combined = combined[:max_chars] + "\n…[truncated]"
     return combined
 
 

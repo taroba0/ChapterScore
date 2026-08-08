@@ -87,14 +87,19 @@ def generate_playlist(
     )
     progress(f"Found: {book.display_name}  [{book.source}]")
 
-    progress("Analyzing literary vibe with Grok…")
+    progress("Analyzing literary vibe with Grok (literature → music)…")
     analysis = analyze_book_vibe(
         book,
         mode=mode,
         lyrics=lyrics,
         use_cache=use_cache,
     )
-    progress(f"Mood: {analysis.overall_mood} · Energy: {analysis.overall_energy:.2f}")
+    sig = (analysis.distinctive_signature or "")[:80]
+    progress(
+        f"Mood: {analysis.overall_mood} · Energy: {analysis.overall_energy:.2f}"
+        + (f" · Intimacy: {analysis.intimacy_vs_epic:.2f}" if analysis.intimacy_vs_epic is not None else "")
+        + (f" · {sig}" if sig else "")
+    )
 
     if dry_run:
         return GenerateResult(book=book, analysis=analysis, tracks=[])

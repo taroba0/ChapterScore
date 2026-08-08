@@ -139,6 +139,15 @@ def _rank_raw(
             atmospheres=list(analysis.atmospheres) if analysis else None,
             overall_mood=analysis.overall_mood if analysis else None,
             key_themes=list(analysis.key_themes) if analysis else None,
+            intimacy_vs_epic=analysis.intimacy_vs_epic if analysis else None,
+            narrative_voice=analysis.narrative_voice if analysis else None,
+            distinctive_signature=analysis.distinctive_signature if analysis else None,
+            setting_texture=analysis.setting_texture if analysis else None,
+            dominant_tones=list(analysis.dominant_tones) if analysis else None,
+            humor_level=analysis.humor_level if analysis else None,
+            realism_vs_dreaminess=analysis.realism_vs_dreaminess if analysis else None,
+            anti_generic_notes=list(analysis.anti_generic_notes) if analysis else None,
+            vibe_keywords=analysis.vibe_keyword_pool() if analysis else None,
         )
         if track.score < 0:
             continue

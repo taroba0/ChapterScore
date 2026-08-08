@@ -450,6 +450,22 @@ _INTIMATE_MARKERS = re.compile(
 )
 
 
+_DREAMY_MARKERS = re.compile(
+    r"("
+    r"dream|ethereal|surreal|ambient|hazy|shoegaze|reverb|"
+    r"brian eno|stars of the lid|tim hecker|floating"
+    r")",
+    re.IGNORECASE,
+)
+_PLAYFUL_MARKERS = re.compile(
+    r"("
+    r"playful|whimsical|pizzicato|quirky|lighthearted|comic|"
+    r"jaunty|bouncy|wry"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def book_vibe_multiplier(
     track: RankedTrack,
     *,
@@ -457,33 +473,103 @@ def book_vibe_multiplier(
     atmospheres: list[str] | None = None,
     overall_mood: str | None = None,
     key_themes: list[str] | None = None,
+    intimacy_vs_epic: float | None = None,
+    narrative_voice: str | None = None,
+    distinctive_signature: str | None = None,
+    setting_texture: str | None = None,
+    dominant_tones: list[str] | None = None,
+    humor_level: float | None = None,
+    realism_vs_dreaminess: float | None = None,
+    anti_generic_notes: list[str] | None = None,
+    vibe_keywords: list[str] | None = None,
 ) -> float:
     """
     Multiplier ~[0.18, 1.45] for how well a track fits the book's emotional world.
 
-    Penalizes generic epic/trailer scores when the book is intimate/bittersweet.
+    Uses multi-dimensional literary signals (intimacy scale, voice, humor,
+    dreaminess) so same-genre books don't collapse to identical rankings.
     """
     energy = 0.5 if book_energy is None else float(book_energy)
+    intimacy = 0.5 if intimacy_vs_epic is None else float(intimacy_vs_epic)
+    humor = 0.3 if humor_level is None else float(humor_level)
+    dream = 0.4 if realism_vs_dreaminess is None else float(realism_vs_dreaminess)
     atms = {a.lower() for a in (atmospheres or [])}
+    tones = {t.lower() for t in (dominant_tones or [])}
     mood = (overall_mood or "").lower()
     themes = " ".join(key_themes or []).lower()
+    voice = (narrative_voice or "").lower()
+    signature = (distinctive_signature or "").lower()
+    setting = (setting_texture or "").lower()
+    anti = " ".join(anti_generic_notes or []).lower()
     blob = f"{track.name} {track.album} {' '.join(track.artists)} {track.matched_query}".lower()
 
     mult = 1.0
-    intimate_book = energy <= 0.5 or bool(
-        atms & {"intimate", "melancholic", "nostalgic", "hopeful", "playful", "romantic", "calm"}
+    intimate_book = (
+        intimacy >= 0.6
+        or energy <= 0.45
+        or bool(
+            atms
+            & {
+                "intimate",
+                "melancholic",
+                "nostalgic",
+                "hopeful",
+                "playful",
+                "romantic",
+                "calm",
+                "bittersweet",
+            }
+        )
+        or any(k in voice for k in ("intimate", "confessional", "wry", "earnest"))
     )
-    epic_book = energy >= 0.7 or bool(atms & {"epic", "triumphant", "adventurous", "angry"})
+    epic_book = (
+        intimacy <= 0.35
+        or energy >= 0.72
+        or bool(atms & {"epic", "triumphant", "adventurous", "angry"})
+    ) and intimacy < 0.55
+    blocks_epic = any(
+        k in anti for k in ("not epic", "no epic", "not trailer", "no trailer", "not battle")
+    )
+    if blocks_epic:
+        intimate_book = True
+        epic_book = False
 
+    # Token overlap from rich literary pool
     vibe_tokens: set[str] = set()
-    for a in atms:
-        vibe_tokens.update(w for w in re.findall(r"[a-z]+", a) if len(w) > 3)
-    vibe_tokens.update(w for w in re.findall(r"[a-z]+", mood) if len(w) > 3)
-    vibe_tokens.update(w for w in re.findall(r"[a-z]+", themes) if len(w) > 3)
-    vibe_tokens -= {"music", "book", "story", "novel", "life", "time", "world"}
+    for source in (
+        list(atms),
+        list(tones),
+        [mood, themes, voice, signature, setting],
+        vibe_keywords or [],
+    ):
+        if isinstance(source, list):
+            for item in source:
+                vibe_tokens.update(w for w in re.findall(r"[a-z]+", str(item).lower()) if len(w) > 3)
+        else:
+            vibe_tokens.update(w for w in re.findall(r"[a-z]+", str(source).lower()) if len(w) > 3)
+    vibe_tokens -= {
+        "music",
+        "book",
+        "story",
+        "novel",
+        "life",
+        "time",
+        "world",
+        "that",
+        "this",
+        "with",
+        "from",
+        "than",
+        "into",
+        "about",
+        "other",
+        "genre",
+        "typical",
+        "rather",
+    }
     hits = sum(1 for t in vibe_tokens if t in blob)
     if hits:
-        mult *= min(1.35, 1.0 + 0.07 * hits)
+        mult *= min(1.4, 1.0 + 0.06 * hits)
 
     t_energy = track.features.get("energy")
     if t_energy is not None:
@@ -495,7 +581,7 @@ def book_vibe_multiplier(
 
     if intimate_book and not epic_book:
         if _EPIC_TRAILER_MARKERS.search(blob):
-            mult *= 0.22
+            mult *= 0.18 if intimacy >= 0.7 else 0.22
         if re.search(
             r"hans zimmer|two steps|john williams|howard shore",
             blob,
@@ -506,16 +592,30 @@ def book_vibe_multiplier(
                 blob,
                 re.I,
             ):
-                mult *= 0.35
-            elif energy < 0.45:
-                mult *= 0.55
+                mult *= 0.32
+            elif energy < 0.5 or intimacy >= 0.6:
+                mult *= 0.5
         if _INTIMATE_MARKERS.search(blob):
-            mult *= 1.22
+            mult *= 1.25 if intimacy >= 0.65 else 1.2
 
     if epic_book and _EPIC_TRAILER_MARKERS.search(blob):
         mult *= 1.15
     if epic_book and _INTIMATE_MARKERS.search(blob) and energy > 0.75:
         mult *= 0.85
+
+    # Humor / irony → reward playful cues, penalize solemn epic when comedy-forward
+    if humor >= 0.55:
+        if _PLAYFUL_MARKERS.search(blob):
+            mult *= 1.18
+        if _EPIC_TRAILER_MARKERS.search(blob) and intimacy > 0.4:
+            mult *= 0.55
+
+    # Dreamy / surreal books → ambient/ethereal fit
+    if dream >= 0.6:
+        if _DREAMY_MARKERS.search(blob):
+            mult *= 1.15
+        if _EPIC_TRAILER_MARKERS.search(blob) and intimacy > 0.45:
+            mult *= 0.7
 
     return max(0.18, min(1.45, mult))
 
@@ -565,6 +665,15 @@ def score_track(
     atmospheres: list[str] | None = None,
     overall_mood: str | None = None,
     key_themes: list[str] | None = None,
+    intimacy_vs_epic: float | None = None,
+    narrative_voice: str | None = None,
+    distinctive_signature: str | None = None,
+    setting_texture: str | None = None,
+    dominant_tones: list[str] | None = None,
+    humor_level: float | None = None,
+    realism_vs_dreaminess: float | None = None,
+    anti_generic_notes: list[str] | None = None,
+    vibe_keywords: list[str] | None = None,
 ) -> float:
     """
     Composite score ~0–100 with hard priority:
@@ -655,6 +764,15 @@ def score_track(
         atmospheres=atmospheres,
         overall_mood=overall_mood,
         key_themes=key_themes,
+        intimacy_vs_epic=intimacy_vs_epic,
+        narrative_voice=narrative_voice,
+        distinctive_signature=distinctive_signature,
+        setting_texture=setting_texture,
+        dominant_tones=dominant_tones,
+        humor_level=humor_level,
+        realism_vs_dreaminess=realism_vs_dreaminess,
+        anti_generic_notes=anti_generic_notes,
+        vibe_keywords=vibe_keywords,
     )
 
     explore = max(0.0, min(1.0, exploration / 100.0))
@@ -665,15 +783,20 @@ def score_track(
     # Light cinematic bonus only when book vibe allows it (not forced)
     cine = cinematic_fit(track)
     e = book_energy if book_energy is not None else (spec.energy or 0.5)
+    intimacy = 0.5 if intimacy_vs_epic is None else float(intimacy_vs_epic)
     atms = {a.lower() for a in (atmospheres or [])}
-    intimate = e <= 0.5 or bool(
+    intimate = intimacy >= 0.6 or e <= 0.5 or bool(
         atms & {"intimate", "melancholic", "nostalgic", "hopeful", "playful", "romantic", "calm"}
     )
-    if intimate and e < 0.65:
+    if intimate and (e < 0.65 or intimacy >= 0.6):
         # Intimate books: only reward delicate cinematic, not epic
-        cine_weight = 6.0 * (1.0 if _INTIMATE_MARKERS.search(
-            f"{track.name} {track.album} {' '.join(track.artists)}"
-        ) else 0.25)
+        cine_weight = 6.0 * (
+            1.0
+            if _INTIMATE_MARKERS.search(
+                f"{track.name} {track.album} {' '.join(track.artists)}"
+            )
+            else 0.25
+        )
     else:
         cine_weight = 10.0  # mild preference when epic/drama fits
 

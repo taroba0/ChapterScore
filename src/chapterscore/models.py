@@ -155,6 +155,12 @@ class BookMetadata(BaseModel):
     page_count: int | None = None
     chapters: list[ChapterSummary] = Field(default_factory=list)
     plot_summary: str = ""
+    # Enriched public signals for deeper literary analysis
+    publisher_blurb: str = ""
+    reception_text: str = ""  # Wikipedia Reception / critical response
+    themes_text: str = ""  # Themes / analysis / style sections
+    review_snippets: list[str] = Field(default_factory=list)  # short public review language
+    genre_labels: list[str] = Field(default_factory=list)  # coarse genre classifications
     source: str = ""
     raw: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
@@ -167,6 +173,33 @@ class BookMetadata(BaseModel):
         if self.authors:
             return f"{self.title} by {self.author_str}"
         return self.title
+
+    def analysis_context_blob(self, *, max_chars: int = 18000) -> str:
+        """Concatenate public signals for LLM analysis (truncated)."""
+        parts: list[str] = []
+        if self.description:
+            parts.append(f"## Publisher / catalogue description\n{self.description}")
+        if self.publisher_blurb and self.publisher_blurb != self.description:
+            parts.append(f"## Publisher blurb\n{self.publisher_blurb}")
+        if self.plot_summary:
+            parts.append(f"## Plot / synopsis\n{self.plot_summary}")
+        if self.reception_text:
+            parts.append(f"## Critical reception & reader response language\n{self.reception_text}")
+        if self.themes_text:
+            parts.append(f"## Themes / style / analysis sections\n{self.themes_text}")
+        if self.review_snippets:
+            parts.append(
+                "## Public review snippets (tone language)\n"
+                + "\n".join(f"- {s}" for s in self.review_snippets[:12])
+            )
+        if self.subjects:
+            parts.append("## Subjects / tags\n" + ", ".join(self.subjects[:40]))
+        if self.genre_labels:
+            parts.append("## Genre labels\n" + ", ".join(self.genre_labels[:20]))
+        blob = "\n\n".join(parts)
+        if len(blob) > max_chars:
+            return blob[:max_chars] + "\n…[truncated]"
+        return blob
 
 
 # ── Vibe analysis (from Grok) ────────────────────────────────────────────────
@@ -185,6 +218,21 @@ class SearchQuerySpec(BaseModel):
     acousticness: float | None = Field(default=None, ge=0.0, le=1.0)
     danceability: float | None = Field(default=None, ge=0.0, le=1.0)
     reason: str = ""
+
+
+class EmotionalAct(BaseModel):
+    """Major structural beat when fine-grained chapters are unavailable or synthetic."""
+
+    act_id: int | str = 1
+    label: str = ""  # e.g. "Act I — arrival", "Turning point"
+    mood: str = ""
+    energy_level: float = Field(default=0.5, ge=0.0, le=1.0)
+    atmospheres: list[str] = Field(default_factory=list)
+    emotional_arc: str = ""
+    pacing: str = "moderate"
+    tone: str = ""
+    vibe_note: str = ""
+    search_queries: list[SearchQuerySpec] = Field(default_factory=list)
 
 
 class ChapterVibe(BaseModel):
@@ -217,10 +265,54 @@ class BookVibeAnalysis(BaseModel):
     tone: str = ""
     era_feel: str = ""  # e.g. "Victorian gothic", "modern noir", "epic fantasy"
     key_themes: list[str] = Field(default_factory=list)
+
+    # ── Expanded multi-dimensional literary profile ───────────────────────
+    narrative_voice: str = ""  # wry, earnest, intimate, detached, sarcastic…
+    writing_style: str = ""  # spare prose, lyrical, dialogue-heavy, experimental…
+    dominant_tones: list[str] = Field(default_factory=list)
+    secondary_tones: list[str] = Field(default_factory=list)
+    humor_level: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="0=no humor, 1=comedy-forward",
+    )
+    sarcasm_irony_level: float = Field(default=0.2, ge=0.0, le=1.0)
+    intimacy_vs_epic: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="0=epic/sweeping scale, 1=intimate/personal scale",
+    )
+    realism_vs_dreaminess: float = Field(
+        default=0.4,
+        ge=0.0,
+        le=1.0,
+        description="0=gritty realism, 1=dreamy/surreal/magical",
+    )
+    setting_texture: str = ""  # time, place, social atmosphere
+    sensory_atmosphere: str = ""  # light, weather, soundscape, body feeling
+    pacing_profile: str = ""  # how pacing changes across the book
+    distinctive_signature: str = Field(
+        default="",
+        description="What makes THIS book emotionally distinct from genre peers",
+    )
+    genre_peers_contrast: str = Field(
+        default="",
+        description="How it differs from typical books in the same genre",
+    )
+    anti_generic_notes: list[str] = Field(
+        default_factory=list,
+        description="Explicit warnings against collapsing into genre clichés",
+    )
+
     chapters: list[ChapterVibe] = Field(default_factory=list)
+    emotional_acts: list[EmotionalAct] = Field(
+        default_factory=list,
+        description="Major acts when chapter data is weak or synthetic",
+    )
     overall_search_queries: list[SearchQuerySpec] = Field(default_factory=list)
     suggested_genres: list[str] = Field(default_factory=list)
-    # Suitable vs unsuitable musical styles for hard re-ranking / soft filters
     suitable_styles: list[str] = Field(
         default_factory=list,
         description="Musical styles that fit the book (e.g. dark ambient, orchestral, industrial)",
@@ -232,9 +324,9 @@ class BookVibeAnalysis(BaseModel):
     playlist_title_suggestion: str = ""
     playlist_description: str = ""
 
-    @field_validator("overall_energy", mode="before")
+    @field_validator("overall_energy", "humor_level", "sarcasm_irony_level", "intimacy_vs_epic", "realism_vs_dreaminess", mode="before")
     @classmethod
-    def clamp_energy(cls, v: Any) -> float:
+    def clamp_01(cls, v: Any) -> float:
         try:
             f = float(v)
         except (TypeError, ValueError):
@@ -248,6 +340,30 @@ class BookVibeAnalysis(BaseModel):
 
     def style_keywords_bad(self) -> list[str]:
         return [s.strip().lower() for s in (self.avoid_styles or []) if s and s.strip()]
+
+    def vibe_keyword_pool(self) -> list[str]:
+        """Rich token pool for ranking / query expansion."""
+        pool: list[str] = []
+        for part in (
+            self.overall_mood,
+            self.tone,
+            self.narrative_voice,
+            self.writing_style,
+            self.era_feel,
+            self.setting_texture,
+            self.sensory_atmosphere,
+            self.distinctive_signature,
+            self.pacing_profile,
+            self.emotional_arc,
+        ):
+            if part:
+                pool.append(part)
+        pool.extend(self.atmospheres or [])
+        pool.extend(self.dominant_tones or [])
+        pool.extend(self.secondary_tones or [])
+        pool.extend(self.key_themes or [])
+        pool.extend(self.anti_generic_notes or [])
+        return pool
 
 
 # ── Track selection ──────────────────────────────────────────────────────────

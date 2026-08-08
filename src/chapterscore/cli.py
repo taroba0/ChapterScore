@@ -328,13 +328,65 @@ def generate_cmd(
         meta.add_row("Year", str(book.publish_year))
     if book.subjects:
         meta.add_row("Subjects", ", ".join(book.subjects[:6]))
+    if book.genre_labels:
+        meta.add_row("Genres", ", ".join(book.genre_labels[:6]))
     meta.add_row("Sources", book.source)
     meta.add_row("Mood", analysis.overall_mood)
     meta.add_row("Energy", f"{analysis.overall_energy:.2f}")
     meta.add_row("Atmospheres", ", ".join(analysis.atmospheres[:8]) or "—")
     meta.add_row("Arc", analysis.emotional_arc or "—")
+    if analysis.narrative_voice:
+        meta.add_row("Voice", analysis.narrative_voice)
+    if analysis.writing_style:
+        meta.add_row("Style", analysis.writing_style)
+    tones = list(analysis.dominant_tones or []) + list(analysis.secondary_tones or [])
+    if tones:
+        meta.add_row("Tones", ", ".join(tones[:8]))
+    if analysis.setting_texture:
+        meta.add_row("Setting", analysis.setting_texture[:120])
+    if analysis.sensory_atmosphere:
+        meta.add_row("Sensory", analysis.sensory_atmosphere[:120])
+    meta.add_row(
+        "Scale",
+        f"intimacy {analysis.intimacy_vs_epic:.2f} · humor {analysis.humor_level:.2f} · "
+        f"dreaminess {analysis.realism_vs_dreaminess:.2f}",
+    )
+    if analysis.distinctive_signature:
+        meta.add_row("Signature", analysis.distinctive_signature[:200])
+    if analysis.genre_peers_contrast:
+        meta.add_row("vs peers", analysis.genre_peers_contrast[:180])
+    if analysis.anti_generic_notes:
+        meta.add_row("Avoid cliché", "; ".join(analysis.anti_generic_notes[:4]))
+    if analysis.suitable_styles:
+        meta.add_row("Music styles", ", ".join(analysis.suitable_styles[:8]))
+    if analysis.avoid_styles:
+        meta.add_row("Avoid styles", ", ".join(analysis.avoid_styles[:8]))
     console.print()
     console.print(Panel(meta, title="Book & Vibe", border_style="cyan", box=box.ROUNDED))
+
+    if analysis.emotional_acts and (
+        mode == ModeOpt.chapter or not analysis.chapters
+    ):
+        act_table = Table(
+            title="Emotional acts",
+            box=box.SIMPLE_HEAD,
+            show_lines=False,
+            header_style="bold yellow",
+        )
+        act_table.add_column("#", style="dim", width=4)
+        act_table.add_column("Label", min_width=14)
+        act_table.add_column("Mood", min_width=10)
+        act_table.add_column("E", justify="right", width=5)
+        act_table.add_column("Note")
+        for act in analysis.emotional_acts[:10]:
+            act_table.add_row(
+                str(act.act_id),
+                (act.label or "—")[:28],
+                (act.mood or "—")[:18],
+                f"{act.energy_level:.2f}",
+                (act.vibe_note or act.emotional_arc or "—")[:60],
+            )
+        console.print(act_table)
 
     if analysis.chapters and mode == ModeOpt.chapter:
         ch_table = Table(

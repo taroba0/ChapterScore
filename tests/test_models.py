@@ -78,3 +78,36 @@ def test_chapter_vibe_roundtrip():
 def test_enums():
     assert Mode.OVERALL.value == "overall"
     assert LyricsPreference.INSTRUMENTAL_ONLY.value == "instrumental-only"
+
+
+def test_book_metadata_enrichment_fields():
+    book = BookMetadata(
+        title="1984",
+        authors=["George Orwell"],
+        description="A dystopian novel…",
+        publisher_blurb="Winston Smith…",
+        reception_text="A landmark of political fiction.",
+        themes_text="Surveillance, language, power.",
+        review_snippets=["bleak and devastating"],
+        genre_labels=["dystopian", "literary fiction"],
+    )
+    assert book.publisher_blurb
+    assert "Surveillance" in book.themes_text
+    blob = book.analysis_context_blob()
+    assert "bleak" in blob
+    assert "dystopian" in blob
+
+
+def test_book_vibe_multi_dimensional_defaults():
+    analysis = BookVibeAnalysis(
+        book_title="X",
+        overall_mood="wry",
+        overall_energy=0.4,
+        narrative_voice="wry first-person",
+        distinctive_signature="not a generic dystopia",
+        intimacy_vs_epic=0.8,
+    )
+    assert analysis.narrative_voice.startswith("wry")
+    assert analysis.intimacy_vs_epic == 0.8
+    assert "wry" in " ".join(analysis.vibe_keyword_pool()).lower()
+    assert analysis.style_keywords_good() == []

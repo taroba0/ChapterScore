@@ -87,8 +87,20 @@ _DRAMA_CINEMATIC = [
 
 
 def _book_energy_band(analysis: BookVibeAnalysis) -> str:
+    """
+    Map literary scale + energy → instrumental seed bank.
+
+    Prefer intimacy_vs_epic (0=epic, 1=intimate) when present so two books
+    with similar energy but different scale get different music.
+    """
     e = analysis.overall_energy if analysis.overall_energy is not None else 0.5
+    intimacy = getattr(analysis, "intimacy_vs_epic", None)
+    if intimacy is None:
+        intimacy = 0.5
     atms = {a.lower() for a in (analysis.atmospheres or [])}
+    tones = {t.lower() for t in (analysis.dominant_tones or [])} | {
+        t.lower() for t in (analysis.secondary_tones or [])
+    }
     intimate_keys = {
         "intimate",
         "melancholic",
@@ -98,14 +110,35 @@ def _book_energy_band(analysis: BookVibeAnalysis) -> str:
         "romantic",
         "calm",
         "solemn",
+        "bittersweet",
+        "tender",
+        "wry",
+        "quiet",
     }
-    epic_keys = {"epic", "triumphant", "adventurous", "angry", "tense"}
-    if e <= 0.45 or (atms & intimate_keys and e < 0.65):
-        if atms & epic_keys and e >= 0.55:
+    epic_keys = {"epic", "triumphant", "adventurous", "angry", "tense", "sweeping", "grand"}
+    voice = (analysis.narrative_voice or "").lower()
+    anti = " ".join(analysis.anti_generic_notes or []).lower()
+    blocks_epic = any(
+        k in anti for k in ("not epic", "no epic", "not trailer", "no trailer", "not battle")
+    )
+
+    # Explicit literary intimacy wins over raw energy
+    if intimacy >= 0.65 or blocks_epic:
+        if atms & epic_keys and e >= 0.7 and intimacy < 0.55:
             return "drama"
         return "intimate"
-    if e >= 0.72 or (atms & epic_keys and e >= 0.6):
+    if intimacy <= 0.3 and (e >= 0.6 or atms & epic_keys):
         return "epic"
+
+    if e <= 0.45 or (atms & intimate_keys and e < 0.65) or tones & intimate_keys:
+        if atms & epic_keys and e >= 0.55 and intimacy < 0.5:
+            return "drama"
+        return "intimate"
+    if e >= 0.72 or (atms & epic_keys and e >= 0.6 and intimacy < 0.45):
+        return "epic"
+    if any(k in voice for k in ("intimate", "wry", "earnest", "confessional", "first-person")):
+        if e < 0.7:
+            return "intimate"
     return "drama"
 
 
@@ -149,12 +182,43 @@ def vibe_instrumental_queries(
 
     add(f"{mood} instrumental", reason="mood")
     add(f"{mood} piano instrumental", reason="mood-piano")
-    add(f"bittersweet {mood} instrumental".replace("bittersweet bittersweet", "bittersweet"), reason="mood2")
+    add(
+        f"bittersweet {mood} instrumental".replace("bittersweet bittersweet", "bittersweet"),
+        reason="mood2",
+    )
 
     for theme in (analysis.key_themes or [])[:4]:
         t = theme.strip()
         if len(t) > 2:
             add(f"{t} instrumental piano", reason="theme")
+
+    # Literary multi-dimensional cues (anti-generic differentiation)
+    for tone in (analysis.dominant_tones or [])[:4]:
+        add(f"{tone} instrumental", reason=f"tone:{tone}")
+    if analysis.narrative_voice:
+        add(f"{analysis.narrative_voice} instrumental piano", reason="voice")
+    if analysis.setting_texture:
+        # First few distinctive words of setting
+        words = " ".join(analysis.setting_texture.split()[:5])
+        if len(words) > 4:
+            add(f"{words} instrumental", reason="setting")
+    if analysis.sensory_atmosphere:
+        words = " ".join(analysis.sensory_atmosphere.split()[:5])
+        if len(words) > 4:
+            add(f"{words} ambient instrumental", reason="sensory")
+    for style in (analysis.suitable_styles or [])[:6]:
+        s = style.strip()
+        if s:
+            add(f"{s} instrumental" if "instrumental" not in s.lower() else s, reason="style")
+
+    humor = getattr(analysis, "humor_level", 0.3) or 0.3
+    dream = getattr(analysis, "realism_vs_dreaminess", 0.4) or 0.4
+    if humor >= 0.55:
+        add("playful pizzicato instrumental", reason="humor")
+        add("wry light orchestral cue", reason="humor")
+    if dream >= 0.6:
+        add("dreamy ambient soundscape", reason="dreamy")
+        add("surreal ethereal instrumental", reason="dreamy")
 
     # 2) Band-appropriate artist/style seeds (not always epic)
     if band == "intimate":
@@ -339,7 +403,7 @@ def expand_queries_from_analysis(
             )
         )
 
-    # Chapter queries flattened (useful even in overall mode as extra diversity)
+# Chapter queries flattened (useful even in overall mode as extra diversity)
     for ch in analysis.chapters[:12]:
         for q in ch.search_queries[:2]:
             add(
@@ -356,10 +420,41 @@ def expand_queries_from_analysis(
                 )
             )
 
+    # Emotional acts (major structural beats when chapters are weak/synthetic)
+    for act in (analysis.emotional_acts or [])[:8]:
+        for q in (act.search_queries or [])[:2]:
+            add(
+                SearchQuerySpec(
+                    query=_flavor_query(q.query, lyrics),
+                    genres=list(q.genres or [])[:1],
+                    mood_keywords=list(q.mood_keywords or []),
+                    energy=q.energy if q.energy is not None else act.energy_level,
+                    valence=q.valence,
+                    instrumentalness_min=q.instrumentalness_min
+                    if q.instrumentalness_min is not None
+                    else _inst_min(lyrics),
+                    reason=f"act:{act.act_id}",
+                )
+            )
+        if act.mood:
+            add(
+                _spec(
+                    f"{act.mood} instrumental"
+                    if lyrics.normalized().is_instrumental_only
+                    else f"{act.mood} atmosphere",
+                    lyrics=lyrics,
+                    energy=act.energy_level,
+                    reason=f"act-mood:{act.act_id}",
+                    mood_keywords=[act.mood],
+                )
+            )
+
     # 2) Atmosphere-driven expansions
     atmospheres = [a.lower().strip() for a in (analysis.atmospheres or [])]
     if analysis.overall_mood:
         atmospheres.append(analysis.overall_mood.lower().strip())
+    for tone in (analysis.dominant_tones or [])[:4]:
+        atmospheres.append(tone.lower().strip())
     for atm in atmospheres:
         for phrase in _ATMOSPHERE_QUERIES.get(atm, []):
             add(
@@ -384,18 +479,21 @@ def expand_queries_from_analysis(
                         )
                     )
 
-    # 3) Genre seeds from analysis
-    for g in (analysis.suggested_genres or [])[:8]:
+    # 3) Genre + suitable_styles seeds (styles are more specific than genres)
+    style_seeds = list(analysis.suitable_styles or [])[:8] + list(
+        analysis.suggested_genres or []
+    )[:6]
+    for g in style_seeds:
         g = g.strip()
         if not g:
             continue
-        if lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
+        if lyrics.normalized().is_instrumental_only:
             add(
                 _spec(
-                    f"{g} instrumental",
+                    f"{g} instrumental" if "instrumental" not in g.lower() else g,
                     lyrics=lyrics,
                     energy=analysis.overall_energy,
-                    reason="genre-seed",
+                    reason="style-seed",
                     genres=[g],
                 )
             )
@@ -404,7 +502,7 @@ def expand_queries_from_analysis(
                     f"{g} soundtrack",
                     lyrics=lyrics,
                     energy=analysis.overall_energy,
-                    reason="genre-soundtrack",
+                    reason="style-soundtrack",
                     genres=[g],
                 )
             )
@@ -414,12 +512,12 @@ def expand_queries_from_analysis(
                     f"{g} mood music",
                     lyrics=lyrics,
                     energy=analysis.overall_energy,
-                    reason="genre-seed",
+                    reason="style-seed",
                     genres=[g],
                 )
             )
 
-    # 4) Era / tone
+    # 4) Era / tone / voice / setting (book-specific texture)
     if analysis.era_feel:
         add(
             _spec(
@@ -433,41 +531,83 @@ def expand_queries_from_analysis(
         add(
             _spec(
                 f"{analysis.tone} cinematic instrumental"
-                if lyrics == LyricsPreference.INSTRUMENTAL_ONLY
+                if lyrics.normalized().is_instrumental_only
                 else f"{analysis.tone} atmosphere music",
                 lyrics=lyrics,
                 energy=analysis.overall_energy,
                 reason="tone",
             )
         )
+    if analysis.narrative_voice:
+        add(
+            _spec(
+                f"{analysis.narrative_voice} instrumental"
+                if lyrics.normalized().is_instrumental_only
+                else f"{analysis.narrative_voice} indie",
+                lyrics=lyrics,
+                energy=analysis.overall_energy,
+                reason="narrative-voice",
+            )
+        )
+    if analysis.writing_style:
+        words = " ".join(analysis.writing_style.split()[:4])
+        if words:
+            add(
+                _spec(
+                    f"{words} instrumental"
+                    if lyrics.normalized().is_instrumental_only
+                    else f"{words} music",
+                    lyrics=lyrics,
+                    energy=analysis.overall_energy,
+                    reason="writing-style",
+                )
+            )
+    if analysis.setting_texture:
+        words = " ".join(analysis.setting_texture.split()[:5])
+        if len(words) > 4:
+            add(
+                _spec(
+                    f"{words} instrumental"
+                    if lyrics.normalized().is_instrumental_only
+                    else f"{words} atmosphere",
+                    lyrics=lyrics,
+                    energy=analysis.overall_energy,
+                    reason="setting-texture",
+                )
+            )
+    if analysis.sensory_atmosphere:
+        words = " ".join(analysis.sensory_atmosphere.split()[:5])
+        if len(words) > 4:
+            add(
+                _spec(
+                    f"{words} ambient",
+                    lyrics=lyrics,
+                    energy=analysis.overall_energy,
+                    reason="sensory",
+                )
+            )
 
-    # 5) Sci-fi / dense worldbuilding detection
-    blob = " ".join(
-        [
-            analysis.overall_mood or "",
-            analysis.era_feel or "",
-            analysis.tone or "",
-            " ".join(analysis.key_themes or []),
-            " ".join(analysis.atmospheres or []),
-            analysis.book_title or "",
-        ]
-    ).lower()
-    if any(
+    # 5) Worldbuilding / genre detection from full literary blob (anti-generic:
+    #    dystopian alone no longer forces dune-style desert scores)
+    blob = " ".join(analysis.vibe_keyword_pool() + [analysis.book_title or ""]).lower()
+    intimacy = getattr(analysis, "intimacy_vs_epic", 0.5) or 0.5
+    is_scifi_space = any(
         k in blob
         for k in (
-            "sci-fi",
-            "scifi",
-            "science fiction",
-            "space",
-            "desert",
-            "dystop",
-            "empire",
-            "planet",
+            "space opera",
             "arrakis",
-            "cyber",
-            "futur",
+            "desert planet",
+            "interstellar",
+            "spaceship",
+            "galactic",
         )
-    ) or "dune" in (analysis.book_title or "").lower():
+    ) or "dune" in (analysis.book_title or "").lower()
+    is_scifi_broad = any(
+        k in blob
+        for k in ("sci-fi", "scifi", "science fiction", "cyber", "futur", "dystop")
+    )
+    # Epic space scores only when scale is not intimate
+    if is_scifi_space or (is_scifi_broad and intimacy < 0.45):
         for phrase in _SCIFI_EXTRA:
             add(
                 _spec(
@@ -477,37 +617,90 @@ def expand_queries_from_analysis(
                     reason="scifi-expand",
                 )
             )
+    elif is_scifi_broad and intimacy >= 0.55:
+        # Intimate dystopia / literary SF → quieter, not trailer-space
+        for phrase in (
+            "dystopian ambient instrumental",
+            "cold electronic ambient",
+            "melancholic synth atmosphere",
+            "surveillance tension underscore",
+            "bleak piano electronic",
+        ):
+            add(
+                _spec(
+                    phrase,
+                    lyrics=lyrics,
+                    energy=analysis.overall_energy,
+                    reason="intimate-scifi",
+                )
+            )
 
-    # 6) Energy-tier seeds — only add tiers near the book's energy (no forced epic)
+    # Humor / dreaminess axes
+    humor = getattr(analysis, "humor_level", 0.3) or 0.3
+    dream = getattr(analysis, "realism_vs_dreaminess", 0.4) or 0.4
+    if humor >= 0.55:
+        add(
+            _spec(
+                "playful whimsical instrumental"
+                if lyrics.normalized().is_instrumental_only
+                else "witty indie pop",
+                lyrics=lyrics,
+                energy=min(0.65, (analysis.overall_energy or 0.5) + 0.1),
+                reason="humor-high",
+            )
+        )
+    if dream >= 0.6:
+        add(
+            _spec(
+                "dreamy surreal ambient"
+                if lyrics.normalized().is_instrumental_only
+                else "dream pop ethereal",
+                lyrics=lyrics,
+                energy=analysis.overall_energy,
+                reason="dreamy",
+            )
+        )
+
+    # 6) Energy + intimacy tier seeds (no forced epic for intimate books)
     energy = analysis.overall_energy if analysis.overall_energy is not None else 0.5
+    band = _book_energy_band(analysis)
     if lyrics.normalized().is_instrumental_only or lyrics.prefers_instrumental:
-        if energy < 0.45:
+        if band == "intimate" or energy < 0.45:
             add(_spec("quiet ambient drone instrumental", lyrics=lyrics, energy=0.2, reason="energy-low"))
             add(_spec("intimate piano instrumental", lyrics=lyrics, energy=0.3, reason="energy-low2"))
             add(_spec("melancholic strings score", lyrics=lyrics, energy=0.35, reason="energy-low3"))
-        elif energy < 0.7:
-            add(_spec("emotional film score piano", lyrics=lyrics, energy=0.5, reason="energy-mid"))
-            add(_spec("building tension hybrid score", lyrics=lyrics, energy=0.55, reason="energy-mid2"))
-        else:
+        elif band == "epic" or energy >= 0.72:
             add(_spec("epic battle orchestral score", lyrics=lyrics, energy=0.85, reason="energy-high"))
             add(_spec("triumphant orchestral fanfare instrumental", lyrics=lyrics, energy=0.9, reason="energy-high2"))
-    else:
-        if energy < 0.45:
-            add(_spec("quiet intimate ballad", lyrics=lyrics, energy=0.25, reason="energy-low"))
-        elif energy < 0.7:
-            add(_spec("mid tempo atmospheric indie", lyrics=lyrics, energy=0.5, reason="energy-mid"))
         else:
+            add(_spec("emotional film score piano", lyrics=lyrics, energy=0.5, reason="energy-mid"))
+            add(_spec("building tension hybrid score", lyrics=lyrics, energy=0.55, reason="energy-mid2"))
+    else:
+        if band == "intimate" or energy < 0.45:
+            add(_spec("quiet intimate ballad", lyrics=lyrics, energy=0.25, reason="energy-low"))
+        elif band == "epic" or energy >= 0.72:
             add(_spec("high energy anthem", lyrics=lyrics, energy=0.85, reason="energy-high"))
+        else:
+            add(_spec("mid tempo atmospheric indie", lyrics=lyrics, energy=0.5, reason="energy-mid"))
 
-    # Bias seed bank by overall energy (instrumental seeds: front = calmer)
+    # Bias seed bank by band (instrumental seeds: front = calmer)
     seeds = (
         _INSTRUMENTAL_SEEDS
         if lyrics.normalized().is_instrumental_only or lyrics.prefers_instrumental
         else _VOCAL_FRIENDLY_SEEDS
     )
-    if energy < 0.45:
-        ordered_seeds = seeds[:10] + seeds[10:]
-    elif energy > 0.7:
+    if band == "intimate" or energy < 0.45:
+        # Prefer calm seeds; skip war drums / triumphant brass
+        ordered_seeds = [
+            s
+            for s in seeds
+            if not any(
+                k in s.lower()
+                for k in ("war drums", "triumphant", "epic film", "hybrid orchestral trailer")
+            )
+        ]
+        ordered_seeds = ordered_seeds[:12] + ordered_seeds[12:]
+    elif band == "epic" or energy > 0.7:
         ordered_seeds = list(reversed(seeds))
     else:
         ordered_seeds = seeds[5:] + seeds[:5]

@@ -470,6 +470,11 @@ def main() -> None:
     m2.metric("Energy", f"{analysis.overall_energy:.2f}")
     m3.metric("Mode", mode_label)
 
+    m4, m5, m6 = st.columns(3)
+    m4.metric("Intimacy", f"{analysis.intimacy_vs_epic:.2f}")
+    m5.metric("Humor", f"{analysis.humor_level:.2f}")
+    m6.metric("Dreaminess", f"{analysis.realism_vs_dreaminess:.2f}")
+
     vibe_bits = []
     if analysis.atmospheres:
         vibe_bits.append(", ".join(analysis.atmospheres[:6]))
@@ -479,6 +484,33 @@ def main() -> None:
         vibe_bits.append(analysis.playlist_description)
     if vibe_bits:
         st.info(" · ".join(vibe_bits[:3]))
+
+    if analysis.distinctive_signature:
+        st.markdown(f"**Signature:** {analysis.distinctive_signature}")
+    if analysis.narrative_voice or analysis.writing_style:
+        st.caption(
+            " · ".join(
+                filter(
+                    None,
+                    [
+                        f"Voice: {analysis.narrative_voice}" if analysis.narrative_voice else "",
+                        f"Prose: {analysis.writing_style}" if analysis.writing_style else "",
+                    ],
+                )
+            )
+        )
+    if analysis.suitable_styles or analysis.avoid_styles:
+        cols = st.columns(2)
+        if analysis.suitable_styles:
+            cols[0].markdown(
+                "**Styles:** " + ", ".join(analysis.suitable_styles[:8])
+            )
+        if analysis.avoid_styles:
+            cols[1].markdown(
+                "**Avoid:** " + ", ".join(analysis.avoid_styles[:8])
+            )
+    if analysis.anti_generic_notes:
+        st.caption("Anti-generic: " + "; ".join(analysis.anti_generic_notes[:4]))
 
     st.caption(
         f"**{book.display_name}**"

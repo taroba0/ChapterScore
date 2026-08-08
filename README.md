@@ -8,8 +8,8 @@ It combines:
 
 | Layer | Source |
 |--------|--------|
-| Book metadata & plot | Open Library, Google Books, Wikipedia |
-| Literary vibe analysis | [xAI Grok](https://docs.x.ai) (`grok-4.5`) |
+| Book metadata, plot, reception | Open Library, Google Books, Wikipedia (+ themes/reception) |
+| Literary vibe analysis | [xAI Grok](https://docs.x.ai) — literature-first dual pass (`litv2`) |
 | Music search & playlists | Spotify Web API via [spotipy](https://spotipy.readthedocs.io/) |
 | CLI UX | [Typer](https://typer.tiangolo.com/) + [Rich](https://rich.readthedocs.io/) |
 | Web UI | [Streamlit](https://streamlit.io/) (`web/app.py`) |
@@ -18,13 +18,14 @@ It combines:
 
 ## Features
 
-- **Overall or chapter mode** — one cohesive playlist, or tracks ordered by chapter with vibe notes
+- **Overall or chapter mode** — one cohesive playlist, or tracks ordered by chapter / emotional act
+- **Literature-first multi-dimensional vibe** — voice, tone, intimacy scale, setting, distinctive signature (anti-generic)
 - **Lyrics control** — prefer vocals, allow either, or force instrumental / soundtrack-only
-- **Real book data first** — structured metadata from public APIs before LLM analysis
-- **Smart track ranking** — audio-feature fit + popularity + keyword overlap + artist diversity
+- **Real book data first** — public metadata, plot, reception, and themes before LLM analysis
+- **Smart track ranking** — book-vibe fit first, then style clash, popularity, diversity
 - **Secure Spotify OAuth** — browser login, token cache with auto-refresh
 - **Disk cache** — book lookups and vibe analyses cached locally (7-day TTL)
-- **Polished CLI** — progress output, tables, `doctor` diagnostics, `--dry-run`
+- **Polished CLI** — progress output, rich literary profile table, `doctor`, `--dry-run`
 - **Streamlit web UI** — single-page form to generate playlists in the browser
 
 ---
@@ -229,19 +230,78 @@ chapterscore logout && chapterscore auth --force
 ## How it works
 
 ```
-┌─────────────┐    ┌──────────────┐    ┌─────────────┐    ┌──────────────┐
-│ Book APIs   │ →  │ Grok vibe    │ →  │ Spotify     │ →  │ Playlist in  │
-│ OL / GB /   │    │ analysis     │    │ search +    │    │ your account │
-│ Wikipedia   │    │ (JSON)       │    │ rank        │    │              │
-└─────────────┘    └──────────────┘    └─────────────┘    └──────────────┘
+┌──────────────────┐   ┌────────────────────┐   ┌─────────────┐   ┌──────────────┐
+│ Public book data │ → │ Literature-first   │ → │ Spotify     │ → │ Playlist in  │
+│ OL / GB / Wiki / │   │ multi-pass Grok    │   │ search +    │   │ your account │
+│ reception/themes │   │ (literary → music) │   │ vibe rank   │   │              │
+└──────────────────┘   └────────────────────┘   └─────────────┘   └──────────────┘
 ```
 
-1. **Fetch** — Open Library + Google Books for metadata; Wikipedia for plot/chapters  
-2. **Analyze** — Grok maps mood, energy, atmospheres, arcs → Spotify search queries + audio-feature targets  
-3. **Search & rank** — Multi-query search, audio features, lyrics filter, diversity-aware ranking  
-4. **Create** — Named playlist with description (chapter vibe notes in chapter mode)
+### Stage 1 — Book information (public sources only)
 
-Book metadata and vibe analyses are cached under your user cache dir (see `chapterscore doctor`).
+| Signal | Source |
+|--------|--------|
+| Metadata, subjects, tags | Open Library |
+| Publisher blurbs | Google Books |
+| Plot / synopsis, chapter lists | Wikipedia |
+| Critical reception, themes, style | Wikipedia section extraction |
+| Tone language | Snippets mined from reception + blurbs (no illegal full text) |
+
+Missing sources degrade gracefully: analysis still runs on whatever public text is available.
+
+### Stage 2 — Literature-first vibe analysis (v0.4+)
+
+Instead of one generic “music supervisor” pass, ChapterScore runs **two Grok passes**:
+
+1. **Literary pass** — voice, dominant/secondary tones, humor & irony, intimacy vs epic scale, realism vs dreaminess, setting texture, sensory atmosphere, pacing profile, **distinctive signature**, genre-peer contrast, anti-generic notes, and emotional acts (when chapter data is weak).
+2. **Music pass** — maps that profile into `suitable_styles`, `avoid_styles`, and Spotify search queries. Musical language is derived from the literary reading, not the other way around.
+
+**Anti-generic rule:** two dystopian novels (e.g. *1984* vs *Dune*) or two coming-of-age stories should produce clearly different signatures, styles, and query banks — not the same “dark epic cinematic” or “melancholic piano” template.
+
+### Stage 3 — Search & rank
+
+- Query expansion uses voice, setting, suitable styles, intimacy band, and act-level cues  
+- Ranking prioritizes **book vibe fit** over generic cinematic prestige  
+- Intimate books penalize epic trailer / battle scores; epic books may use them  
+- Instrumental-only remains a hard track-level filter when selected  
+
+### Stage 4 — Playlist
+
+Named playlist with description (chapter / act vibe notes in chapter mode).
+
+Book metadata and vibe analyses are cached (book cache `v2`, analysis cache `litv2`). Use `--no-cache` after upgrades.
+
+---
+
+## Testing that two similar-genre books differ
+
+Dry-run two books in the same broad genre and compare the **Signature**, **Scale**, **Music styles**, and **Avoid styles** rows:
+
+```bash
+# Two dystopias — should NOT look the same
+chapterscore generate "1984" -a "George Orwell" --dry-run --no-cache
+chapterscore generate "Dune" -a "Frank Herbert" --dry-run --no-cache
+
+# Two intimate literary / coming-of-age
+chapterscore generate "Normal People" -a "Sally Rooney" --dry-run --no-cache
+chapterscore generate "The Catcher in the Rye" -a "J. D. Salinger" --dry-run --no-cache
+```
+
+What “meaningfully different” looks like:
+
+| Check | *1984* (typical) | *Dune* (typical) |
+|-------|------------------|------------------|
+| Signature | claustrophobic, clinical, psychological | ecological messianism, desert mythic scale |
+| `intimacy_vs_epic` | high (intimate/personal dread) | low (epic/sweeping) |
+| Music styles | cold ambient, bleak piano, tense minimalism | hybrid orchestral, desert ambient, ritual |
+| Avoid / anti-generic | NOT epic battle / trailer | NOT bedroom indie / bubblegum |
+| Queries | surveillance, bleak, electronic dread | desert, empire, sandstorm, space opera |
+
+Unit tests encode the same idea without live APIs:
+
+```bash
+pytest tests/test_literary_vibe.py -q
+```
 
 ---
 
