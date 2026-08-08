@@ -62,24 +62,25 @@ class Settings(BaseSettings):
     chapterscore_tracks_per_chapter: int = Field(default=3, ge=1, le=15)
     chapterscore_tracks_overall: int = Field(default=20, ge=5, le=100)
     # Desired candidates per query (paginated in pages of ≤10 — many apps cap limit at 10)
-    chapterscore_max_search_results: int = Field(default=20, ge=5, le=50)
+    # Quality-over-speed: larger candidate pools (paginated ≤10/page)
+    chapterscore_max_search_results: int = Field(default=30, ge=5, le=50)
     # Soft floor: aim for at least this many tracks / hours when possible
     chapterscore_min_tracks: int = Field(default=12, ge=1, le=100)
     chapterscore_min_hours: float = Field(default=1.5, ge=0.0, le=6.0)
-    # Spotify resilience
+    # Spotify resilience — longer budget for thorough cinematic searches
     chapterscore_spotify_timeout: float = Field(
-        default=10.0, ge=3.0, le=30.0, description="Hard wall-clock timeout per Spotify API call (s)"
+        default=12.0, ge=3.0, le=30.0, description="Hard wall-clock timeout per Spotify API call (s)"
     )
     chapterscore_spotify_requests_timeout: float = Field(
-        default=8.0, ge=2.0, le=30.0, description="requests library timeout for spotipy (s)"
+        default=10.0, ge=2.0, le=30.0, description="requests library timeout for spotipy (s)"
     )
     chapterscore_spotify_max_429_sleep: float = Field(
         default=3.0, ge=0.0, le=15.0, description="Max seconds to sleep on HTTP 429"
     )
     chapterscore_spotify_collection_budget: float = Field(
-        default=90.0,
+        default=180.0,
         ge=20.0,
-        le=300.0,
+        le=600.0,
         description="Global wall-clock budget for the entire track-collection phase (s)",
     )
     chapterscore_cache_dir: str = ""

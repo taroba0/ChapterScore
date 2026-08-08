@@ -51,6 +51,21 @@ def test_instrumental_only_accepts_score():
     )
 
 
+def test_instrumental_only_rejects_mid_instrumentalness():
+    t = _t(
+        "Maybe Vocal",
+        ["Band"],
+        features={"instrumentalness": 0.45, "speechiness": 0.05},
+        mq="cinematic soundtrack",
+    )
+    assert passes_lyrics_filter(t, LyricsPreference.INSTRUMENTAL_ONLY) is False
+
+
+def test_query_alone_cannot_admit_random_track():
+    t = _t("Hello", ["Adele"], features={}, mq="cinematic orchestral soundtrack instrumental")
+    assert passes_lyrics_filter(t, LyricsPreference.INSTRUMENTAL_ONLY) is False
+
+
 def test_allow_lyrics_accepts_vocals():
     vocal = _t("Love Song", ["Singer"], features={"instrumentalness": 0.05})
     assert passes_lyrics_filter(vocal, LyricsPreference.ALLOW_LYRICS) is True

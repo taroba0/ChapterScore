@@ -74,17 +74,35 @@ def test_strict_accepts_high_instrumentalness():
     )
 
 
-def test_missing_features_allowed_when_query_flavored_strict():
-    """Without audio features, soundtrack-flavored searches still pass STRICT."""
+def test_query_flavor_alone_does_not_pass_instrumental_strict():
+    """Search query containing 'soundtrack' must NOT free-pass vocal tracks."""
     t = _track(
         "nf1",
-        "Arrival of the Birds",
-        ["The Cinematic Orchestra"],
+        "Love Song Radio Edit",
+        ["Pop Vocalist"],
         features={},
         matched_query="cinematic orchestral soundtrack",
     )
     assert (
-        passes_lyrics_filter(t, LyricsPreference.INSTRUMENTAL_ONLY, strictness=InstrumentalStrictness.STRICT)
+        passes_lyrics_filter(
+            t, LyricsPreference.INSTRUMENTAL_ONLY, strictness=InstrumentalStrictness.STRICT
+        )
+        is False
+    )
+
+
+def test_score_artist_passes_without_features():
+    t = _track(
+        "nf1b",
+        "Cornfield Chase",
+        ["Hans Zimmer"],
+        features={},
+        matched_query="anything",
+    )
+    assert (
+        passes_lyrics_filter(
+            t, LyricsPreference.INSTRUMENTAL_ONLY, strictness=InstrumentalStrictness.STRICT
+        )
         is True
     )
 

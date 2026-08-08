@@ -97,8 +97,9 @@ class PersonalizationPrefs(BaseModel):
     taste_strength: TasteStrength = TasteStrength.TOP_10
     use_recommendations: bool = True
     # 0 = max comfort (familiar artists), 100 = max exploration (new artists)
-    exploration: int = Field(default=40, ge=0, le=100)
-    min_popularity: int = Field(default=28, ge=0, le=100)
+    # Default leans comfort (user wants familiarity); 0=comfort, 100=explore
+    exploration: int = Field(default=25, ge=0, le=100)
+    min_popularity: int = Field(default=30, ge=0, le=100)
 
     @property
     def comfort(self) -> float:

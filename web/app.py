@@ -349,7 +349,7 @@ def main() -> None:
             "Exploration vs comfort",
             min_value=0,
             max_value=100,
-            value=40,
+            value=25,
             help=(
                 "0 = stick close to artists you already love · "
                 "100 = discover more new artists (still matching the book). "

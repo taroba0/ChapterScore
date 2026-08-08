@@ -32,7 +32,7 @@ T = TypeVar("T")
 
 # Spotify Web API: many apps reject search limit > 10.
 _SEARCH_PAGE_SIZE = 10
-_MAX_PAGES_DEFAULT = 2
+_MAX_PAGES_DEFAULT = 3  # quality over speed: up to 30 hits per query
 
 # Timeouts (seconds) — overridable via settings
 _DEFAULT_REQUEST_TIMEOUT = 10.0  # requests connect+read

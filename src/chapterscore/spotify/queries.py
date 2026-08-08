@@ -33,6 +33,105 @@ _INSTRUMENTAL_SEEDS = [
     "quiet reflective guitar instrumental",
 ]
 
+# Dedicated film-score universe for Instrumental only (quality over quantity)
+_CINEMATIC_CORE = [
+    "hans zimmer",
+    "hans zimmer interstellar",
+    "hans zimmer dune",
+    "hans zimmer inception",
+    "hans zimmer pirates of the caribbean",
+    "john williams",
+    "howard shore lord of the rings",
+    "james horner avatar",
+    "james horner",
+    "thomas newman",
+    "ramin djawadi",
+    "ludwig goransson",
+    "two steps from hell",
+    "thomas bergersen",
+    "audiomachine",
+    "immediate music",
+    "klaus badelt",
+    "alan silvestri",
+    "danny elfman",
+    "john powell",
+    "michael giacchino",
+    "alexandre desplat",
+    "ennio morricone",
+    "joe hisaishi",
+    "vangelis blade runner",
+    "max richter",
+    "johann johannsson",
+    "hildur gudnadottir",
+    "epic orchestral film score",
+    "cinematic trailer music instrumental",
+    "hybrid orchestral trailer",
+    "dark cinematic score",
+    "emotional film score piano",
+    "adventure film soundtrack instrumental",
+    "sci fi orchestral score",
+    "fantasy film score",
+    "original motion picture soundtrack instrumental",
+]
+
+
+def cinematic_instrumental_queries(
+    analysis: BookVibeAnalysis,
+    *,
+    max_queries: int = 28,
+) -> list[SearchQuerySpec]:
+    """
+    High-quality film-score / cinematic query bank for Instrumental only mode.
+
+    Prioritizes named composers and OST language over abstract mood adjectives.
+    """
+    energy = analysis.overall_energy if analysis.overall_energy is not None else 0.55
+    mood = (analysis.overall_mood or "epic").lower()
+    out: list[SearchQuerySpec] = []
+    seen: set[str] = set()
+
+    def add(q: str, reason: str = "cinematic-core") -> None:
+        key = " ".join(q.lower().split())
+        if not key or key in seen:
+            return
+        seen.add(key)
+        out.append(
+            SearchQuerySpec(
+                query=q,
+                energy=energy,
+                instrumentalness_min=0.75,
+                mood_keywords=[mood],
+                genres=["soundtrack", "score"],
+                reason=reason,
+            )
+        )
+
+    for q in _CINEMATIC_CORE:
+        add(q)
+        if len(out) >= max_queries - 6:
+            break
+
+    # Book-mood flavored cinematic queries
+    for phrase in (
+        f"{mood} film score",
+        f"{mood} cinematic orchestral",
+        f"{mood} soundtrack instrumental",
+        "cinematic orchestral soundtrack",
+        "epic film score instrumental",
+        "emotional orchestral soundtrack",
+    ):
+        add(phrase, reason="cinematic-mood")
+
+    # Atmosphere → film-score phrasing
+    for atm in (analysis.atmospheres or [])[:5]:
+        add(f"{atm} film score", reason=f"cine-atm:{atm}")
+        add(f"{atm} cinematic score instrumental", reason=f"cine-atm2:{atm}")
+
+    if analysis.era_feel:
+        add(f"{analysis.era_feel} film score", reason="era-score")
+
+    return out[:max_queries]
+
 _VOCAL_FRIENDLY_SEEDS = [
     "cinematic indie anthem",
     "atmospheric dream pop",

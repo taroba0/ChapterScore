@@ -214,10 +214,10 @@ def generate_cmd(
         help="Use Spotify Recommendations API seeded with your taste + book vibe (default: on).",
     ),
     exploration: int = typer.Option(
-        40,
+        25,
         "--exploration",
         "-e",
-        help="0=max comfort (familiar artists) … 100=max exploration (new artists). Default: 40.",
+        help="0=max comfort (familiar artists) … 100=max exploration (new artists). Default: 25.",
         min=0,
         max=100,
     ),

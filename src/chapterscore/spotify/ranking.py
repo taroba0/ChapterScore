@@ -37,12 +37,28 @@ _INSTRUMENTAL_CUES = re.compile(
 _VOCAL_HARD = re.compile(
     r"\b("
     r"lyrics|with\s+vocals?|a\s*cappella|acapella|sing[- ]?along|"
-    r"karaoke|radio\s*edit|official\s*video|music\s*video"
+    r"karaoke|radio\s*edit|official\s*video|music\s*video|"
+    r"vocal\s*version|sung\s*version| sing\b|sings\b|singer\b|"
+    r"rap\b|rapping|hip[\s-]?hop|r&b|rnb\b|pop\s*hit|"
+    r"feat\.|ft\.|featuring"
     r")\b",
     re.IGNORECASE,
 )
 _VOCAL_SOFT = re.compile(
-    r"\b(feat\.|ft\.|featuring|remix|cover)\b",
+    r"\b(remix|cover|radio|live\s*session|unplugged)\b",
+    re.IGNORECASE,
+)
+# Genres/styles that almost always imply sung vocals — hard reject in instrumental-only
+_VOCAL_GENRE_BLOCK = re.compile(
+    r"\b("
+    r"country|bluegrass|honky[\s-]?tonk|nashville|"
+    r"hip[\s-]?hop|trap\b|drill\b|grime\b|"
+    r"k-?pop|j-?pop|boy\s*band|girl\s*group|"
+    r"reggae|dancehall|soca|"
+    r"death\s*metal|black\s*metal|screamo|hardcore\s*punk|"
+    r"gospel|worship\s*song|christian\s*rock|"
+    r"opera\s*aria"  # sung opera — keep "orchestral" separate
+    r")\b",
     re.IGNORECASE,
 )
 _UNDESIRABLE = re.compile(
@@ -114,7 +130,28 @@ _SCORE_ARTISTS = re.compile(
     r"steve jablonsky|harry gregson[- ]williams|lisa gerrard|"
     r"dead can dance|carbon based lifeforms|solar fields|aes dana|"
     r"philip glass|arvo p[äa]rt|eric whitacre|ólafur arnalds|ólöf arnalds|"
-    r"kiasmos|a winged victory for the sullen"
+    r"kiasmos|a winged victory for the sullen|"
+    # Extra cinematic / trailer universe
+    r"hans zimmer|klaus badelt|heitor pereira|lorne balfe|rupert gregson[- ]williams|"
+    r"brian tyler|marco beltrami|tyler bates|jed kurzel|johann johannsson|"
+    r"dario marianelli|patrick doyle|nicholas hooper|alexandre desplat|"
+    r"john debney|jerry goldsmith|ennio morricone|basil poledouris|"
+    r"trevor morris|brian eno|raphael beau|austin wintory|gareth coker|"
+    r"inon zur|jeremy soule|yasunori mitsuda|nobuo uematsu|"
+    r"thomas bergersen|nick phoenix|globus|really slow motion|"
+    r"brand x music|elephant music|corner stone cinematic"
+    r")",
+    re.IGNORECASE,
+)
+
+_CINEMATIC_ALBUM = re.compile(
+    r"("
+    r"soundtrack|motion\s*picture|original\s*score|ost\b|film\s*score|"
+    r"television\s*series|video\s*game|game\s*soundtrack|"
+    r"interstellar|inception|dune|avatar|gladiator|pirates\s*of\s*the\s*caribbean|"
+    r"harry\s*potter|lord\s*of\s*the\s*rings|the\s*hobbit|star\s*wars|"
+    r"dark\s*knight|batman|man\s*of\s*steel|blade\s*runner|"
+    r"last\s*of\s*us|god\s*of\s*war|skyrim|zelda|final\s*fantasy"
     r")",
     re.IGNORECASE,
 )
@@ -129,7 +166,7 @@ def is_likely_instrumental(track: RankedTrack) -> bool | None:
     Ternary detector: True / False / None (unknown).
 
     When audio features are unavailable (common 403), rely on title, album,
-    known score artists, and query provenance — never require features.
+    and known score artists — **never** on the search query string alone.
     """
     inst = track.features.get("instrumentalness")
     speech = track.features.get("speechiness")
@@ -138,29 +175,75 @@ def is_likely_instrumental(track: RankedTrack) -> bool | None:
     blob = f"{name} {album}"
     artists = _artist_blob(track)
 
+    if _VOCAL_HARD.search(blob) or _VOCAL_GENRE_BLOCK.search(blob):
+        return False
+
     if inst is not None:
-        if inst >= 0.65:
+        if inst >= 0.75:
             return True
-        if inst <= 0.20 and (speech is None or speech >= 0.04):
+        if inst >= 0.55 and (speech is None or speech < 0.08):
+            return True
+        if inst <= 0.35:
             return False
-        if inst <= 0.35 and speech is not None and speech > 0.15:
+        if inst <= 0.50 and speech is not None and speech > 0.12:
             return False
 
-    if _INSTRUMENTAL_CUES.search(blob):
-        if inst is not None and inst < 0.15 and speech is not None and speech > 0.2:
+    if speech is not None and speech > 0.15:
+        return False
+
+    if _INSTRUMENTAL_CUES.search(blob) or _CINEMATIC_ALBUM.search(blob):
+        if inst is not None and inst < 0.25:
             return False
         return True
 
     if _SCORE_ARTISTS.search(artists) or _SCORE_ARTISTS.search(album):
-        # Known score/ambient composers — treat as instrumental unless title screams vocals
         if _VOCAL_HARD.search(name):
             return False
         return True
 
-    if _VOCAL_HARD.search(name):
-        return False
-
     return None
+
+
+def has_track_level_instrumental_signal(track: RankedTrack) -> bool:
+    """
+    Positive evidence ON THE TRACK (not the search query) that it is instrumental/cinematic.
+
+    Critical: matched_query must never be used as a free pass — that caused vocal
+    tracks from soundtrack-flavored searches to leak through.
+    """
+    name = track.name or ""
+    album = track.album or ""
+    artists = _artist_blob(track)
+    blob = f"{name} {album}"
+    inst = track.features.get("instrumentalness")
+    speech = track.features.get("speechiness")
+
+    if inst is not None and inst >= 0.70 and (speech is None or speech < 0.12):
+        return True
+    if _INSTRUMENTAL_CUES.search(blob):
+        return True
+    if _CINEMATIC_ALBUM.search(album) or _CINEMATIC_ALBUM.search(name):
+        return True
+    if _SCORE_ARTISTS.search(artists):
+        return True
+    return False
+
+
+def cinematic_fit(track: RankedTrack) -> float:
+    """0–1 how strongly this track sits in the film-score / cinematic universe."""
+    score = 0.0
+    artists = _artist_blob(track)
+    blob = f"{track.name or ''} {track.album or ''}"
+    if _SCORE_ARTISTS.search(artists):
+        score += 0.55
+    if _CINEMATIC_ALBUM.search(blob):
+        score += 0.35
+    if _INSTRUMENTAL_CUES.search(blob):
+        score += 0.15
+    inst = track.features.get("instrumentalness")
+    if inst is not None:
+        score += 0.25 * min(1.0, inst)
+    return min(1.0, score)
 
 
 def _query_is_instrumental_flavored(query: str) -> bool:
@@ -179,23 +262,27 @@ def quality_penalty(track: RankedTrack, *, popularity_known: bool = True) -> flo
     factor = 1.0
     blob = f"{track.name or ''} {' '.join(track.artists or [])}"
     if _LOW_QUALITY.search(blob):
-        factor *= 0.55
-    # Only apply popularity penalties when the API actually returns values
+        factor *= 0.45
     if popularity_known:
         if track.popularity <= 0:
-            factor *= 0.45
-        elif track.popularity < 10:
-            factor *= 0.7
-        elif track.popularity < 25:
-            factor *= 0.85
-    # Boost known score / ambient artists (critical when popularity is null)
+            factor *= 0.55
+        elif track.popularity < 15:
+            factor *= 0.75
+        elif track.popularity < 30:
+            factor *= 0.9
+    # Strong boost for known film composers / OST albums
     if _SCORE_ARTISTS.search(" ".join(track.artists or [])):
+        factor *= 1.55
+    album = track.album or ""
+    if _CINEMATIC_ALBUM.search(album):
         factor *= 1.35
-    # Album name cues for official soundtracks
-    album = (track.album or "").lower()
-    if any(k in album for k in ("soundtrack", "motion picture", "score", "ost")):
-        factor *= 1.15
-    return min(1.5, factor)
+    elif any(k in album.lower() for k in ("soundtrack", "motion picture", "score", "ost")):
+        factor *= 1.2
+    # Cinematic fit as continuous quality signal
+    cf = cinematic_fit(track)
+    if cf > 0.4:
+        factor *= 1.0 + 0.35 * cf
+    return min(2.0, factor)
 
 
 def passes_lyrics_filter(
@@ -207,10 +294,8 @@ def passes_lyrics_filter(
     """
     Priority-1 HARD filter for vocal policy.
 
-    - ALLOW_LYRICS: only reject junk/karaoke
-    - PREFER_INSTRUMENTAL: soft mode — almost everything passes (scoring biases instrumental)
-    - INSTRUMENTAL_ONLY: hard reject clear vocals; ``strictness`` only relaxes
-      uncertainty when features are missing — never admits clear vocal tracks.
+    INSTRUMENTAL_ONLY is intentionally harsh: prefer empty pool over vocals.
+    Track-level evidence is required — search-query wording is never enough.
     """
     if is_undesirable(track):
         return False
@@ -218,69 +303,65 @@ def passes_lyrics_filter(
     mode = lyrics.normalized()
     name = track.name or ""
     album = track.album or ""
-    blob = f"{name} {album}"
+    artists = _artist_blob(track)
+    blob = f"{name} {album} {artists}"
     inst = track.features.get("instrumentalness")
     speech = track.features.get("speechiness")
     likely = is_likely_instrumental(track)
-    flavored = _query_is_instrumental_flavored(track.matched_query or "")
 
     if mode is LyricsPreference.ALLOW_LYRICS:
         return True
 
     if mode is LyricsPreference.PREFER_INSTRUMENTAL:
-        # Soft preference only — keep karaoke out, let scoring prefer instrumental
-        if "karaoke" in name.lower():
+        if "karaoke" in name.lower() or _UNDESIRABLE.search(blob):
             return False
         return True
 
-    # ── INSTRUMENTAL_ONLY (hard) ──────────────────────────────────────────
-    # Always reject explicit vocal markers regardless of progressive stage
-    if _VOCAL_HARD.search(blob):
+    # ── INSTRUMENTAL_ONLY (very strict hard filter) ───────────────────────
+    # Hard negatives — never admit these at any strictness level
+    if _VOCAL_HARD.search(blob) or _VOCAL_GENRE_BLOCK.search(blob):
         return False
-    if speech is not None and speech > 0.40:
+    if speech is not None and speech > 0.18:
         return False
     if likely is False:
         return False
-    if inst is not None and inst < 0.35:
-        # Clear non-instrumental audio features
+    if inst is not None and inst < 0.50:
+        return False
+    if _VOCAL_SOFT.search(name) and not has_track_level_instrumental_signal(track):
         return False
 
+    # Thresholds by progressive strictness (only relax uncertainty, not vocals)
     if strictness == InstrumentalStrictness.STRICT:
-        if speech is not None and speech > 0.25:
+        if speech is not None and speech > 0.10:
             return False
         if inst is not None:
-            return inst >= 0.60
-        # No features: require title/artist instrumental cue OR score-query provenance
-        return likely is True or flavored or bool(_INSTRUMENTAL_CUES.search(blob))
+            return inst >= 0.75 and (speech is None or speech < 0.10)
+        # No features: require strong track-level cinematic/instrumental evidence
+        return has_track_level_instrumental_signal(track) and likely is not False
 
     if strictness == InstrumentalStrictness.MODERATE:
-        if speech is not None and speech > 0.33:
+        if speech is not None and speech > 0.14:
             return False
         if inst is not None:
-            return inst >= 0.45 or likely is True
-        if _VOCAL_SOFT.search(name) and not _INSTRUMENTAL_CUES.search(blob):
-            return False
-        return likely is True or flavored or bool(_INSTRUMENTAL_CUES.search(blob))
+            return inst >= 0.62
+        return has_track_level_instrumental_signal(track)
 
     if strictness == InstrumentalStrictness.RELAXED:
-        if speech is not None and speech > 0.40:
+        if speech is not None and speech > 0.16:
             return False
-        if inst is not None and inst < 0.35:
+        if inst is not None and inst < 0.55:
             return False
-        # Still require some positive instrumental signal when features missing
-        if inst is None and likely is not True and not flavored:
-            if not _INSTRUMENTAL_CUES.search(blob) and not _SCORE_ARTISTS.search(
-                " ".join(track.artists or [])
-            ):
-                return False
-        return likely is not False
+        # Still need positive track-level signal
+        return has_track_level_instrumental_signal(track) or (
+            likely is True and _SCORE_ARTISTS.search(artists)
+        )
 
-    # PERMISSIVE last resort for instrumental-only: still block clear vocals
-    if inst is not None and inst < 0.30:
+    # PERMISSIVE last resort — still quality-first, still no clear vocals
+    if inst is not None and inst < 0.50:
         return False
     if likely is False:
         return False
-    return True
+    return has_track_level_instrumental_signal(track) or likely is True
 
 
 # Genre / style clash tokens (normalized lowercase substrings)
@@ -469,53 +550,68 @@ def score_track(
     taste_score = taste_affinity
     novelty_score = 1.0 - taste_affinity
 
-    # Vibe weights dominate; personalization is smaller and always after style
-    if feats and popularity_known:
-        feature_weight, pop_weight, prov_weight = 34.0, 18.0, 12.0
-    elif feats:
-        feature_weight, pop_weight, prov_weight = 38.0, 10.0, 14.0
-    elif popularity_known:
-        feature_weight, pop_weight, prov_weight = 14.0, 26.0, 14.0
-    else:
-        feature_weight, pop_weight, prov_weight = 12.0, 10.0, 28.0
+    # Instrumental-only: cinematic purity dominates ranking
+    cine = cinematic_fit(track) if mode is LyricsPreference.INSTRUMENTAL_ONLY else 0.0
 
-    # Priority 3–4: exploration + taste (capped; never outweigh vibe)
-    taste_weight = 18.0 * comfort
-    novelty_weight = 18.0 * explore
-    if taste_affinity <= 0 and explore < 0.05:
-        feature_weight += 10.0
-        pop_weight += 8.0
+    if mode is LyricsPreference.INSTRUMENTAL_ONLY:
+        # Quality-first cinematic mix (taste is usually disabled here)
+        feature_weight, pop_weight, prov_weight = 22.0, 12.0, 8.0
+        cine_weight = 38.0
         taste_weight = 0.0
-        novelty_weight = 0.0
+        novelty_weight = 8.0 * explore  # small exploration only
+    else:
+        if feats and popularity_known:
+            feature_weight, pop_weight, prov_weight = 28.0, 16.0, 10.0
+        elif feats:
+            feature_weight, pop_weight, prov_weight = 32.0, 10.0, 12.0
+        elif popularity_known:
+            feature_weight, pop_weight, prov_weight = 12.0, 24.0, 12.0
+        else:
+            feature_weight, pop_weight, prov_weight = 12.0, 10.0, 24.0
+        cine_weight = 0.0
+        # Stronger personal taste when lyrics allowed (comfort-oriented)
+        taste_weight = 32.0 * comfort + 8.0  # floor so taste always matters somewhat
+        novelty_weight = 14.0 * explore
+        if taste_affinity <= 0:
+            # No personal data — put weight back into vibe/pop
+            feature_weight += taste_weight * 0.5
+            pop_weight += taste_weight * 0.3
+            novelty_weight += taste_weight * 0.2
+            taste_weight = 0.0
 
     score = (
         feature_weight * feature_fit
         + pop_weight * pop_score
-        + 12.0 * overlap
+        + 10.0 * overlap
         + prov_weight * provenance
-        + 10.0 * diversity
+        + 8.0 * diversity
         + taste_weight * taste_score
         + novelty_weight * novelty_score
+        + cine_weight * cine
     ) * duration_factor * quality_penalty(track, popularity_known=popularity_known) * style_mult
 
     if mode is LyricsPreference.INSTRUMENTAL_ONLY:
         likely = is_likely_instrumental(track)
         if likely is True:
-            score += 10.0
+            score += 12.0
         elif likely is False:
-            score -= 20.0
+            score -= 30.0
         inst = feats.get("instrumentalness")
         if inst is not None:
-            score += 12.0 * inst
+            score += 16.0 * inst
+        # Extra purity: reject-ish scoring for weak instrumentalness even if filtered
+        if inst is not None and inst < 0.7:
+            score *= 0.75
+        score += 15.0 * cine
     elif mode is LyricsPreference.PREFER_INSTRUMENTAL:
         if is_likely_instrumental(track) is True:
-            score += 6.0
+            score += 8.0
         inst = feats.get("instrumentalness")
         if inst is not None:
-            score += 6.0 * inst
+            score += 8.0 * inst
 
     if from_recommendations:
-        score += 2.5 * (0.5 + 0.5 * comfort)
+        score += 3.0 * (0.4 + 0.6 * comfort)
 
     return round(score, 3)
 

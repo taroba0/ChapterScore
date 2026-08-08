@@ -22,9 +22,9 @@ def test_personalization_defaults():
     p = PersonalizationPrefs()
     assert p.taste_strength == TasteStrength.TOP_10
     assert p.use_recommendations is True
-    assert p.exploration == 40
-    assert abs(p.comfort - 0.6) < 1e-6
-    assert abs(p.explore - 0.4) < 1e-6
+    assert p.exploration == 25  # comfort-oriented default
+    assert abs(p.comfort - 0.75) < 1e-6
+    assert abs(p.explore - 0.25) < 1e-6
 
 
 def test_affinity_lookup():
