@@ -270,19 +270,15 @@ def quality_penalty(track: RankedTrack, *, popularity_known: bool = True) -> flo
             factor *= 0.75
         elif track.popularity < 30:
             factor *= 0.9
-    # Strong boost for known film composers / OST albums
+    # Mild quality cues only — book vibe multiplier decides epic vs intimate fit
     if _SCORE_ARTISTS.search(" ".join(track.artists or [])):
-        factor *= 1.55
+        factor *= 1.12
     album = track.album or ""
     if _CINEMATIC_ALBUM.search(album):
-        factor *= 1.35
+        factor *= 1.1
     elif any(k in album.lower() for k in ("soundtrack", "motion picture", "score", "ost")):
-        factor *= 1.2
-    # Cinematic fit as continuous quality signal
-    cf = cinematic_fit(track)
-    if cf > 0.4:
-        factor *= 1.0 + 0.35 * cf
-    return min(2.0, factor)
+        factor *= 1.08
+    return min(1.6, factor)
 
 
 def passes_lyrics_filter(
@@ -412,13 +408,116 @@ def style_clash_score(
     if hits:
         mult *= min(1.25, 1.0 + 0.08 * hits)
 
-    # Soft boost for known film-score artists when suitable includes orchestral/ambient
+    # Soft boost for score artists only when suitable styles invite them
     suitable_l = " ".join(suitable or []).lower()
-    if any(k in suitable_l for k in ("orchestral", "soundtrack", "ambient", "cinematic", "score")):
+    if any(
+        k in suitable_l
+        for k in (
+            "orchestral",
+            "soundtrack",
+            "ambient",
+            "cinematic",
+            "score",
+            "neoclassical",
+            "piano",
+        )
+    ):
         if _SCORE_ARTISTS.search(" ".join(track.artists or "")):
-            mult *= 1.1
+            mult *= 1.08
 
     return max(0.15, min(1.35, mult))
+
+
+_EPIC_TRAILER_MARKERS = re.compile(
+    r"("
+    r"two steps from hell|thomas bergersen|audiomachine|immediate music|"
+    r"pirates of the caribbean|lord of the rings|gladiator|dark knight|"
+    r"hunger games|man of steel|transformers|avengers|battle|war drums|"
+    r"trailer music|epic orchestral|hybrid trailer|brass fanfare|"
+    r"klaus badelt|steve jablonsky"
+    r")",
+    re.IGNORECASE,
+)
+
+_INTIMATE_MARKERS = re.compile(
+    r"("
+    r"max richter|nils frahm|olafur arnalds|ólafur arnalds|ludovico einaudi|yann tiersen|"
+    r"yiruma|library tapes|dustin o.?halloran|winged victory|"
+    r"piano|nocturne|lullaby|intimate|delicate|quiet|soft|"
+    r"chamber|neoclassical|bittersweet|nostalg"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def book_vibe_multiplier(
+    track: RankedTrack,
+    *,
+    book_energy: float | None = None,
+    atmospheres: list[str] | None = None,
+    overall_mood: str | None = None,
+    key_themes: list[str] | None = None,
+) -> float:
+    """
+    Multiplier ~[0.18, 1.45] for how well a track fits the book's emotional world.
+
+    Penalizes generic epic/trailer scores when the book is intimate/bittersweet.
+    """
+    energy = 0.5 if book_energy is None else float(book_energy)
+    atms = {a.lower() for a in (atmospheres or [])}
+    mood = (overall_mood or "").lower()
+    themes = " ".join(key_themes or []).lower()
+    blob = f"{track.name} {track.album} {' '.join(track.artists)} {track.matched_query}".lower()
+
+    mult = 1.0
+    intimate_book = energy <= 0.5 or bool(
+        atms & {"intimate", "melancholic", "nostalgic", "hopeful", "playful", "romantic", "calm"}
+    )
+    epic_book = energy >= 0.7 or bool(atms & {"epic", "triumphant", "adventurous", "angry"})
+
+    vibe_tokens: set[str] = set()
+    for a in atms:
+        vibe_tokens.update(w for w in re.findall(r"[a-z]+", a) if len(w) > 3)
+    vibe_tokens.update(w for w in re.findall(r"[a-z]+", mood) if len(w) > 3)
+    vibe_tokens.update(w for w in re.findall(r"[a-z]+", themes) if len(w) > 3)
+    vibe_tokens -= {"music", "book", "story", "novel", "life", "time", "world"}
+    hits = sum(1 for t in vibe_tokens if t in blob)
+    if hits:
+        mult *= min(1.35, 1.0 + 0.07 * hits)
+
+    t_energy = track.features.get("energy")
+    if t_energy is not None:
+        gap = abs(t_energy - energy)
+        if gap > 0.35:
+            mult *= max(0.35, 1.0 - 1.1 * (gap - 0.35))
+        elif gap < 0.15:
+            mult *= 1.08
+
+    if intimate_book and not epic_book:
+        if _EPIC_TRAILER_MARKERS.search(blob):
+            mult *= 0.22
+        if re.search(
+            r"hans zimmer|two steps|john williams|howard shore",
+            blob,
+            re.I,
+        ) and not _INTIMATE_MARKERS.search(blob):
+            if re.search(
+                r"battle|pirates|gladiator|dark knight|inception\s*main|\btime\b",
+                blob,
+                re.I,
+            ):
+                mult *= 0.35
+            elif energy < 0.45:
+                mult *= 0.55
+        if _INTIMATE_MARKERS.search(blob):
+            mult *= 1.22
+
+    if epic_book and _EPIC_TRAILER_MARKERS.search(blob):
+        mult *= 1.15
+    if epic_book and _INTIMATE_MARKERS.search(blob) and energy > 0.75:
+        mult *= 0.85
+
+    return max(0.18, min(1.45, mult))
 
 
 def _feature_distance(actual: float | None, target: float | None, weight: float = 1.0) -> float:
@@ -462,24 +561,30 @@ def score_track(
     from_recommendations: bool = False,
     suitable_styles: list[str] | None = None,
     avoid_styles: list[str] | None = None,
+    book_energy: float | None = None,
+    atmospheres: list[str] | None = None,
+    overall_mood: str | None = None,
+    key_themes: list[str] | None = None,
 ) -> float:
     """
     Composite score ~0–100 with hard priority:
 
       1. Lyrics filter applied *before* scoring (caller)
-      2. Book vibe + style fit (largest weight / style multiplier)
-      3. Exploration vs comfort
-      4. Personal taste affinity (softest; never overrides 1–2)
+      2. Book vibe & emotional tone (largest weight)
+      3. User taste / comfort
+      4. Light cinematic preference only when it fits the book
     """
     if seen_ids and track.id in seen_ids:
         return -1.0
 
     mode = lyrics.normalized()
     feats = track.features
+    # Prefer energy target from book when available
+    energy_target = book_energy if book_energy is not None else spec.energy
     fit_parts = [
-        _feature_distance(feats.get("energy"), spec.energy, 1.2),
-        _feature_distance(feats.get("valence"), spec.valence, 1.0),
-        _feature_distance(feats.get("acousticness"), spec.acousticness, 0.6),
+        _feature_distance(feats.get("energy"), energy_target, 1.4),
+        _feature_distance(feats.get("valence"), spec.valence, 1.1),
+        _feature_distance(feats.get("acousticness"), spec.acousticness, 0.7),
         _feature_distance(feats.get("danceability"), spec.danceability, 0.4),
     ]
     if spec.tempo_bpm and feats.get("tempo"):
@@ -493,14 +598,14 @@ def score_track(
             fit_parts.append(min(1.0, inst / target))
         elif is_likely_instrumental(track) is True:
             fit_parts.append(0.9)
-        elif _query_is_instrumental_flavored(track.matched_query or ""):
-            fit_parts.append(0.7)
+        elif has_track_level_instrumental_signal(track):
+            fit_parts.append(0.75)
         else:
-            fit_parts.append(0.4)
+            fit_parts.append(0.35)
     elif mode is LyricsPreference.PREFER_INSTRUMENTAL:
         inst = feats.get("instrumentalness")
         if inst is not None:
-            fit_parts.append(0.35 + 0.65 * inst)  # soft preference
+            fit_parts.append(0.35 + 0.65 * inst)
         elif is_likely_instrumental(track) is True:
             fit_parts.append(0.85)
         else:
@@ -519,11 +624,13 @@ def score_track(
 
     overlap = _keyword_overlap(spec, track)
 
-    provenance = 1.0 if _query_is_instrumental_flavored(track.matched_query or "") else 0.7
+    provenance = 0.75
+    if has_track_level_instrumental_signal(track):
+        provenance = 0.9
     if mode is LyricsPreference.ALLOW_LYRICS:
         provenance = 0.85 + 0.15 * overlap
     if from_recommendations:
-        provenance = max(provenance, 0.9)
+        provenance = max(provenance, 0.88)
 
     diversity = 1.0
     if artist_counts and track.artists:
@@ -540,9 +647,14 @@ def score_track(
     else:
         duration_factor = 0.85
 
-    # Priority 2: book style multiplier (can heavily down-rank clashes)
-    style_mult = style_clash_score(
-        track, suitable=suitable_styles, avoid=avoid_styles
+    # Priority 2: book emotional world (dominant)
+    style_mult = style_clash_score(track, suitable=suitable_styles, avoid=avoid_styles)
+    vibe_mult = book_vibe_multiplier(
+        track,
+        book_energy=book_energy if book_energy is not None else spec.energy,
+        atmospheres=atmospheres,
+        overall_mood=overall_mood,
+        key_themes=key_themes,
     )
 
     explore = max(0.0, min(1.0, exploration / 100.0))
@@ -550,59 +662,65 @@ def score_track(
     taste_score = taste_affinity
     novelty_score = 1.0 - taste_affinity
 
-    # Instrumental-only: cinematic purity dominates ranking
-    cine = cinematic_fit(track) if mode is LyricsPreference.INSTRUMENTAL_ONLY else 0.0
+    # Light cinematic bonus only when book vibe allows it (not forced)
+    cine = cinematic_fit(track)
+    e = book_energy if book_energy is not None else (spec.energy or 0.5)
+    atms = {a.lower() for a in (atmospheres or [])}
+    intimate = e <= 0.5 or bool(
+        atms & {"intimate", "melancholic", "nostalgic", "hopeful", "playful", "romantic", "calm"}
+    )
+    if intimate and e < 0.65:
+        # Intimate books: only reward delicate cinematic, not epic
+        cine_weight = 6.0 * (1.0 if _INTIMATE_MARKERS.search(
+            f"{track.name} {track.album} {' '.join(track.artists)}"
+        ) else 0.25)
+    else:
+        cine_weight = 10.0  # mild preference when epic/drama fits
 
+    # Vibe-first weights
     if mode is LyricsPreference.INSTRUMENTAL_ONLY:
-        # Quality-first cinematic mix (taste is usually disabled here)
-        feature_weight, pop_weight, prov_weight = 22.0, 12.0, 8.0
-        cine_weight = 38.0
-        taste_weight = 0.0
-        novelty_weight = 8.0 * explore  # small exploration only
+        feature_weight, pop_weight, prov_weight = 28.0, 10.0, 8.0
+        vibe_overlap_weight = 16.0
+        taste_weight = 0.0  # tops disabled
+        novelty_weight = 6.0 * explore
     else:
         if feats and popularity_known:
-            feature_weight, pop_weight, prov_weight = 28.0, 16.0, 10.0
+            feature_weight, pop_weight, prov_weight = 26.0, 14.0, 8.0
         elif feats:
-            feature_weight, pop_weight, prov_weight = 32.0, 10.0, 12.0
-        elif popularity_known:
-            feature_weight, pop_weight, prov_weight = 12.0, 24.0, 12.0
+            feature_weight, pop_weight, prov_weight = 30.0, 10.0, 10.0
         else:
-            feature_weight, pop_weight, prov_weight = 12.0, 10.0, 24.0
-        cine_weight = 0.0
-        # Stronger personal taste when lyrics allowed (comfort-oriented)
-        taste_weight = 32.0 * comfort + 8.0  # floor so taste always matters somewhat
-        novelty_weight = 14.0 * explore
+            feature_weight, pop_weight, prov_weight = 14.0, 12.0, 18.0
+        vibe_overlap_weight = 14.0
+        taste_weight = 28.0 * comfort + 6.0
+        novelty_weight = 12.0 * explore
         if taste_affinity <= 0:
-            # No personal data — put weight back into vibe/pop
-            feature_weight += taste_weight * 0.5
-            pop_weight += taste_weight * 0.3
+            feature_weight += taste_weight * 0.55
+            pop_weight += taste_weight * 0.25
             novelty_weight += taste_weight * 0.2
             taste_weight = 0.0
 
     score = (
         feature_weight * feature_fit
         + pop_weight * pop_score
-        + 10.0 * overlap
+        + vibe_overlap_weight * overlap
         + prov_weight * provenance
         + 8.0 * diversity
         + taste_weight * taste_score
         + novelty_weight * novelty_score
         + cine_weight * cine
-    ) * duration_factor * quality_penalty(track, popularity_known=popularity_known) * style_mult
+    ) * duration_factor * quality_penalty(track, popularity_known=popularity_known) * style_mult * vibe_mult
 
     if mode is LyricsPreference.INSTRUMENTAL_ONLY:
         likely = is_likely_instrumental(track)
         if likely is True:
-            score += 12.0
+            score += 10.0
         elif likely is False:
             score -= 30.0
         inst = feats.get("instrumentalness")
         if inst is not None:
-            score += 16.0 * inst
-        # Extra purity: reject-ish scoring for weak instrumentalness even if filtered
+            score += 14.0 * inst
         if inst is not None and inst < 0.7:
-            score *= 0.75
-        score += 15.0 * cine
+            score *= 0.8
     elif mode is LyricsPreference.PREFER_INSTRUMENTAL:
         if is_likely_instrumental(track) is True:
             score += 8.0
@@ -611,7 +729,7 @@ def score_track(
             score += 8.0 * inst
 
     if from_recommendations:
-        score += 3.0 * (0.4 + 0.6 * comfort)
+        score += 2.5 * (0.4 + 0.6 * comfort)
 
     return round(score, 3)
 

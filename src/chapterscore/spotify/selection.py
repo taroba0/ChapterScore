@@ -41,9 +41,9 @@ from chapterscore.spotify.personalization import (
 from chapterscore.spotify.queries import (
     broaden_specs,
     cinematic_fallback_queries,
-    cinematic_instrumental_queries,
     expand_chapter_queries,
     expand_queries_from_analysis,
+    vibe_instrumental_queries,
 )
 from chapterscore.spotify.ranking import (
     InstrumentalStrictness,
@@ -135,6 +135,10 @@ def _rank_raw(
             from_recommendations=from_recommendations,
             suitable_styles=suitable,
             avoid_styles=avoid,
+            book_energy=analysis.overall_energy if analysis else spec.energy,
+            atmospheres=list(analysis.atmospheres) if analysis else None,
+            overall_mood=analysis.overall_mood if analysis else None,
+            key_themes=list(analysis.key_themes) if analysis else None,
         )
         if track.score < 0:
             continue
@@ -413,54 +417,9 @@ def _select_overall(
 
     pool: list[RankedTrack] = []
 
-    # ── Instrumental only: dedicated cinematic / film-score path ──────────
-    if lyrics.is_instrumental_only and _stage_ok():
-        progress(
-            "Stage C — Cinematic / soundtrack mode "
-            "(Hans Zimmer · film scores · trailer music; strict instrumental)"
-        )
-        cine_specs = cinematic_instrumental_queries(analysis, max_queries=26)
-        # Blend book vibe into a few more score-oriented queries
-        for sq in expand_queries_from_analysis(analysis, lyrics, max_queries=6):
-            cine_specs.append(sq)
-        pool_c = _search_pool(
-            sp,
-            cine_specs,
-            lyrics,
-            strictness=InstrumentalStrictness.STRICT,
-            progress=progress,
-            label="C/cinematic",
-            early_stop_raw=max(200, target * 10),  # quality: gather more candidates
-            limit_per_query=30,
-            taste=taste,
-            analysis=analysis,
-        )
-        pool = _merge_unique(pool, pool_c)
-        # Prefer high cinematic scores when selecting
-        chosen_c = select_diverse(pool, target, max_per_artist=max(max_art, 2), min_score=25.0)
-        if not chosen_c:
-            chosen_c = select_diverse(pool, target, max_per_artist=max(max_art, 2))
-        if chosen_c and not _needs_more(chosen_c, target, min_hours):
-            progress(
-                f"✓ Cinematic mode filled playlist ({len(chosen_c)} tracks) "
-                "with strict instrumental filter"
-            )
-            return chosen_c
-        if chosen_c:
-            progress(
-                f"Cinematic mode partial ({len(chosen_c)}/{target}) — "
-                "continuing broader instrumental search"
-            )
-
-    # ── Stage 0: Spotify Recommendations (personal seeds + vibe targets) ──
-    # Skip recs for instrumental-only when we already have a strong cinematic pool,
-    # or always try if pool is still thin (recs often return vocals → filtered hard).
-    if (
-        taste.prefs.use_recommendations
-        and _stage_ok()
-        and not lyrics.is_instrumental_only
-    ):
-        progress("Stage 0 — Spotify Recommendations (seeded with your taste + book vibe)")
+    # ── Stage 0: Spotify Recommendations (lyrics-allowed / prefer-instrumental) ──
+    if taste.prefs.use_recommendations and _stage_ok() and not lyrics.is_instrumental_only:
+        progress("Stage 0 — Spotify Recommendations (taste + book vibe)")
         rec_raw = recommendations_for_vibe(
             sp, analysis, lyrics, taste, limit=min(50, max(20, target * 2)), progress=progress
         )
@@ -468,7 +427,7 @@ def _select_overall(
             ids = [t["id"] for t in rec_raw if t.get("id")]
             features = get_audio_features(sp, ids, session=session) if ids else {}
             vibe_spec = SearchQuerySpec(
-                query=analysis.overall_mood or "cinematic",
+                query=analysis.overall_mood or "reflective",
                 energy=analysis.overall_energy,
                 reason="recommendations",
             )
@@ -487,10 +446,10 @@ def _select_overall(
             progress(f"Stage [0/recs]: {len(rec_raw)} raw → {len(rec_ranked)} after filters")
             chosen0 = select_diverse(pool, target, max_per_artist=max_art)
             if chosen0 and not _needs_more(chosen0, target, min_hours):
-                progress(f"✓ Stage 0 (recommendations) filled playlist ({len(chosen0)} tracks)")
+                progress(f"✓ Stage 0 filled playlist ({len(chosen0)} tracks)")
                 return chosen0
 
-    # Personal-artist keyword searches (never under instrumental-only)
+    # Personal-artist searches (never under instrumental-only)
     personal_specs: list[SearchQuerySpec] = []
     if taste.enabled and not lyrics.is_instrumental_only:
         for q in search_queries_for_personal_artists(taste, analysis, lyrics, max_artists=6):
@@ -502,23 +461,30 @@ def _select_overall(
                 )
             )
 
-    # ── Stage 1: rich expanded queries ────────────────────────────────────
+    # ── Stage 1: book-vibe first (always) ──────────────────────────────────
     if lyrics.is_instrumental_only:
-        # Already ran cinematic bank; supplement with vibe queries still score-flavored
-        primary_specs = expand_queries_from_analysis(analysis, lyrics, max_queries=12)
-        progress(f"Stage 1 — {len(primary_specs)} book-vibe score queries (strict instrumental)")
+        progress(
+            "Stage 1 — Book-vibe instrumental search "
+            f"(mood={analysis.overall_mood!r}, energy={analysis.overall_energy:.2f}; "
+            "strict no-vocals)"
+        )
+        # Vibe-matched instrumental bank (intimate piano vs epic only if book needs it)
+        primary_specs = vibe_instrumental_queries(analysis, max_queries=20)
+        for sq in expand_queries_from_analysis(analysis, lyrics, max_queries=10):
+            primary_specs.append(sq)
         strict1 = InstrumentalStrictness.STRICT
-        early1 = max(120, target * 8)
+        early1 = max(140, target * 9)
+        limit_q = 30
     else:
-        primary_specs = expand_queries_from_analysis(analysis, lyrics, max_queries=12)
-        # Lead with personal artists when comfort-oriented
+        primary_specs = expand_queries_from_analysis(analysis, lyrics, max_queries=14)
         if personal_specs and taste.prefs.exploration <= 55:
             primary_specs = personal_specs[:6] + primary_specs
         elif personal_specs:
             primary_specs = personal_specs[:3] + primary_specs
-        progress(f"Stage 1 — {len(primary_specs)} vibe + taste queries")
+        progress(f"Stage 1 — {len(primary_specs)} book-vibe + taste queries")
         strict1 = InstrumentalStrictness.PERMISSIVE
         early1 = max(100, target * 6)
+        limit_q = None
 
     pool1 = _search_pool(
         sp,
@@ -526,15 +492,15 @@ def _select_overall(
         lyrics,
         strictness=strict1,
         progress=progress,
-        label="1/strict",
+        label="1/vibe",
         early_stop_raw=early1,
-        limit_per_query=30 if lyrics.is_instrumental_only else None,
+        limit_per_query=limit_q,
         taste=taste,
         analysis=analysis,
     )
     pool = _merge_unique(pool, pool1)
-    # Quality gate: prefer higher-scoring tracks when we have enough
-    min_q = 35.0 if lyrics.is_instrumental_only else 0.0
+    # Prefer quality: drop weak vibe matches when we have enough strong ones
+    min_q = 30.0 if lyrics.is_instrumental_only else 0.0
     chosen = select_diverse(pool, target, max_per_artist=max_art, min_score=min_q)
     if not chosen:
         chosen = select_diverse(pool, target, max_per_artist=max_art)

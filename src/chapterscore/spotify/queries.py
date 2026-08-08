@@ -33,64 +33,100 @@ _INSTRUMENTAL_SEEDS = [
     "quiet reflective guitar instrumental",
 ]
 
-# Dedicated film-score universe for Instrumental only (quality over quantity)
-_CINEMATIC_CORE = [
-    "hans zimmer",
-    "hans zimmer interstellar",
-    "hans zimmer dune",
-    "hans zimmer inception",
-    "hans zimmer pirates of the caribbean",
-    "john williams",
-    "howard shore lord of the rings",
-    "james horner avatar",
-    "james horner",
+# Intimate / emotional instrumental (bittersweet novels, character drama)
+_INTIMATE_INSTRUMENTAL = [
+    "max richter",
+    "nils frahm",
+    "olafur arnalds",
+    "ludovico einaudi",
     "thomas newman",
-    "ramin djawadi",
-    "ludwig goransson",
+    "yann tiersen",
+    "yiruma",
+    "johann johannsson",
+    "hildur gudnadottir",
+    "a winged victory for the sullen",
+    "dustin ohalloran",
+    "library tapes",
+    "neoclassical piano intimate",
+    "melancholic piano instrumental",
+    "bittersweet piano strings",
+    "nostalgic ambient piano",
+    "intimate chamber strings",
+    "emotional film score piano quiet",
+    "delicate orchestral score",
+    "hopeful piano instrumental",
+    "playful pizzicato instrumental",
+    "lofi ambient instrumental nostalgic",
+    "post rock quiet instrumental",
+    "acoustic guitar instrumental melancholic",
+]
+
+# Epic / action cinematic — only when the book energy/atmosphere warrants it
+_EPIC_CINEMATIC = [
+    "hans zimmer",
     "two steps from hell",
     "thomas bergersen",
     "audiomachine",
-    "immediate music",
-    "klaus badelt",
-    "alan silvestri",
-    "danny elfman",
-    "john powell",
-    "michael giacchino",
-    "alexandre desplat",
-    "ennio morricone",
-    "joe hisaishi",
-    "vangelis blade runner",
-    "max richter",
-    "johann johannsson",
-    "hildur gudnadottir",
     "epic orchestral film score",
-    "cinematic trailer music instrumental",
     "hybrid orchestral trailer",
-    "dark cinematic score",
-    "emotional film score piano",
     "adventure film soundtrack instrumental",
-    "sci fi orchestral score",
-    "fantasy film score",
-    "original motion picture soundtrack instrumental",
+    "triumphant brass fanfare instrumental",
+]
+
+# Mid-energy cinematic (drama, mystery) — lighter touch
+_DRAMA_CINEMATIC = [
+    "thomas newman",
+    "alexandre desplat",
+    "james newton howard",
+    "carter burwell",
+    "cliff martinez",
+    "emotional orchestral soundtrack",
+    "cinematic piano score",
+    "subtle film score strings",
 ]
 
 
-def cinematic_instrumental_queries(
+def _book_energy_band(analysis: BookVibeAnalysis) -> str:
+    e = analysis.overall_energy if analysis.overall_energy is not None else 0.5
+    atms = {a.lower() for a in (analysis.atmospheres or [])}
+    intimate_keys = {
+        "intimate",
+        "melancholic",
+        "nostalgic",
+        "hopeful",
+        "playful",
+        "romantic",
+        "calm",
+        "solemn",
+    }
+    epic_keys = {"epic", "triumphant", "adventurous", "angry", "tense"}
+    if e <= 0.45 or (atms & intimate_keys and e < 0.65):
+        if atms & epic_keys and e >= 0.55:
+            return "drama"
+        return "intimate"
+    if e >= 0.72 or (atms & epic_keys and e >= 0.6):
+        return "epic"
+    return "drama"
+
+
+def vibe_instrumental_queries(
     analysis: BookVibeAnalysis,
     *,
-    max_queries: int = 28,
+    max_queries: int = 24,
 ) -> list[SearchQuerySpec]:
     """
-    High-quality film-score / cinematic query bank for Instrumental only mode.
+    Instrumental-only query bank driven by **book vibe**, not generic epic cinema.
 
-    Prioritizes named composers and OST language over abstract mood adjectives.
+    Intimate/bittersweet books → piano, neoclassical, quiet scores.
+    Epic books → only then lean into trailer/Zimmer-style material.
     """
-    energy = analysis.overall_energy if analysis.overall_energy is not None else 0.55
-    mood = (analysis.overall_mood or "epic").lower()
+    energy = analysis.overall_energy if analysis.overall_energy is not None else 0.5
+    mood = (analysis.overall_mood or "reflective").lower()
+    band = _book_energy_band(analysis)
     out: list[SearchQuerySpec] = []
     seen: set[str] = set()
 
-    def add(q: str, reason: str = "cinematic-core") -> None:
+    def add(q: str, reason: str = "vibe-inst") -> None:
         key = " ".join(q.lower().split())
         if not key or key in seen:
             return
@@ -100,37 +136,64 @@ def cinematic_instrumental_queries(
                 query=q,
                 energy=energy,
                 instrumentalness_min=0.75,
-                mood_keywords=[mood],
-                genres=["soundtrack", "score"],
+                mood_keywords=[mood] + list(analysis.atmospheres or [])[:3],
                 reason=reason,
             )
         )
 
-    for q in _CINEMATIC_CORE:
-        add(q)
-        if len(out) >= max_queries - 6:
+    # 1) Pure book-mood phrases first (highest priority for search order)
+    for atm in (analysis.atmospheres or [])[:6]:
+        add(f"{atm} piano instrumental", reason=f"atm-piano:{atm}")
+        add(f"{atm} instrumental score", reason=f"atm-score:{atm}")
+        add(f"{atm} ambient instrumental", reason=f"atm-amb:{atm}")
+
+    add(f"{mood} instrumental", reason="mood")
+    add(f"{mood} piano instrumental", reason="mood-piano")
+    add(f"bittersweet {mood} instrumental".replace("bittersweet bittersweet", "bittersweet"), reason="mood2")
+
+    for theme in (analysis.key_themes or [])[:4]:
+        t = theme.strip()
+        if len(t) > 2:
+            add(f"{t} instrumental piano", reason="theme")
+
+    # 2) Band-appropriate artist/style seeds (not always epic)
+    if band == "intimate":
+        seeds = _INTIMATE_INSTRUMENTAL
+        progress_label = "intimate"
+    elif band == "epic":
+        seeds = _EPIC_CINEMATIC + _DRAMA_CINEMATIC[:4]
+        progress_label = "epic"
+    else:
+        seeds = _DRAMA_CINEMATIC + _INTIMATE_INSTRUMENTAL[:8]
+        progress_label = "drama"
+
+    for q in seeds:
+        add(q, reason=f"band-{progress_label}")
+        if len(out) >= max_queries - 2:
             break
 
-    # Book-mood flavored cinematic queries
-    for phrase in (
-        f"{mood} film score",
-        f"{mood} cinematic orchestral",
-        f"{mood} soundtrack instrumental",
-        "cinematic orchestral soundtrack",
-        "epic film score instrumental",
-        "emotional orchestral soundtrack",
-    ):
-        add(phrase, reason="cinematic-mood")
-
-    # Atmosphere → film-score phrasing
-    for atm in (analysis.atmospheres or [])[:5]:
-        add(f"{atm} film score", reason=f"cine-atm:{atm}")
-        add(f"{atm} cinematic score instrumental", reason=f"cine-atm2:{atm}")
-
     if analysis.era_feel:
-        add(f"{analysis.era_feel} film score", reason="era-score")
+        add(f"{analysis.era_feel} instrumental", reason="era")
+
+    # Light cinematic only when it fits the band (not forced for intimate books)
+    if band == "intimate":
+        add("delicate film score piano", reason="soft-cine")
+        add("nostalgic neoclassical score", reason="soft-cine")
+    elif band == "drama":
+        add("emotional film score strings", reason="soft-cine")
+    else:
+        add("epic film score instrumental", reason="soft-cine")
 
     return out[:max_queries]
+
+
+# Backward-compatible name used by older selection code
+def cinematic_instrumental_queries(
+    analysis: BookVibeAnalysis,
+    *,
+    max_queries: int = 24,
+) -> list[SearchQuerySpec]:
+    return vibe_instrumental_queries(analysis, max_queries=max_queries)
 
 _VOCAL_FRIENDLY_SEEDS = [
     "cinematic indie anthem",
@@ -415,29 +478,39 @@ def expand_queries_from_analysis(
                 )
             )
 
-    # 6) Energy-tier seeds (low / mid / high) for arc coverage
+    # 6) Energy-tier seeds — only add tiers near the book's energy (no forced epic)
     energy = analysis.overall_energy if analysis.overall_energy is not None else 0.5
-    if lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
-        add(_spec("quiet ambient drone instrumental", lyrics=lyrics, energy=0.15, reason="energy-low"))
-        add(_spec("building tension hybrid score", lyrics=lyrics, energy=0.55, reason="energy-mid"))
-        add(_spec("epic battle orchestral score", lyrics=lyrics, energy=0.9, reason="energy-high"))
+    if lyrics.normalized().is_instrumental_only or lyrics.prefers_instrumental:
+        if energy < 0.45:
+            add(_spec("quiet ambient drone instrumental", lyrics=lyrics, energy=0.2, reason="energy-low"))
+            add(_spec("intimate piano instrumental", lyrics=lyrics, energy=0.3, reason="energy-low2"))
+            add(_spec("melancholic strings score", lyrics=lyrics, energy=0.35, reason="energy-low3"))
+        elif energy < 0.7:
+            add(_spec("emotional film score piano", lyrics=lyrics, energy=0.5, reason="energy-mid"))
+            add(_spec("building tension hybrid score", lyrics=lyrics, energy=0.55, reason="energy-mid2"))
+        else:
+            add(_spec("epic battle orchestral score", lyrics=lyrics, energy=0.85, reason="energy-high"))
+            add(_spec("triumphant orchestral fanfare instrumental", lyrics=lyrics, energy=0.9, reason="energy-high2"))
     else:
-        add(_spec("quiet intimate ballad", lyrics=lyrics, energy=0.2, reason="energy-low"))
-        add(_spec("mid tempo atmospheric indie", lyrics=lyrics, energy=0.5, reason="energy-mid"))
-        add(_spec("high energy anthem", lyrics=lyrics, energy=0.85, reason="energy-high"))
+        if energy < 0.45:
+            add(_spec("quiet intimate ballad", lyrics=lyrics, energy=0.25, reason="energy-low"))
+        elif energy < 0.7:
+            add(_spec("mid tempo atmospheric indie", lyrics=lyrics, energy=0.5, reason="energy-mid"))
+        else:
+            add(_spec("high energy anthem", lyrics=lyrics, energy=0.85, reason="energy-high"))
 
-    # Bias seed bank by overall energy
+    # Bias seed bank by overall energy (instrumental seeds: front = calmer)
     seeds = (
         _INSTRUMENTAL_SEEDS
-        if lyrics == LyricsPreference.INSTRUMENTAL_ONLY
+        if lyrics.normalized().is_instrumental_only or lyrics.prefers_instrumental
         else _VOCAL_FRIENDLY_SEEDS
     )
-    # Interleave: pick seeds matching energy band first
-    ordered_seeds = list(seeds)
-    if energy < 0.4:
-        ordered_seeds = seeds[:8] + seeds[8:]
+    if energy < 0.45:
+        ordered_seeds = seeds[:10] + seeds[10:]
     elif energy > 0.7:
         ordered_seeds = list(reversed(seeds))
+    else:
+        ordered_seeds = seeds[5:] + seeds[:5]
 
     for phrase in ordered_seeds:
         add(_spec(phrase, lyrics=lyrics, energy=energy, reason="seed-bank"))

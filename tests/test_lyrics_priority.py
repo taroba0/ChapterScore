@@ -110,3 +110,49 @@ def test_style_beats_taste_affinity():
         suitable_styles=["dark ambient", "ambient"],
     )
     assert s_fit > s_clash
+
+
+def test_intimate_book_penalizes_epic_trailer():
+    """Tomorrow-and-Tomorrow vibe should crush Pirates / Two Steps from Hell."""
+    from chapterscore.spotify.ranking import book_vibe_multiplier
+
+    epic = _t(
+        "He's a Pirate",
+        ["Klaus Badelt", "Hans Zimmer"],
+        mq="pirates of the caribbean soundtrack",
+        features={"energy": 0.85, "instrumentalness": 0.9},
+    )
+    intimate = _t(
+        "On the Nature of Daylight",
+        ["Max Richter"],
+        mq="melancholic piano",
+        features={"energy": 0.25, "instrumentalness": 0.95},
+    )
+    atms = ["nostalgic", "intimate", "melancholic", "hopeful", "playful"]
+    m_epic = book_vibe_multiplier(
+        epic, book_energy=0.4, atmospheres=atms, overall_mood="bittersweet nostalgic"
+    )
+    m_int = book_vibe_multiplier(
+        intimate, book_energy=0.4, atmospheres=atms, overall_mood="bittersweet nostalgic"
+    )
+    assert m_epic < 0.4
+    assert m_int > m_epic
+
+    spec = SearchQuerySpec(query="nostalgic intimate piano", energy=0.4, valence=0.35)
+    s_epic = score_track(
+        epic,
+        spec,
+        LyricsPreference.INSTRUMENTAL_ONLY,
+        book_energy=0.4,
+        atmospheres=atms,
+        overall_mood="bittersweet",
+    )
+    s_int = score_track(
+        intimate,
+        spec,
+        LyricsPreference.INSTRUMENTAL_ONLY,
+        book_energy=0.4,
+        atmospheres=atms,
+        overall_mood="bittersweet",
+    )
+    assert s_int > s_epic
