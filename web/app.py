@@ -347,8 +347,8 @@ def main() -> None:
             return
 
     try:
-        result = generate_playlist(
-            title.strip(),
+        # spotify_client: session OAuth client from browser login (None for dry-run)
+        gen_kwargs = dict(
             author=author.strip() or None,
             mode=_map_mode(mode_label),
             lyrics=_map_lyrics(lyrics_label),
@@ -359,7 +359,24 @@ def main() -> None:
             progress=progress,
             spotify_client=sp,
         )
+        result = generate_playlist(title.strip(), **gen_kwargs)
         status_box.update(label="Done", state="complete")
+    except TypeError as exc:
+        # Helps diagnose stale deploys that still run an old pipeline.py
+        if "spotify_client" in str(exc):
+            status_box.update(label="Deploy outdated", state="error")
+            st.error(
+                "This deployment is running an **old** `generate_playlist` without "
+                "`spotify_client` support.\n\n"
+                f"Loaded pipeline: `{generate_playlist.__code__.co_filename}`\n"
+                f"ChapterScore version: **{__version__}** (need ≥ 0.1.1)\n\n"
+                "Push the latest `src/chapterscore/pipeline.py` to GitHub and "
+                "**reboot** the Streamlit Cloud app."
+            )
+            return
+        status_box.update(label="Failed", state="error")
+        st.error(_friendly_error(exc))
+        return
     except ChapterScoreError as exc:
         status_box.update(label="Failed", state="error")
         st.error(_friendly_error(exc))

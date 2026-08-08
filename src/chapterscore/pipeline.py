@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from chapterscore.analysis.grok import analyze_book_vibe
 from chapterscore.books.aggregator import fetch_book
@@ -17,11 +17,12 @@ from chapterscore.models import (
     PlaylistResult,
     RankedTrack,
 )
-import spotipy
-
 from chapterscore.spotify.auth import get_spotify
 from chapterscore.spotify.playlist import build_playlist_description, create_playlist_from_tracks
 from chapterscore.spotify.selection import select_tracks_for_analysis
+
+if TYPE_CHECKING:
+    import spotipy
 
 ProgressCb = Callable[[str], None]
 
@@ -59,11 +60,13 @@ def generate_playlist(
     """
     Full ChapterScore pipeline.
 
-    If dry_run=True, skips Spotify auth/playlist creation and only returns
-    book + analysis (useful for testing analysis without credentials).
-
-    ``spotify_client``: optional pre-authenticated client (e.g. from Streamlit
-    browser OAuth). When omitted, uses CLI file-token auth via ``get_spotify()``.
+    Parameters
+    ----------
+    dry_run:
+        If True, fetch book + analyze vibe only (no Spotify search/playlist).
+    spotify_client:
+        Optional pre-authenticated Spotify client (e.g. Streamlit browser OAuth).
+        When ``None`` (CLI default), authenticates via ``get_spotify()`` file cache.
     """
     settings = get_settings()
 
@@ -90,7 +93,12 @@ def generate_playlist(
         return GenerateResult(book=book, analysis=analysis, tracks=[])
 
     progress("Connecting to Spotify…")
-    sp = spotify_client if spotify_client is not None else get_spotify()
+    # Web: use session client from browser OAuth. CLI: file-token OAuth.
+    if spotify_client is not None:
+        sp = spotify_client
+        progress("Using provided Spotify session client")
+    else:
+        sp = get_spotify()
 
     n_overall = tracks or settings.chapterscore_tracks_overall
     n_chapter = tracks_per_chapter or settings.chapterscore_tracks_per_chapter
@@ -113,7 +121,7 @@ def generate_playlist(
             "Could not find any suitable tracks for this book.",
             hint=(
                 "This is unexpected after progressive fallback. "
-                "Check Spotify auth (`chapterscore auth`), network, and try `--no-cache`. "
+                "Check Spotify auth, network, and try again. "
                 "If it persists, your market may have limited catalogue access."
             ),
         )
@@ -138,15 +146,13 @@ def generate_playlist(
     )
 
     visibility = "public" if public else "private"
-    progress(
-        f"Creating {visibility} playlist “{name}” with {len(selected)} tracks…"
-    )
+    progress(f"Creating {visibility} playlist “{name}” with {len(selected)} tracks…")
     playlist = create_playlist_from_tracks(
         sp,
         selected,
         name=name,
         description=description,
-        public=public,  # default False — Development mode is happier with private
+        public=public,
         book_title=book.title,
         mode=mode,
     )
