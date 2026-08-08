@@ -1,0 +1,41 @@
+# Secrets & local config
+.env
+.env.local
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Cache & runtime
+cache/
+.chapterscore/
+*.cache
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Spotify token cache (also stored in user data dir)
+.spotify_token_cache*
+.cache-*
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Test / temp
+tmp/
+*.log
