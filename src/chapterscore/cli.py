@@ -147,7 +147,10 @@ def generate_cmd(
         ModeOpt.overall,
         "--mode",
         "-m",
-        help="overall = one cohesive playlist; chapter = ordered by chapter arcs.",
+        help=(
+            "overall = one cohesive shuffle-friendly world; "
+            "chapter = ordered narrative arcs."
+        ),
     ),
     lyrics: LyricsOpt = typer.Option(
         LyricsOpt.allow_lyrics,
@@ -155,14 +158,14 @@ def generate_cmd(
         "-l",
         help=(
             "allow-lyrics | prefer-instrumental | instrumental-only. "
-            "Instrumental-only is a hard filter and disables Top Artists."
+            "Instrumental-only is a hard no-vocals filter (Top Artists still allowed)."
         ),
     ),
     tracks: Optional[int] = typer.Option(
         None,
         "--tracks",
         "-n",
-        help="Track count for overall mode (default: 20).",
+        help="Soft track-count aim for overall mode (default: 20). Quality may stop earlier.",
         min=5,
         max=100,
     ),
@@ -176,14 +179,14 @@ def generate_cmd(
     min_tracks: Optional[int] = typer.Option(
         None,
         "--min-tracks",
-        help="Minimum tracks to aim for (default: 12). Triggers broader fallback if short.",
+        help="Soft minimum track aim (default: 12). Not a hard pad-to-N requirement.",
         min=1,
         max=100,
     ),
     min_hours: Optional[float] = typer.Option(
         None,
         "--min-hours",
-        help="Target playlist length in hours (default: 1.5 ≈ 90 min). 0 disables.",
+        help="Soft length aim in hours (default: 1.5). 0 disables. Quality preferred over padding.",
         min=0.0,
         max=6.0,
     ),
@@ -245,10 +248,9 @@ def generate_cmd(
     taste_val = _taste(taste)
     if lyrics_pref.is_instrumental_only and taste_val != TasteStrength.DISABLE:
         console.print(
-            "[yellow]Note:[/yellow] Top Artists is disabled in Instrumental only mode "
-            "(most top artists contain vocals)."
+            "[yellow]Note:[/yellow] many of your top artists have vocals, so results "
+            "may be limited in Instrumental only mode. Top Artists stays enabled."
         )
-        taste_val = TasteStrength.DISABLE
 
     prefs = PersonalizationPrefs(
         taste_strength=taste_val,

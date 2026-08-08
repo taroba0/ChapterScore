@@ -43,6 +43,14 @@ def build_literary_prompt(book: BookMetadata, *, mode: Mode) -> str:
                 "emotional ACTS (beginning, rising, turning points, climax, "
                 "aftermath) rather than inventing fake chapter titles."
             )
+    else:
+        chapter_note = (
+            "MODE is overall: describe the book's cohesive emotional world "
+            "(one consistent climate a listener could shuffle through). "
+            "emotional_arc may note how the novel changes, but do NOT design "
+            "music as a sequenced beginning→climax→ending playlist. "
+            "emotional_acts may be empty or brief; focus on the stable core vibe."
+        )
 
     return f"""\
 Produce a literature-first profile for this book as JSON.
@@ -122,6 +130,10 @@ Rules:
   "wry indie folk", "lo-fi nostalgic ambient") not just "cinematic".
 - avoid_styles must block real mismatches (epic trailer music for intimate
   contemporary literary fiction; country for cyberpunk, etc.).
+- OVERALL MODE: overall_search_queries must describe ONE cohesive emotional
+  world (shuffle-friendly). Stay near overall_energy; do not sequence
+  opening/climax/resolution as separate playlist phases. Chapter mode may
+  vary by chapter/act for narrative progression.
 - Search queries: 2–6 words, Spotify-friendly, artist-free unless iconic.
 - energy/valence 0–1 on Spotify-like scales.
 - JSON only, no markdown.
@@ -191,6 +203,7 @@ BOOK: {book.title} by {book.author_str}
 MODE: {mode.value}
 LYRICS: {lyrics.value}
 {lyrics_instruction}
+{"OVERALL: cohesive world, shuffle-safe (no story-arc sequencing)." if mode == Mode.OVERALL else "CHAPTER: ordered progression across chapters/acts is OK."}
 
 LITERARY PROFILE (source of truth):
 {lit_json}

@@ -279,7 +279,10 @@ def main() -> None:
                 "Mode",
                 options=["overall", "chapter"],
                 index=0,
-                help="Overall = one cohesive mix. Chapter = ordered by narrative arcs.",
+                help=(
+                    "Overall = one cohesive emotional world (shuffle-friendly). "
+                    "Chapter = ordered narrative progression."
+                ),
             )
         with col2:
             lyrics_label = st.selectbox(
@@ -289,19 +292,24 @@ def main() -> None:
                 help=(
                     "Allow lyrics = vocals OK · "
                     "Prefer instrumental = soft bias · "
-                    "Instrumental only = hard filter (no clear vocals)"
+                    "Instrumental only = hard no-vocals filter "
+                    "(Top Artists still allowed as a soft seed)"
                 ),
             )
 
         col3, col4 = st.columns(2)
         with col3:
             min_hours = st.number_input(
-                "Minimum hours",
+                "Target hours (soft)",
                 min_value=0.0,
                 max_value=6.0,
                 value=1.5,
                 step=0.5,
-                help="Target playlist length. Set 0 to disable.",
+                help=(
+                    "Soft length aim. Quality-matched tracks are preferred even if "
+                    "the playlist ends up a bit shorter. Set 0 to disable. "
+                    "Not derived from book length."
+                ),
             )
         with col4:
             st.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
@@ -316,25 +324,22 @@ def main() -> None:
             "**(3)** exploration → **(4)** Top Artists (soft)."
         )
         instrumental_only = lyrics_label == "Instrumental only"
-        if instrumental_only:
-            st.info(
-                "Top Artists is disabled in **Instrumental only** mode because "
-                "most top artists contain vocals."
-            )
-            taste_label = "disable"
-        else:
-            taste_label = st.selectbox(
-                "Personal taste (Top Artists)",
-                options=["disable", "top5", "top10", "top15"],
-                index=2,
-                format_func=lambda x: {
-                    "disable": "Disable — book vibe only",
-                    "top5": "Top 5 artists",
-                    "top10": "Top 10 artists (recommended)",
-                    "top15": "Top 15 artists",
-                }[x],
-                help="How many of your Spotify Top Artists to use as soft seeds.",
-                disabled=False,
+        taste_label = st.selectbox(
+            "Personal taste (Top Artists)",
+            options=["disable", "top5", "top10", "top15"],
+            index=2,
+            format_func=lambda x: {
+                "disable": "Disable — book vibe only",
+                "top5": "Top 5 artists",
+                "top10": "Top 10 artists (recommended)",
+                "top15": "Top 15 artists",
+            }[x],
+            help="How many of your Spotify Top Artists to use as soft seeds.",
+        )
+        if instrumental_only and taste_label != "disable":
+            st.warning(
+                "Note: many of your top artists have vocals, so results may be limited "
+                "in **Instrumental only** mode. Top Artists stays enabled."
             )
         use_recs = st.toggle(
             "Use Spotify Recommendations API",

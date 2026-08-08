@@ -47,6 +47,8 @@ from chapterscore.spotify.queries import (
 )
 from chapterscore.spotify.ranking import (
     InstrumentalStrictness,
+    apply_overall_cohesion,
+    dedupe_tracks,
     is_likely_instrumental,
     passes_lyrics_filter,
     passes_popularity_filter,
@@ -277,23 +279,81 @@ def _target_count(
     min_tracks: int | None,
     min_hours: float | None,
 ) -> int:
-    """Compute how many tracks we should aim for."""
+    """Soft upper aim for track count (quality may stop earlier)."""
     n = max(tracks_requested, min_tracks or 0)
-    # Rough duration target: ~3.5 min/track average for scores
+    # Duration → rough track estimate (~3.5 min/track); still a soft aim only
     if min_hours and min_hours > 0:
         est = int((min_hours * 60) / 3.5) + 1
         n = max(n, est)
     return min(n, 100)
 
 
-def _needs_more(tracks: list[RankedTrack], target: int, min_hours: float | None) -> bool:
-    if len(tracks) < target:
+def _quality_floor(lyrics: LyricsPreference) -> float:
+    """Minimum score to include when quality-first soft targets apply."""
+    if lyrics.normalized().is_instrumental_only:
+        return 28.0
+    return 18.0
+
+
+def _should_search_more(
+    tracks: list[RankedTrack],
+    target: int,
+    min_hours: float | None,
+    *,
+    quality_floor: float = 0.0,
+) -> bool:
+    """
+    Whether to keep searching for more candidates.
+
+    Soft: stop once we have a solid quality set near ~60% of the target
+    (or a reasonable duration). Never treat length as a hard requirement.
+    """
+    if not tracks:
+        return True
+    good = [t for t in tracks if t.score >= quality_floor] if quality_floor > 0 else tracks
+    soft_n = max(6, int(target * 0.6)) if target else 6
+    if len(good) < soft_n:
         return True
     if min_hours and min_hours > 0:
-        hours = total_duration_ms(tracks) / 3_600_000
-        if hours < min_hours * 0.85:  # 15% tolerance
+        hours = total_duration_ms(good) / 3_600_000
+        # Only keep searching if substantially under the soft duration aim
+        if hours < min_hours * 0.55:
             return True
     return False
+
+
+def _pick_quality(
+    pool: list[RankedTrack],
+    target: int,
+    *,
+    max_per_artist: int,
+    lyrics: LyricsPreference,
+    book_energy: float | None = None,
+    cohesive: bool = False,
+) -> list[RankedTrack]:
+    """
+    Quality-first selection up to a soft target.
+
+    Never pads with weak tracks just to hit a number. Applies overall-mode
+    cohesion when requested. Always de-duplicates.
+    """
+    candidates = list(pool)
+    if cohesive and book_energy is not None:
+        candidates = apply_overall_cohesion(candidates, book_energy=book_energy)
+
+    floor = _quality_floor(lyrics)
+    chosen = select_diverse(
+        candidates, target, max_per_artist=max_per_artist, min_score=floor
+    )
+    # Only lower the floor if the playlist is still very thin
+    if len(chosen) < max(5, int(target * 0.35)):
+        chosen = select_diverse(
+            candidates,
+            target,
+            max_per_artist=max_per_artist,
+            min_score=floor * 0.55,
+        )
+    return dedupe_tracks(chosen)
 
 
 def _max_per_artist(exploration: int) -> int:
@@ -342,23 +402,23 @@ def select_tracks_for_analysis(
     )
     progress(f"Lyrics policy: {lyrics.display_label} (hard filter when instrumental-only)")
 
-    # Top Artists auto-disabled under instrumental-only
-    effective_prefs = prefs.model_copy(
-        update={"taste_strength": prefs.effective_taste(lyrics)}
-    )
     if lyrics.is_instrumental_only and prefs.taste_strength != TasteStrength.DISABLE:
         progress(
-            "Top Artists disabled in Instrumental only mode "
-            "(most top artists are vocal acts)"
+            "Note: many of your top artists have vocals, so results may be limited "
+            "in Instrumental only mode (Top Artists still enabled as a soft seed)"
         )
 
     # Resolve personal taste once per run (may be empty if disabled)
-    taste = build_taste_profile(sp, effective_prefs, progress=progress)
+    taste = build_taste_profile(sp, prefs, progress=progress)
     progress(
         f"Priority: (1) lyrics → (2) book style → (3) exploration={prefs.exploration} "
-        f"→ (4) taste={effective_prefs.taste_strength.value}; "
+        f"→ (4) taste={prefs.taste_strength.value}; "
         f"recommendations={'on' if prefs.use_recommendations else 'off'}"
     )
+    if mode == Mode.OVERALL or not analysis.chapters:
+        progress("Overall mode: cohesive emotional world (shuffle-friendly)")
+    else:
+        progress("Chapter mode: ordered narrative progression")
 
     try:
         if mode == Mode.OVERALL or not analysis.chapters:
@@ -392,7 +452,7 @@ def select_tracks_for_analysis(
                 f"elapsed={time.monotonic() - ended.started_at:.0f}s"
             )
 
-    return result
+    return dedupe_tracks(result)
 
 
 def _select_overall(
@@ -411,9 +471,10 @@ def _select_overall(
         min_tracks=min_tracks,
         min_hours=min_hours,
     )
+    q_floor = _quality_floor(lyrics)
     progress(
-        f"Selecting ≥{target} tracks "
-        f"(requested={tracks_requested}"
+        f"Selecting up to ~{target} tracks (soft target; quality first"
+        f"; requested={tracks_requested}"
         + (f", min_hours={min_hours}" if min_hours else "")
         + ")…"
     )
@@ -424,11 +485,34 @@ def _select_overall(
     def _stage_ok() -> bool:
         return not session.budget_exhausted()
 
+    def _finalize(pool: list[RankedTrack], *, label: str) -> list[RankedTrack]:
+        chosen = _pick_quality(
+            pool,
+            target,
+            max_per_artist=max_art,
+            lyrics=lyrics,
+            book_energy=analysis.overall_energy,
+            cohesive=True,
+        )
+        if chosen:
+            progress(
+                f"✓ {label}: {len(chosen)} tracks "
+                f"(duration ≈ {total_duration_ms(chosen) / 60000:.0f} min; "
+                f"soft aim was ~{target})"
+            )
+        return chosen
+
     pool: list[RankedTrack] = []
 
-    # ── Stage 0: Spotify Recommendations (lyrics-allowed / prefer-instrumental) ──
-    if taste.prefs.use_recommendations and _stage_ok() and not lyrics.is_instrumental_only:
+    # ── Stage 0: Spotify Recommendations (allowed with Top Artists + instrumental) ──
+    # Instrumental-only still hard-filters vocals after recommendations return.
+    if taste.prefs.use_recommendations and _stage_ok():
         progress("Stage 0 — Spotify Recommendations (taste + book vibe)")
+        rec_strict = (
+            InstrumentalStrictness.STRICT
+            if lyrics.is_instrumental_only
+            else InstrumentalStrictness.PERMISSIVE
+        )
         rec_raw = recommendations_for_vibe(
             sp, analysis, lyrics, taste, limit=min(50, max(20, target * 2)), progress=progress
         )
@@ -446,21 +530,22 @@ def _select_overall(
                 vibe_spec,
                 lyrics,
                 matched_query="spotify:recommendations",
-                strictness=InstrumentalStrictness.PERMISSIVE,
+                strictness=rec_strict,
                 taste=taste,
                 from_recommendations=True,
                 analysis=analysis,
             )
             pool = _merge_unique(pool, rec_ranked)
             progress(f"Stage [0/recs]: {len(rec_raw)} raw → {len(rec_ranked)} after filters")
-            chosen0 = select_diverse(pool, target, max_per_artist=max_art)
-            if chosen0 and not _needs_more(chosen0, target, min_hours):
-                progress(f"✓ Stage 0 filled playlist ({len(chosen0)} tracks)")
+            chosen0 = _finalize(pool, label="Stage 0")
+            if chosen0 and not _should_search_more(
+                chosen0, target, min_hours, quality_floor=q_floor
+            ):
                 return chosen0
 
-    # Personal-artist searches (never under instrumental-only)
+    # Personal-artist searches (allowed under instrumental-only; vocals still filtered)
     personal_specs: list[SearchQuerySpec] = []
-    if taste.enabled and not lyrics.is_instrumental_only:
+    if taste.enabled:
         for q in search_queries_for_personal_artists(taste, analysis, lyrics, max_artists=6):
             personal_specs.append(
                 SearchQuerySpec(
@@ -475,22 +560,28 @@ def _select_overall(
         progress(
             "Stage 1 — Book-vibe instrumental search "
             f"(mood={analysis.overall_mood!r}, energy={analysis.overall_energy:.2f}; "
-            "strict no-vocals)"
+            "strict no-vocals; cohesive overall world)"
         )
-        # Vibe-matched instrumental bank (intimate piano vs epic only if book needs it)
         primary_specs = vibe_instrumental_queries(analysis, max_queries=20)
-        for sq in expand_queries_from_analysis(analysis, lyrics, max_queries=10):
+        for sq in expand_queries_from_analysis(
+            analysis, lyrics, max_queries=10, cohesive_overall=True
+        ):
             primary_specs.append(sq)
+        if personal_specs:
+            # Soft personal seeds after book vibe (instrumental-flavored)
+            primary_specs = primary_specs + personal_specs[:4]
         strict1 = InstrumentalStrictness.STRICT
         early1 = max(140, target * 9)
         limit_q = 30
     else:
-        primary_specs = expand_queries_from_analysis(analysis, lyrics, max_queries=14)
+        primary_specs = expand_queries_from_analysis(
+            analysis, lyrics, max_queries=14, cohesive_overall=True
+        )
         if personal_specs and taste.prefs.exploration <= 55:
             primary_specs = personal_specs[:6] + primary_specs
         elif personal_specs:
             primary_specs = personal_specs[:3] + primary_specs
-        progress(f"Stage 1 — {len(primary_specs)} book-vibe + taste queries")
+        progress(f"Stage 1 — {len(primary_specs)} book-vibe + taste queries (cohesive overall)")
         strict1 = InstrumentalStrictness.PERMISSIVE
         early1 = max(100, target * 6)
         limit_q = None
@@ -508,20 +599,15 @@ def _select_overall(
         analysis=analysis,
     )
     pool = _merge_unique(pool, pool1)
-    # Prefer quality: drop weak vibe matches when we have enough strong ones
-    min_q = 30.0 if lyrics.is_instrumental_only else 0.0
-    chosen = select_diverse(pool, target, max_per_artist=max_art, min_score=min_q)
-    if not chosen:
-        chosen = select_diverse(pool, target, max_per_artist=max_art)
-    if chosen and not _needs_more(chosen, target, min_hours):
-        progress(f"✓ Stage 1 filled playlist ({len(chosen)} tracks)")
+    chosen = _finalize(pool, label="Stage 1")
+    if chosen and not _should_search_more(chosen, target, min_hours, quality_floor=q_floor):
         return chosen
 
     # ── Stage 2: relax instrumental threshold ─────────────────────────────
     if lyrics.is_instrumental_only and _stage_ok():
         progress(
             f"Stage 2 — relaxing instrumental uncertainty "
-            f"({len(chosen)}/{target} so far; still hard-blocking clear vocals)"
+            f"({len(chosen)}/~{target} so far; still hard-blocking clear vocals)"
         )
         if not session.rate_limited:
             pool2 = _search_pool(
@@ -536,9 +622,8 @@ def _select_overall(
                 analysis=analysis,
             )
             pool = _merge_unique(pool, pool2)
-        chosen = select_diverse(pool, target, max_per_artist=max_art)
-        if chosen and not _needs_more(chosen, target, min_hours):
-            progress(f"✓ Stage 2 filled playlist ({len(chosen)} tracks)")
+        chosen = _finalize(pool, label="Stage 2")
+        if chosen and not _should_search_more(chosen, target, min_hours, quality_floor=q_floor):
             return chosen
 
     # ── Stage 3: broaden queries ──────────────────────────────────────────
@@ -549,7 +634,7 @@ def _select_overall(
         else InstrumentalStrictness.PERMISSIVE
     )
     if _stage_ok() and not session.rate_limited:
-        progress(f"Stage 3 — broadening queries ({len(chosen)}/{target} so far)")
+        progress(f"Stage 3 — broadening queries ({len(chosen)}/~{target} so far)")
         broad = broaden_specs(primary_specs[:8], lyrics)[:10]
         pool3 = _search_pool(
             sp,
@@ -563,16 +648,15 @@ def _select_overall(
             analysis=analysis,
         )
         pool = _merge_unique(pool, pool3)
-        chosen = select_diverse(pool, target, max_per_artist=max(max_art, 2))
-        if chosen and not _needs_more(chosen, target, min_hours):
-            progress(f"✓ Stage 3 filled playlist ({len(chosen)} tracks)")
+        chosen = _finalize(pool, label="Stage 3")
+        if chosen and not _should_search_more(chosen, target, min_hours, quality_floor=q_floor):
             return chosen
 
     # ── Stage 4: cinematic / soundtrack fallback bank ─────────────────────
     cinema: list[SearchQuerySpec] = []
     if _stage_ok() and not session.rate_limited:
         progress(
-            f"Stage 4 — cinematic fallback bank ({len(chosen)}/{target} so far)"
+            f"Stage 4 — cinematic fallback bank ({len(chosen)}/~{target} so far)"
         )
         cinema = cinematic_fallback_queries(analysis, lyrics, max_queries=8)
         pool4 = _search_pool(
@@ -587,14 +671,13 @@ def _select_overall(
             analysis=analysis,
         )
         pool = _merge_unique(pool, pool4)
-        chosen = select_diverse(pool, target, max_per_artist=max(max_art, 2))
-        if chosen and not _needs_more(chosen, target, min_hours):
-            progress(f"✓ Stage 4 filled playlist ({len(chosen)} tracks)")
+        chosen = _finalize(pool, label="Stage 4")
+        if chosen and not _should_search_more(chosen, target, min_hours, quality_floor=q_floor):
             return chosen
 
     # ── Stage 5: last resort (instrumental-only still hard-blocks vocals) ──
     progress(
-        f"Stage 5 — last-resort fill ({len(chosen)}/{target} so far)"
+        f"Stage 5 — last-resort quality pick ({len(chosen)}/~{target} so far; no weak padding)"
     )
     if lyrics.is_instrumental_only and _stage_ok() and not session.rate_limited:
         pool5 = _search_pool(
@@ -610,15 +693,11 @@ def _select_overall(
         )
         pool = _merge_unique(pool, pool5)
 
-    chosen = select_diverse(pool, target, max_per_artist=4)
+    chosen = _finalize(pool, label="Stage 5")
     if chosen:
-        progress(
-            f"✓ Stage 5 assembled {len(chosen)} tracks "
-            f"(duration ≈ {total_duration_ms(chosen) / 60000:.0f} min)"
-        )
         return chosen
 
-    # Absolute last ditch: one ultra-generic search
+    # Absolute last ditch: one ultra-generic search (only if still empty)
     progress("Stage 6 — ultra-generic safety net")
     emergency_q = (
         "cinematic orchestral soundtrack"
@@ -638,7 +717,7 @@ def _select_overall(
         taste=taste,
         analysis=analysis,
     )
-    chosen = select_diverse(pool6, max(tracks_requested, 10), max_per_artist=5)
+    chosen = _finalize(pool6, label="Emergency")
     if chosen:
         progress(f"✓ Emergency net returned {len(chosen)} tracks")
     else:
@@ -725,25 +804,33 @@ def _select_chapter(
             progress(f"  ⚠ Chapter {ch.chapter_number}: no tracks yet (will fill later)")
         final.extend(chosen)
 
-    # Global fill if below min_tracks / min_hours
+    # Soft global fill only when severely short (quality first, no weak padding)
     target = _target_count(
         tracks_requested=max(len(final), tracks_per_chapter * max(len(chapters), 1)),
         min_tracks=min_tracks,
         min_hours=min_hours,
     )
-    if _needs_more(final, target, min_hours):
+    q_floor = _quality_floor(lyrics)
+    if _should_search_more(final, target, min_hours, quality_floor=q_floor):
         progress(
-            f"Global fill — playlist has {len(final)} tracks, aiming for ≥{target}"
+            f"Global fill — playlist has {len(final)} tracks, soft aim ~{target} "
+            "(quality first)"
         )
-        # Prefer unused global pool first
         unused = [t for t in global_pool if t.id not in seen_ids]
-        extra = select_diverse(unused, target - len(final), max_per_artist=2)
+        extra = select_diverse(
+            unused,
+            max(0, target - len(final)),
+            max_per_artist=2,
+            min_score=q_floor * 0.7,
+        )
         for t in extra:
+            if t.id in seen_ids:
+                continue
             seen_ids.add(t.id)
             final.append(t)
 
-    if _needs_more(final, target, min_hours):
-        progress("Global fill — running cinematic fallback")
+    if _should_search_more(final, target, min_hours, quality_floor=q_floor):
+        progress("Global fill — cinematic bank (only if still thin)")
         cinema = cinematic_fallback_queries(analysis, lyrics, max_queries=12)
         pool_c = _search_pool(
             sp,
@@ -760,10 +847,16 @@ def _select_chapter(
         )
         extra = select_diverse(
             [t for t in pool_c if t.id not in seen_ids],
-            target - len(final),
+            max(0, target - len(final)),
             max_per_artist=max(max_art, 2),
+            min_score=q_floor * 0.55,
         )
-        final.extend(extra)
+        for t in extra:
+            if t.id in seen_ids:
+                continue
+            seen_ids.add(t.id)
+            final.append(t)
 
-    progress(f"Chapter mode assembled {len(final)} tracks")
+    final = dedupe_tracks(final)
+    progress(f"Chapter mode assembled {len(final)} tracks (soft aim ~{target})")
     return final

@@ -800,11 +800,12 @@ def score_track(
     else:
         cine_weight = 10.0  # mild preference when epic/drama fits
 
-    # Vibe-first weights
+    # Vibe-first weights (Top Artists is always soft; book vibe wins)
     if mode is LyricsPreference.INSTRUMENTAL_ONLY:
         feature_weight, pop_weight, prov_weight = 28.0, 10.0, 8.0
         vibe_overlap_weight = 16.0
-        taste_weight = 0.0  # tops disabled
+        # Soft taste boost even under instrumental-only (never overrides lyrics/vibe)
+        taste_weight = (14.0 * comfort + 4.0) if taste_affinity > 0 else 0.0
         novelty_weight = 6.0 * explore
     else:
         if feats and popularity_known:
@@ -874,6 +875,58 @@ def passes_popularity_filter(
     return track.popularity >= min_popularity
 
 
+def _norm_title(name: str) -> str:
+    """Normalize a track title for duplicate detection."""
+    s = (name or "").lower()
+    s = re.sub(
+        r"[\(\[\{].*?(remaster|live|radio\s*edit|version|mix|edit|bonus|deluxe).*?[\)\]\}]",
+        "",
+        s,
+        flags=re.I,
+    )
+    s = re.sub(
+        r"\b(remaster(ed)?(\s*\d{4})?|live|radio\s*edit|extended|deluxe|bonus\s*track)\b",
+        "",
+        s,
+        flags=re.I,
+    )
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+def recording_key(track: RankedTrack) -> str:
+    """
+    Identity for the same recording: Spotify id, or artist+normalized title.
+
+    Same title by different artists is allowed; remaster/live variants of the
+    same work by the same primary artist are treated as duplicates.
+    """
+    if track.id:
+        return f"id:{track.id}"
+    artist = re.sub(r"[^a-z0-9]+", "", (track.artists[0] if track.artists else "").lower())
+    return f"rec:{artist}|{_norm_title(track.name)}"
+
+
+def dedupe_tracks(tracks: list[RankedTrack]) -> list[RankedTrack]:
+    """Strict final pass: unique by track id and by artist+title recording key."""
+    out: list[RankedTrack] = []
+    seen_ids: set[str] = set()
+    seen_recordings: set[str] = set()
+    for t in tracks:
+        if t.id and t.id in seen_ids:
+            continue
+        # Always check artist+title even when id differs (re-uploads / remasters)
+        artist = re.sub(r"[^a-z0-9]+", "", (t.artists[0] if t.artists else "").lower())
+        rec = f"{artist}|{_norm_title(t.name)}"
+        if rec and rec != "|" and rec in seen_recordings:
+            continue
+        if t.id:
+            seen_ids.add(t.id)
+        if rec and rec != "|":
+            seen_recordings.add(rec)
+        out.append(t)
+    return out
+
+
 def select_diverse(
     candidates: list[RankedTrack],
     n: int,
@@ -881,7 +934,7 @@ def select_diverse(
     max_per_artist: int = 2,
     min_score: float = 0.0,
 ) -> list[RankedTrack]:
-    """Pick top-n tracks by score with artist diversity."""
+    """Pick up to n tracks by score with artist diversity and strict de-duplication."""
     ordered = sorted(
         (t for t in candidates if t.score >= min_score),
         key=lambda t: t.score,
@@ -890,45 +943,67 @@ def select_diverse(
     chosen: list[RankedTrack] = []
     artist_counts: Counter[str] = Counter()
     seen_ids: set[str] = set()
-    seen_names: set[str] = set()
+    seen_recordings: set[str] = set()
 
-    def norm(name: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", name.lower())
+    def _take(track: RankedTrack, *, respect_artist_cap: bool) -> bool:
+        if track.id and track.id in seen_ids:
+            return False
+        artist = re.sub(r"[^a-z0-9]+", "", (track.artists[0] if track.artists else "").lower())
+        rec = f"{artist}|{_norm_title(track.name)}"
+        if rec and rec != "|" and rec in seen_recordings:
+            return False
+        primary = (track.artists[0] if track.artists else "").lower()
+        if respect_artist_cap and primary and artist_counts[primary] >= max_per_artist:
+            return False
+        chosen.append(track)
+        if track.id:
+            seen_ids.add(track.id)
+        if rec and rec != "|":
+            seen_recordings.add(rec)
+        if primary:
+            artist_counts[primary] += 1
+        return True
 
     for track in ordered:
         if len(chosen) >= n:
             break
-        if track.id in seen_ids:
-            continue
-        nn = norm(track.name)
-        if nn and nn in seen_names:
-            continue
-        primary = (track.artists[0] if track.artists else "").lower()
-        if primary and artist_counts[primary] >= max_per_artist:
-            continue
-        chosen.append(track)
-        seen_ids.add(track.id)
-        if nn:
-            seen_names.add(nn)
-        if primary:
-            artist_counts[primary] += 1
+        _take(track, respect_artist_cap=True)
 
-    # Relax artist cap
+    # Relax artist cap only — never relax duplicate rules
     if len(chosen) < n:
         for track in ordered:
             if len(chosen) >= n:
                 break
-            if track.id in seen_ids:
-                continue
-            nn = norm(track.name)
-            if nn and nn in seen_names:
-                continue
-            chosen.append(track)
-            seen_ids.add(track.id)
-            if nn:
-                seen_names.add(nn)
+            _take(track, respect_artist_cap=False)
 
-    return chosen
+    return dedupe_tracks(chosen)
+
+
+def apply_overall_cohesion(
+    tracks: list[RankedTrack],
+    *,
+    book_energy: float | None,
+    max_energy_gap: float = 0.38,
+) -> list[RankedTrack]:
+    """
+    Soft-penalize tracks far from the book's overall energy so overall-mode
+    playlists stay one emotional world under shuffle.
+    """
+    if book_energy is None:
+        return tracks
+    energy = float(book_energy)
+    adjusted: list[RankedTrack] = []
+    for t in tracks:
+        te = t.features.get("energy")
+        if te is not None:
+            gap = abs(float(te) - energy)
+            if gap > max_energy_gap:
+                # Deep copy score only — mutate score in place is fine for ranking
+                t.score = round(t.score * max(0.35, 1.0 - 1.2 * (gap - max_energy_gap)), 3)
+            elif gap < 0.12:
+                t.score = round(t.score * 1.06, 3)
+        adjusted.append(t)
+    return adjusted
 
 
 def total_duration_ms(tracks: list[RankedTrack]) -> int:

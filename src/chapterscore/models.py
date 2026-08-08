@@ -61,9 +61,7 @@ class LyricsPreference(str, Enum):
         }.get(self, self.value)
 
     def effective_taste(self, taste: TasteStrength) -> TasteStrength:
-        """Instrumental-only disables Top Artists (most tops are vocal acts)."""
-        if self.is_instrumental_only:
-            return TasteStrength.DISABLE
+        """Return taste unchanged (instrumental-only no longer blocks Top Artists)."""
         return taste
 
 
@@ -112,8 +110,8 @@ class PersonalizationPrefs(BaseModel):
         return self.exploration / 100.0
 
     def effective_taste(self, lyrics: LyricsPreference) -> TasteStrength:
-        """Top Artists disabled under instrumental-only (most tops are vocal acts)."""
-        return lyrics.effective_taste(self.taste_strength)
+        """Return configured taste strength (lyrics mode never hard-disables it)."""
+        return self.taste_strength
 
 
 class Atmosphere(str, Enum):

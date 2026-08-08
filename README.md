@@ -104,8 +104,8 @@ Open the URL Streamlit prints (usually **http://localhost:8501**).
 | Book title | Required |
 | Author | Optional |
 | Mode | `overall` or `chapter` |
-| Lyrics | `instrumental-only`, `no`, or `yes` |
-| Minimum hours | Default `1.5` (set `0` to disable) |
+| Lyrics | `instrumental-only`, `no`, or `yes` (Top Artists still allowed with instrumental) |
+| Target hours (soft) | Default `1.5` (set `0` to disable; quality preferred over padding) |
 | Dry run | Analyze only — no Spotify write |
 
 #### Spotify Redirect URIs (required)
@@ -365,7 +365,7 @@ chapterscore generate "The Hobbit" -a "J.R.R. Tolkien" -l instrumental-only -n 1
 | Stale analysis | `chapterscore cache --clear` or `--no-cache` |
 | Rate limits | Built-in retries + early-stop search; wait ~60s if Spotify returns quota exceeded |
 | Empty tracks (old bug) | Fixed: search `limit` must be ≤10 (paginated); audio-features 403 is tolerated |
-| `--min-tracks` / `--min-hours` | Aim for longer playlists (defaults: 12 tracks / 1.5 hours) |
+| `--min-tracks` / `--min-hours` | Soft length aims (defaults: 12 tracks / 1.5 hours); quality over padding |
 
 Run **`chapterscore doctor`** anytime for a full environment check.
 

@@ -71,10 +71,15 @@ def test_allow_lyrics_accepts_vocals():
     assert passes_lyrics_filter(vocal, LyricsPreference.ALLOW_LYRICS) is True
 
 
-def test_taste_disabled_under_instrumental_only():
+def test_taste_not_disabled_under_instrumental_only():
+    """Instrumental-only must not hard-block Top Artists."""
     prefs = PersonalizationPrefs(taste_strength=TasteStrength.TOP_10)
-    assert prefs.effective_taste(LyricsPreference.INSTRUMENTAL_ONLY) is TasteStrength.DISABLE
+    assert prefs.effective_taste(LyricsPreference.INSTRUMENTAL_ONLY) is TasteStrength.TOP_10
     assert prefs.effective_taste(LyricsPreference.ALLOW_LYRICS) is TasteStrength.TOP_10
+    assert (
+        LyricsPreference.INSTRUMENTAL_ONLY.effective_taste(TasteStrength.TOP_5)
+        is TasteStrength.TOP_5
+    )
 
 
 def test_style_clash_penalizes_country_in_dystopia():

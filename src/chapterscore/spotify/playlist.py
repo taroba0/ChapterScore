@@ -75,7 +75,9 @@ def build_playlist_description(
         body = " | ".join(notes) if notes else (analysis_description or "Chapter-by-chapter soundtrack.")
         return _truncate(f"{header}. {body}")
 
-    body = analysis_description or "A soundtrack matching the book's emotional arc."
+    body = analysis_description or (
+        "A cohesive soundtrack for the book's emotional world — shuffle-friendly."
+    )
     return _truncate(f"{header}. {body}")
 
 
@@ -144,6 +146,16 @@ def create_playlist_from_tracks(
     if not tracks:
         raise SpotifyAPIError(
             "No tracks to add to the playlist.",
+            hint="Try a different lyrics mode or overall mode for broader search results.",
+        )
+
+    # Strict de-dupe before write (id + same-recording variants)
+    from chapterscore.spotify.ranking import dedupe_tracks
+
+    tracks = dedupe_tracks(tracks)
+    if not tracks:
+        raise SpotifyAPIError(
+            "No unique tracks left after de-duplication.",
             hint="Try a different lyrics mode or overall mode for broader search results.",
         )
 

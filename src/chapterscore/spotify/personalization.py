@@ -288,12 +288,15 @@ def search_queries_for_personal_artists(
     if not profile.artist_names:
         return []
     mood = (analysis.overall_mood or "cinematic").split()[0]
-    # Never used under instrumental-only (taste disabled upstream)
-    suffix = "instrumental" if lyrics.prefers_instrumental else ""
+    # Under instrumental-only, bias personal seeds toward instrumental/score variants
+    # (vocals are still hard-filtered downstream).
+    instrumental_bias = lyrics.normalized().is_instrumental_only or lyrics.prefers_instrumental
+    suffix = "instrumental" if instrumental_bias else ""
     queries = []
     for name in profile.artist_names[:max_artists]:
         q = f"{name} {mood} {suffix}".strip()
         queries.append(q)
-        if lyrics.prefers_instrumental:
+        if instrumental_bias:
             queries.append(f"{name} soundtrack")
+            queries.append(f"{name} instrumental")
     return queries[: max_artists * 2]

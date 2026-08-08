@@ -285,6 +285,31 @@ def test_select_diverse_dedupes_ids():
     assert len(chosen) == 2
 
 
+def test_dedupe_same_recording_different_ids():
+    from chapterscore.spotify.ranking import dedupe_tracks
+
+    t1 = _track("id1", "Main Theme (Remastered 2018)", ["Hans Zimmer"], popularity=80)
+    t2 = _track("id2", "Main Theme", ["Hans Zimmer"], popularity=75)
+    t3 = _track("id3", "Main Theme", ["John Williams"], popularity=70)
+    for t in (t1, t2, t3):
+        t.score = 50.0
+    out = dedupe_tracks([t1, t2, t3])
+    # Same primary artist + normalized title → one; different artist OK
+    assert len(out) == 2
+    assert {t.artists[0] for t in out} == {"Hans Zimmer", "John Williams"}
+
+
+def test_select_diverse_dedupes_remaster_variants():
+    t1 = _track("a1", "Arrival", ["Max Richter"], popularity=80, features={"energy": 0.3})
+    t2 = _track("a2", "Arrival - Remastered", ["Max Richter"], popularity=70, features={"energy": 0.3})
+    t3 = _track("b1", "Daylight", ["Max Richter"], popularity=75, features={"energy": 0.3})
+    for t in (t1, t2, t3):
+        t.score = 60.0
+    chosen = select_diverse([t1, t2, t3], n=5, max_per_artist=5)
+    assert len(chosen) == 2
+    assert {t.id for t in chosen} == {"a1", "b1"} or len({t.id for t in chosen}) == 2
+
+
 def test_mixed_lyrics_mode_passes_vocals():
     vocal = _track(
         "v1",

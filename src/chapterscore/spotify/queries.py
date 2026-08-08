@@ -368,14 +368,22 @@ def expand_queries_from_analysis(
     lyrics: LyricsPreference,
     *,
     max_queries: int = 24,
+    cohesive_overall: bool = False,
 ) -> list[SearchQuerySpec]:
     """
     Build a diverse query list from LLM output + atmosphere/genre seeds.
 
     Dedupes by normalized query text while preserving order (LLM first).
+
+    When ``cohesive_overall`` is True (overall mode), skip emotional-act
+    extremes far from the book's overall energy so the playlist stays one
+    shuffle-friendly emotional world rather than a sequenced arc.
     """
     out: list[SearchQuerySpec] = []
     seen: set[str] = set()
+    overall_e = (
+        analysis.overall_energy if analysis.overall_energy is not None else 0.5
+    )
 
     def add(spec: SearchQuerySpec) -> None:
         key = " ".join(spec.query.lower().split())
@@ -420,8 +428,18 @@ def expand_queries_from_analysis(
                 )
             )
 
-    # Emotional acts (major structural beats when chapters are weak/synthetic)
-    for act in (analysis.emotional_acts or [])[:8]:
+    # Emotional acts — only when not building a cohesive overall (shuffle) mix,
+    # or when the act sits near the book's overall energy band.
+    if not cohesive_overall:
+        acts = list(analysis.emotional_acts or [])[:8]
+    else:
+        acts = [
+            a
+            for a in (analysis.emotional_acts or [])[:8]
+            if abs((a.energy_level if a.energy_level is not None else overall_e) - overall_e)
+            <= 0.22
+        ][:3]
+    for act in acts:
         for q in (act.search_queries or [])[:2]:
             add(
                 SearchQuerySpec(
