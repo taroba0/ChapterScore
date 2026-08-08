@@ -14,6 +14,7 @@ from chapterscore.models import (
     BookVibeAnalysis,
     LyricsPreference,
     Mode,
+    PersonalizationPrefs,
     PlaylistResult,
     RankedTrack,
 )
@@ -56,6 +57,7 @@ def generate_playlist(
     use_cache: bool = True,
     progress: ProgressCb = _noop,
     spotify_client: spotipy.Spotify | None = None,
+    personalization: PersonalizationPrefs | None = None,
 ) -> GenerateResult:
     """
     Full ChapterScore pipeline.
@@ -67,8 +69,12 @@ def generate_playlist(
     spotify_client:
         Optional pre-authenticated Spotify client (e.g. Streamlit browser OAuth).
         When ``None`` (CLI default), authenticates via ``get_spotify()`` file cache.
+    personalization:
+        Taste / recommendations / exploration controls. Defaults to Top 10 +
+        recommendations on + exploration 40.
     """
     settings = get_settings()
+    prefs = personalization or PersonalizationPrefs()
 
     progress("Fetching book metadata…")
     book = fetch_book(
@@ -103,6 +109,11 @@ def generate_playlist(
     n_overall = tracks or settings.chapterscore_tracks_overall
     n_chapter = tracks_per_chapter or settings.chapterscore_tracks_per_chapter
 
+    progress(
+        f"Personalization — taste: {prefs.taste_strength.value}, "
+        f"recommendations: {'on' if prefs.use_recommendations else 'off'}, "
+        f"exploration: {prefs.exploration}"
+    )
     progress("Searching and ranking tracks (progressive fallback enabled)…")
     selected = select_tracks_for_analysis(
         sp,
@@ -113,6 +124,7 @@ def generate_playlist(
         tracks_per_chapter=n_chapter,
         min_tracks=min_tracks,
         min_hours=min_hours,
+        personalization=prefs,
         progress=progress,
     )
 

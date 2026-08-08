@@ -18,7 +18,7 @@ from rich.text import Text
 from chapterscore import __version__
 from chapterscore.config import get_settings, reload_settings
 from chapterscore.exceptions import ChapterScoreError
-from chapterscore.models import LyricsPreference, Mode
+from chapterscore.models import LyricsPreference, Mode, PersonalizationPrefs, TasteStrength
 
 # Keep library log noise out of the polished CLI unless user opts in
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -57,6 +57,13 @@ class LyricsOpt(str, Enum):
     instrumental_only = "instrumental-only"
 
 
+class TasteOpt(str, Enum):
+    disable = "disable"
+    top5 = "top5"
+    top10 = "top10"
+    top15 = "top15"
+
+
 def _banner() -> None:
     title = Text()
     title.append("Chapter", style="bold cyan")
@@ -92,6 +99,15 @@ def _lyrics(l: LyricsOpt) -> LyricsPreference:
         LyricsOpt.no: LyricsPreference.NO,
         LyricsOpt.instrumental_only: LyricsPreference.INSTRUMENTAL_ONLY,
     }[l]
+
+
+def _taste(t: TasteOpt) -> TasteStrength:
+    return {
+        TasteOpt.disable: TasteStrength.DISABLE,
+        TasteOpt.top5: TasteStrength.TOP_5,
+        TasteOpt.top10: TasteStrength.TOP_10,
+        TasteOpt.top15: TasteStrength.TOP_15,
+    }[t]
 
 
 def _version_callback(value: bool) -> None:
@@ -175,6 +191,28 @@ def generate_cmd(
         help="Fetch book + analyze vibe only; do not touch Spotify.",
     ),
     no_cache: bool = typer.Option(False, "--no-cache", help="Bypass book/analysis cache."),
+    taste: TasteOpt = typer.Option(
+        TasteOpt.top10,
+        "--taste",
+        "-t",
+        help=(
+            "Personal taste from your Spotify Top Artists: "
+            "disable | top5 | top10 | top15 (default: top10)."
+        ),
+    ),
+    recommendations: bool = typer.Option(
+        True,
+        "--recommendations/--no-recommendations",
+        help="Use Spotify Recommendations API seeded with your taste + book vibe (default: on).",
+    ),
+    exploration: int = typer.Option(
+        40,
+        "--exploration",
+        "-e",
+        help="0=max comfort (familiar artists) … 100=max exploration (new artists). Default: 40.",
+        min=0,
+        max=100,
+    ),
 ) -> None:
     """Generate a Spotify playlist for a book."""
     from chapterscore.pipeline import generate_playlist
@@ -195,6 +233,12 @@ def generate_cmd(
         )
         raise typer.Exit(2)
 
+    prefs = PersonalizationPrefs(
+        taste_strength=_taste(taste),
+        use_recommendations=recommendations,
+        exploration=exploration,
+    )
+
     console.print(
         f"[bold]Book:[/bold] {title}"
         + (f"  [dim]by {author}[/dim]" if author else "")
@@ -204,6 +248,11 @@ def generate_cmd(
         f"[bold]Mode:[/bold] {mode.value}   "
         f"[bold]Lyrics:[/bold] {lyrics.value}"
         + ("   [yellow]DRY RUN[/yellow]" if dry_run else "")
+    )
+    console.print(
+        f"[bold]Taste:[/bold] {prefs.taste_strength.value}   "
+        f"[bold]Recommendations:[/bold] {'on' if prefs.use_recommendations else 'off'}   "
+        f"[bold]Exploration:[/bold] {prefs.exploration}"
     )
     console.print()
 
@@ -238,6 +287,7 @@ def generate_cmd(
                 dry_run=dry_run,
                 use_cache=not no_cache,
                 progress=progress_spin,
+                personalization=prefs,
             )
     except ChapterScoreError as exc:
         _print_error(exc)

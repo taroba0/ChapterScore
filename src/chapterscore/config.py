@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     # Base scopes; auth.required_scope_string() always merges REQUIRED_SCOPES on top.
     spotify_scope: str = (
         "playlist-modify-public playlist-modify-private "
-        "user-read-private user-read-email"
+        "user-read-private user-read-email user-top-read"
     )
 
     # xAI / Grok

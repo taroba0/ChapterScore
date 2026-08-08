@@ -18,6 +18,7 @@ def test_required_scopes_include_playlist_and_email():
         "playlist-modify-private",
         "user-read-private",
         "user-read-email",
+        "user-top-read",
     ):
         assert scope in s.split()
 
@@ -25,6 +26,7 @@ def test_required_scopes_include_playlist_and_email():
 def test_required_scopes_constant():
     assert "playlist-modify-private" in REQUIRED_SCOPES
     assert "user-read-email" in REQUIRED_SCOPES
+    assert "user-top-read" in REQUIRED_SCOPES
 
 
 def test_parse_scopes():

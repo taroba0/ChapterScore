@@ -27,8 +27,15 @@ from chapterscore.models import (
     ChapterVibe,
     LyricsPreference,
     Mode,
+    PersonalizationPrefs,
     RankedTrack,
     SearchQuerySpec,
+)
+from chapterscore.spotify.personalization import (
+    TasteProfile,
+    build_taste_profile,
+    recommendations_for_vibe,
+    search_queries_for_personal_artists,
 )
 from chapterscore.spotify.queries import (
     broaden_specs,
@@ -40,6 +47,7 @@ from chapterscore.spotify.ranking import (
     InstrumentalStrictness,
     is_likely_instrumental,
     passes_lyrics_filter,
+    passes_popularity_filter,
     score_track,
     select_diverse,
     total_duration_ms,
@@ -79,8 +87,16 @@ def _rank_raw(
     vibe_note: str = "",
     artist_counts: Counter[str] | None = None,
     seen_ids: set[str] | None = None,
+    taste: TasteProfile | None = None,
+    from_recommendations: bool = False,
 ) -> list[RankedTrack]:
     ranked: list[RankedTrack] = []
+    exploration = taste.prefs.exploration if taste else 40
+    min_pop = taste.prefs.min_popularity if taste else 0
+    # Soft popularity: only hard-filter when we have popularity data for most tracks
+    pop_known = sum(1 for t in raw_tracks if (t.get("popularity") or 0) > 0)
+    strict_pop = pop_known >= max(3, len(raw_tracks) // 2)
+
     for t in raw_tracks:
         base = track_dict_to_base(t)
         feats = features.get(base["id"], {})
@@ -94,6 +110,11 @@ def _rank_raw(
         track.is_instrumental = is_likely_instrumental(track)
         if not passes_lyrics_filter(track, lyrics, strictness=strictness):
             continue
+        if min_pop > 0 and not passes_popularity_filter(
+            track, min_pop, strict=strict_pop
+        ):
+            continue
+        affinity = taste.affinity_for_artists(track.artists) if taste else 0.0
         track.score = score_track(
             track,
             spec,
@@ -101,6 +122,10 @@ def _rank_raw(
             artist_counts=artist_counts,
             seen_ids=seen_ids,
             strictness=strictness,
+            taste_affinity=affinity,
+            exploration=exploration,
+            min_popularity=min_pop,
+            from_recommendations=from_recommendations,
         )
         if track.score < 0:
             continue
@@ -122,6 +147,7 @@ def _search_pool(
     limit_per_query: int | None = None,
     label: str = "",
     early_stop_raw: int | None = None,
+    taste: TasteProfile | None = None,
 ) -> list[RankedTrack]:
     """Search specs, enrich features once, rank under a given strictness."""
     settings = get_settings()
@@ -191,6 +217,7 @@ def _search_pool(
                 vibe_note=vibe_note,
                 artist_counts=artist_counts,
                 seen_ids=seen_ids,
+                taste=taste,
             )
         )
 
@@ -245,6 +272,15 @@ def _needs_more(tracks: list[RankedTrack], target: int, min_hours: float | None)
     return False
 
 
+def _max_per_artist(exploration: int) -> int:
+    """Comfort allows more tracks per favorite artist; exploration spreads out."""
+    if exploration <= 25:
+        return 3
+    if exploration <= 60:
+        return 2
+    return 1
+
+
 def select_tracks_for_analysis(
     sp: spotipy.Spotify,
     analysis: BookVibeAnalysis,
@@ -255,10 +291,11 @@ def select_tracks_for_analysis(
     tracks_per_chapter: int | None = None,
     min_tracks: int | None = None,
     min_hours: float | None = None,
+    personalization: PersonalizationPrefs | None = None,
     progress: ProgressCb = _noop,
 ) -> list[RankedTrack]:
     """
-    Select and order tracks with progressive fallback.
+    Select and order tracks with personalization + progressive fallback.
 
     Runs under a global wall-clock budget so generate can never hang forever.
     Individual query failures are skipped; stages continue with what they have.
@@ -268,6 +305,7 @@ def select_tracks_for_analysis(
     n_per_ch = tracks_per_chapter or settings.chapterscore_tracks_per_chapter
     min_tracks = min_tracks if min_tracks is not None else settings.chapterscore_min_tracks
     min_hours = min_hours if min_hours is not None else settings.chapterscore_min_hours
+    prefs = personalization or PersonalizationPrefs()
 
     session = start_search_session(
         budget_seconds=settings.chapterscore_spotify_collection_budget,
@@ -276,6 +314,14 @@ def select_tracks_for_analysis(
     progress(
         f"Spotify search session: {session.hard_timeout:.0f}s/call, "
         f"{session.budget_seconds:.0f}s total budget"
+    )
+
+    # Resolve personal taste once per run
+    taste = build_taste_profile(sp, prefs, progress=progress)
+    progress(
+        f"Personalization: taste={prefs.taste_strength.value}, "
+        f"recommendations={'on' if prefs.use_recommendations else 'off'}, "
+        f"exploration={prefs.exploration}"
     )
 
     try:
@@ -287,6 +333,7 @@ def select_tracks_for_analysis(
                 tracks_requested=n_overall,
                 min_tracks=min_tracks,
                 min_hours=min_hours,
+                taste=taste,
                 progress=progress,
             )
         else:
@@ -297,6 +344,7 @@ def select_tracks_for_analysis(
                 tracks_per_chapter=n_per_ch,
                 min_tracks=min_tracks,
                 min_hours=min_hours,
+                taste=taste,
                 progress=progress,
             )
     finally:
@@ -319,6 +367,7 @@ def _select_overall(
     tracks_requested: int,
     min_tracks: int | None,
     min_hours: float | None,
+    taste: TasteProfile,
     progress: ProgressCb,
 ) -> list[RankedTrack]:
     target = _target_count(
@@ -334,14 +383,68 @@ def _select_overall(
     )
 
     session = get_search_session()
+    max_art = _max_per_artist(taste.prefs.exploration)
 
     def _stage_ok() -> bool:
         return not session.budget_exhausted()
 
+    pool: list[RankedTrack] = []
+
+    # ── Stage 0: Spotify Recommendations (personal seeds + vibe targets) ──
+    if taste.prefs.use_recommendations and _stage_ok():
+        progress("Stage 0 — Spotify Recommendations (seeded with your taste + book vibe)")
+        rec_raw = recommendations_for_vibe(
+            sp, analysis, lyrics, taste, limit=min(50, max(20, target * 2)), progress=progress
+        )
+        if rec_raw:
+            ids = [t["id"] for t in rec_raw if t.get("id")]
+            features = get_audio_features(sp, ids, session=session) if ids else {}
+            vibe_spec = SearchQuerySpec(
+                query=analysis.overall_mood or "cinematic",
+                energy=analysis.overall_energy,
+                reason="recommendations",
+            )
+            rec_ranked = _rank_raw(
+                rec_raw,
+                features,
+                vibe_spec,
+                lyrics,
+                matched_query="spotify:recommendations",
+                strictness=InstrumentalStrictness.MODERATE
+                if lyrics == LyricsPreference.INSTRUMENTAL_ONLY
+                else InstrumentalStrictness.PERMISSIVE,
+                taste=taste,
+                from_recommendations=True,
+            )
+            pool = _merge_unique(pool, rec_ranked)
+            progress(f"Stage [0/recs]: {len(rec_raw)} raw → {len(rec_ranked)} after filters")
+            chosen0 = select_diverse(pool, target, max_per_artist=max_art)
+            if chosen0 and not _needs_more(chosen0, target, min_hours):
+                progress(f"✓ Stage 0 (recommendations) filled playlist ({len(chosen0)} tracks)")
+                return chosen0
+
+    # Personal-artist keyword searches (comfort lean) before pure vibe search
+    personal_specs: list[SearchQuerySpec] = []
+    if taste.enabled and taste.prefs.exploration < 85:
+        for q in search_queries_for_personal_artists(taste, analysis, lyrics, max_artists=4):
+            personal_specs.append(
+                SearchQuerySpec(
+                    query=q,
+                    energy=analysis.overall_energy,
+                    reason="personal-artist",
+                )
+            )
+
     # ── Stage 1: rich expanded queries, strict filter ─────────────────────
     primary_specs = expand_queries_from_analysis(analysis, lyrics, max_queries=10)
+    # Interleave a few personal queries at the front when comfort is preferred
+    if personal_specs and taste.prefs.exploration <= 55:
+        primary_specs = personal_specs[:4] + primary_specs
+    elif personal_specs:
+        primary_specs = primary_specs + personal_specs[:3]
+
     progress(f"Stage 1 — {len(primary_specs)} expanded vibe queries (strict filter)")
-    pool = _search_pool(
+    pool1 = _search_pool(
         sp,
         primary_specs,
         lyrics,
@@ -351,8 +454,10 @@ def _select_overall(
         progress=progress,
         label="1/strict",
         early_stop_raw=max(80, target * 5),
+        taste=taste,
     )
-    chosen = select_diverse(pool, target, max_per_artist=2)
+    pool = _merge_unique(pool, pool1)
+    chosen = select_diverse(pool, target, max_per_artist=max_art)
     if chosen and not _needs_more(chosen, target, min_hours):
         progress(f"✓ Stage 1 filled playlist ({len(chosen)} tracks)")
         return chosen
@@ -363,21 +468,6 @@ def _select_overall(
             f"Stage 2 — relaxing instrumental filter "
             f"({len(chosen)}/{target} so far)"
         )
-        # Re-rank existing pool under moderate first (no new network if we have hits)
-        if pool:
-            for t in pool:
-                if passes_lyrics_filter(
-                    t, lyrics, strictness=InstrumentalStrictness.MODERATE
-                ):
-                    t.score = max(
-                        t.score,
-                        score_track(
-                            t,
-                            SearchQuerySpec(query=t.matched_query or "score", reason="re"),
-                            lyrics,
-                            strictness=InstrumentalStrictness.MODERATE,
-                        ),
-                    )
         if not session.rate_limited:
             pool2 = _search_pool(
                 sp,
@@ -387,9 +477,10 @@ def _select_overall(
                 progress=progress,
                 label="2/moderate",
                 early_stop_raw=60,
+                taste=taste,
             )
             pool = _merge_unique(pool, pool2)
-        chosen = select_diverse(pool, target, max_per_artist=2)
+        chosen = select_diverse(pool, target, max_per_artist=max_art)
         if chosen and not _needs_more(chosen, target, min_hours):
             progress(f"✓ Stage 2 filled playlist ({len(chosen)} tracks)")
             return chosen
@@ -412,9 +503,10 @@ def _select_overall(
             progress=progress,
             label="3/broad",
             early_stop_raw=60,
+            taste=taste,
         )
         pool = _merge_unique(pool, pool3)
-        chosen = select_diverse(pool, target, max_per_artist=3)
+        chosen = select_diverse(pool, target, max_per_artist=max(max_art, 2))
         if chosen and not _needs_more(chosen, target, min_hours):
             progress(f"✓ Stage 3 filled playlist ({len(chosen)} tracks)")
             return chosen
@@ -434,14 +526,15 @@ def _select_overall(
             progress=progress,
             label="4/cinematic",
             early_stop_raw=60,
+            taste=taste,
         )
         pool = _merge_unique(pool, pool4)
-        chosen = select_diverse(pool, target, max_per_artist=3)
+        chosen = select_diverse(pool, target, max_per_artist=max(max_art, 2))
         if chosen and not _needs_more(chosen, target, min_hours):
             progress(f"✓ Stage 4 filled playlist ({len(chosen)} tracks)")
             return chosen
 
-    # ── Stage 5: permissive last resort (mostly re-filter existing pool) ──
+    # ── Stage 5: permissive last resort ───────────────────────────────────
     progress(
         f"Stage 5 — permissive filter last resort ({len(chosen)}/{target} so far)"
     )
@@ -454,32 +547,9 @@ def _select_overall(
             progress=progress,
             label="5/permissive",
             early_stop_raw=40,
+            taste=taste,
         )
         pool = _merge_unique(pool, pool5)
-
-    # Also re-score entire pool under permissive and pick
-    if lyrics == LyricsPreference.INSTRUMENTAL_ONLY and pool:
-        rescored: list[RankedTrack] = []
-        default_spec = SearchQuerySpec(
-            query="cinematic soundtrack",
-            energy=analysis.overall_energy,
-            reason="rescore",
-        )
-        for t in pool:
-            if not passes_lyrics_filter(
-                t, lyrics, strictness=InstrumentalStrictness.PERMISSIVE
-            ):
-                continue
-            # Re-attach score with permissive strictness
-            t.score = score_track(
-                t,
-                default_spec,
-                lyrics,
-                strictness=InstrumentalStrictness.PERMISSIVE,
-            )
-            rescored.append(t)
-        # Keep original scores if higher
-        pool = _merge_unique(pool, rescored)
 
     chosen = select_diverse(pool, target, max_per_artist=4)
     if chosen:
@@ -521,6 +591,7 @@ def _select_chapter(
     tracks_per_chapter: int,
     min_tracks: int | None,
     min_hours: float | None,
+    taste: TasteProfile,
     progress: ProgressCb,
 ) -> list[RankedTrack]:
     chapters: list[ChapterVibe] = analysis.chapters
@@ -528,6 +599,7 @@ def _select_chapter(
         f"Selecting ~{tracks_per_chapter} tracks × {len(chapters)} chapters "
         "with per-chapter fallback…"
     )
+    max_art = _max_per_artist(taste.prefs.exploration)
 
     seen_ids: set[str] = set()
     artist_counts: Counter[str] = Counter()
@@ -553,10 +625,11 @@ def _select_chapter(
             artist_counts=artist_counts,
             progress=progress,
             label=f"ch{ch.chapter_number}",
+            taste=taste,
         )
         global_pool = _merge_unique(global_pool, pool)
 
-        chosen = select_diverse(pool, tracks_per_chapter, max_per_artist=1)
+        chosen = select_diverse(pool, tracks_per_chapter, max_per_artist=max_art)
         # Relax for this chapter if thin
         if len(chosen) < tracks_per_chapter and lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
             pool_r = _search_pool(
@@ -570,10 +643,11 @@ def _select_chapter(
                 artist_counts=artist_counts,
                 progress=progress,
                 label=f"ch{ch.chapter_number}/relax",
+                taste=taste,
             )
             global_pool = _merge_unique(global_pool, pool_r)
             chosen = select_diverse(
-                _merge_unique(pool, pool_r), tracks_per_chapter, max_per_artist=2
+                _merge_unique(pool, pool_r), tracks_per_chapter, max_per_artist=max(max_art, 2)
             )
 
         for t in chosen:
@@ -616,11 +690,12 @@ def _select_chapter(
             seen_ids=seen_ids,
             progress=progress,
             label="global/cinematic",
+            taste=taste,
         )
         extra = select_diverse(
             [t for t in pool_c if t.id not in seen_ids],
             target - len(final),
-            max_per_artist=3,
+            max_per_artist=max(max_art, 2),
         )
         final.extend(extra)
 

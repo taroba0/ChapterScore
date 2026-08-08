@@ -306,20 +306,26 @@ def score_track(
     artist_counts: Counter[str] | None = None,
     seen_ids: set[str] | None = None,
     strictness: InstrumentalStrictness = InstrumentalStrictness.STRICT,
+    taste_affinity: float = 0.0,
+    exploration: int = 40,
+    min_popularity: int = 0,
+    from_recommendations: bool = False,
 ) -> float:
     """
     Composite score ~0–100.
 
-    Weights (approx):
-      - Audio-feature fit          ~35%
-      - Popularity (log)           ~25%
-      - Soft keyword / provenance  ~15%
-      - Diversity                  ~15%
-      - Duration quality           multiplier
-      - Instrumental preference    bonus
+    Base signals: vibe fit, popularity, keywords, diversity.
+    Personalization (when taste_affinity / exploration provided):
+      - Comfort (low exploration) boosts tracks near the user's top artists
+      - Exploration boosts unfamiliar artists and recommendation novelty
     """
     if seen_ids and track.id in seen_ids:
         return -1.0
+
+    # Soft popularity gate (hard filter applied upstream; mild penalty here)
+    if min_popularity > 0 and track.popularity > 0 and track.popularity < min_popularity:
+        # Allow through with penalty rather than hard-drop (pool may be thin)
+        pass
 
     feats = track.features
     fit_parts = [
@@ -335,7 +341,6 @@ def score_track(
     if lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
         inst = feats.get("instrumentalness")
         if inst is not None:
-            # Soft target — higher is better, not a cliff
             target = 0.75 if strictness <= InstrumentalStrictness.MODERATE else 0.5
             fit_parts.append(min(1.0, inst / target))
         elif is_likely_instrumental(track) is True:
@@ -351,22 +356,22 @@ def score_track(
 
     feature_fit = sum(fit_parts) / max(len(fit_parts), 1)
 
-    # Spotify often returns popularity=null for restricted apps; treat 0 as unknown
-    # unless we have a positive value somewhere in the candidate set (handled by caller
-    # via features). Here: only trust popularity when > 0.
     popularity_known = track.popularity > 0
     if popularity_known:
         pop = track.popularity / 100.0
         pop_score = 0.25 + 0.75 * (math.log1p(pop * 12) / math.log1p(12))
+        if min_popularity > 0 and track.popularity < min_popularity:
+            pop_score *= 0.55
     else:
-        pop_score = 0.55  # neutral — don't punish the whole catalogue
+        pop_score = 0.55
 
     overlap = _keyword_overlap(spec, track)
 
-    # Provenance bonus: came from a well-formed soundtrack query
     provenance = 1.0 if _query_is_instrumental_flavored(track.matched_query or "") else 0.7
     if lyrics != LyricsPreference.INSTRUMENTAL_ONLY:
         provenance = 0.85 + 0.15 * overlap
+    if from_recommendations:
+        provenance = max(provenance, 0.9)
 
     diversity = 1.0
     if artist_counts and track.artists:
@@ -383,23 +388,43 @@ def score_track(
     else:
         duration_factor = 0.85
 
-    # Weighting adapts to which signals are actually available
+    # exploration ∈ [0,100] → comfort weight vs explore weight
+    explore = max(0.0, min(1.0, exploration / 100.0))
+    comfort = 1.0 - explore
+
+    # Taste affinity 0–1; at high comfort, familiar artists score higher.
+    # At high exploration, *lack* of affinity gets a small novelty bonus.
+    taste_score = taste_affinity
+    novelty_score = 1.0 - taste_affinity  # unfamiliar = high novelty
+
+    # Base weights (before personalization mix)
     if feats and popularity_known:
-        feature_weight, pop_weight, prov_weight = 35.0, 25.0, 10.0
+        feature_weight, pop_weight, prov_weight = 30.0, 20.0, 10.0
     elif feats:
-        feature_weight, pop_weight, prov_weight = 40.0, 10.0, 15.0
+        feature_weight, pop_weight, prov_weight = 35.0, 10.0, 12.0
     elif popularity_known:
-        feature_weight, pop_weight, prov_weight = 15.0, 35.0, 15.0
+        feature_weight, pop_weight, prov_weight = 12.0, 28.0, 12.0
     else:
-        # No features, no popularity — lean on provenance, artists, keywords
-        feature_weight, pop_weight, prov_weight = 10.0, 10.0, 30.0
+        feature_weight, pop_weight, prov_weight = 10.0, 10.0, 25.0
+
+    # Personalization budget (~25 points) split by exploration slider
+    taste_weight = 25.0 * comfort
+    novelty_weight = 25.0 * explore
+    # When no personalization data, redistribute to vibe/pop
+    if taste_affinity <= 0 and explore < 0.05:
+        feature_weight += 12.0
+        pop_weight += 13.0
+        taste_weight = 0.0
+        novelty_weight = 0.0
 
     score = (
         feature_weight * feature_fit
         + pop_weight * pop_score
-        + 15.0 * overlap
+        + 12.0 * overlap
         + prov_weight * provenance
-        + 15.0 * diversity
+        + 12.0 * diversity
+        + taste_weight * taste_score
+        + novelty_weight * novelty_score
     ) * duration_factor * quality_penalty(track, popularity_known=popularity_known)
 
     if lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
@@ -410,14 +435,34 @@ def score_track(
             score -= 12.0
         inst = feats.get("instrumentalness")
         if inst is not None:
-            score += 10.0 * inst  # continuous bonus
+            score += 10.0 * inst
 
-    # Soft vocal preference
     if lyrics == LyricsPreference.YES:
         if is_likely_instrumental(track) is True:
             score -= 5.0
 
+    # Soft boost for recommendation-sourced tracks when recommendations preferred
+    if from_recommendations:
+        score += 3.0 * (0.5 + 0.5 * comfort)
+
     return round(score, 3)
+
+
+def passes_popularity_filter(
+    track: RankedTrack,
+    min_popularity: int,
+    *,
+    strict: bool = True,
+) -> bool:
+    """
+    Popularity gate. When popularity is unknown (0/null from API), allow through
+    so we don't empty the pool on restricted Spotify apps.
+    """
+    if min_popularity <= 0:
+        return True
+    if track.popularity <= 0:
+        return not strict  # unknown: keep in soft mode
+    return track.popularity >= min_popularity
 
 
 def select_diverse(

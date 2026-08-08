@@ -23,7 +23,7 @@ import streamlit as st
 from chapterscore import __version__
 from chapterscore.config import get_settings, reload_settings
 from chapterscore.exceptions import ChapterScoreError
-from chapterscore.models import LyricsPreference, Mode
+from chapterscore.models import LyricsPreference, Mode, PersonalizationPrefs, TasteStrength
 from chapterscore.pipeline import generate_playlist
 from chapterscore.spotify.web_auth import (
     SS_USER,
@@ -305,6 +305,47 @@ def main() -> None:
                 value=False,
             )
 
+        st.markdown("##### Personalization")
+        st.caption(
+            "Blend the book’s vibe with **your** Spotify taste. "
+            "Requires Login with Spotify (scope: user-top-read)."
+        )
+        taste_label = st.selectbox(
+            "Personal taste (Top Artists)",
+            options=["disable", "top5", "top10", "top15"],
+            index=2,
+            format_func=lambda x: {
+                "disable": "Disable — book vibe only",
+                "top5": "Top 5 artists",
+                "top10": "Top 10 artists (recommended)",
+                "top15": "Top 15 artists",
+            }[x],
+            help="How many of your Spotify Top Artists to use as seeds.",
+        )
+        use_recs = st.toggle(
+            "Use Spotify Recommendations API",
+            value=True,
+            help=(
+                "When on, seed Recommendations with your artists + book energy/mood. "
+                "Falls back to search if the API is unavailable."
+            ),
+        )
+        exploration = st.slider(
+            "Exploration vs comfort",
+            min_value=0,
+            max_value=100,
+            value=40,
+            help=(
+                "0 = stick close to artists you already love · "
+                "100 = discover more new artists (still matching the book)"
+            ),
+        )
+        st.caption(
+            f"{'← Comfort' if exploration < 50 else 'Explore →'}  "
+            f"Current: **{exploration}** "
+            f"({'mostly familiar' if exploration <= 35 else 'balanced' if exploration <= 65 else 'mostly new'})"
+        )
+
         submitted = st.form_submit_button("Generate Playlist", type="primary")
 
     if not submitted:
@@ -346,6 +387,18 @@ def main() -> None:
             st.error(_friendly_error(exc))
             return
 
+    taste_map = {
+        "disable": TasteStrength.DISABLE,
+        "top5": TasteStrength.TOP_5,
+        "top10": TasteStrength.TOP_10,
+        "top15": TasteStrength.TOP_15,
+    }
+    prefs = PersonalizationPrefs(
+        taste_strength=taste_map[taste_label],
+        use_recommendations=bool(use_recs),
+        exploration=int(exploration),
+    )
+
     try:
         # spotify_client: session OAuth client from browser login (None for dry-run)
         gen_kwargs = dict(
@@ -358,6 +411,7 @@ def main() -> None:
             use_cache=True,
             progress=progress,
             spotify_client=sp,
+            personalization=prefs,
         )
         result = generate_playlist(title.strip(), **gen_kwargs)
         status_box.update(label="Done", state="complete")

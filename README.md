@@ -199,6 +199,30 @@ chapterscore --help
 | `--name` | auto | Custom playlist name |
 | `--dry-run` | off | Book + Grok only |
 | `--no-cache` | off | Bypass caches |
+| `-t, --taste` | `top10` | `disable` \| `top5` \| `top10` \| `top15` (Spotify Top Artists) |
+| `--recommendations` / `--no-recommendations` | on | Spotify Recommendations API |
+| `-e, --exploration` | `40` | 0=comfort … 100=explore |
+
+### Personalization (CLI examples)
+
+```bash
+# Stick close to your Top 10 artists
+chapterscore generate "Dune" -a "Frank Herbert" -t top10 -e 20
+
+# More discovery, still book-matched
+chapterscore generate "Dune" -a "Frank Herbert" -t top5 -e 75
+
+# Pure book vibe (no personal seeds)
+chapterscore generate "Dune" -t disable --no-recommendations
+```
+
+After changing scopes, re-auth once:
+
+```bash
+chapterscore logout && chapterscore auth --force
+```
+
+(Web: **Log out** then **Login with Spotify** again so `user-top-read` is granted.)
 
 ---
 

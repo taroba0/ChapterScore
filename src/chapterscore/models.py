@@ -19,6 +19,43 @@ class LyricsPreference(str, Enum):
     INSTRUMENTAL_ONLY = "instrumental-only"  # no vocals
 
 
+class TasteStrength(str, Enum):
+    """How many of the user's Spotify Top Artists to use as personal seeds."""
+
+    DISABLE = "disable"
+    TOP_5 = "top5"
+    TOP_10 = "top10"
+    TOP_15 = "top15"
+
+    def artist_limit(self) -> int:
+        return {
+            TasteStrength.DISABLE: 0,
+            TasteStrength.TOP_5: 5,
+            TasteStrength.TOP_10: 10,
+            TasteStrength.TOP_15: 15,
+        }[self]
+
+
+class PersonalizationPrefs(BaseModel):
+    """User-controlled personalization for track selection."""
+
+    taste_strength: TasteStrength = TasteStrength.TOP_10
+    use_recommendations: bool = True
+    # 0 = max comfort (familiar artists), 100 = max exploration (new artists)
+    exploration: int = Field(default=40, ge=0, le=100)
+    min_popularity: int = Field(default=28, ge=0, le=100)
+
+    @property
+    def comfort(self) -> float:
+        """0–1 comfort weight (inverse of exploration)."""
+        return 1.0 - (self.exploration / 100.0)
+
+    @property
+    def explore(self) -> float:
+        """0–1 exploration weight."""
+        return self.exploration / 100.0
+
+
 class Atmosphere(str, Enum):
     CALM = "calm"
     TENSE = "tense"

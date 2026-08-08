@@ -15,12 +15,13 @@ from chapterscore.exceptions import ConfigError, SpotifyAuthError
 logger = logging.getLogger(__name__)
 logging.getLogger("spotipy").setLevel(logging.CRITICAL)
 
-# Required scopes for ChapterScore playlist creation + profile diagnostics.
+# Required scopes for ChapterScore playlist creation + profile + personalization.
 REQUIRED_SCOPES: tuple[str, ...] = (
     "playlist-modify-public",
     "playlist-modify-private",
     "user-read-private",
     "user-read-email",
+    "user-top-read",  # Top Artists for personalization
 )
 
 PLAYLIST_SCOPES: tuple[str, ...] = (
