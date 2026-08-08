@@ -253,7 +253,7 @@ def build_search_string(
             if g_clean and g_clean not in parts[0].lower():
                 parts.append(f"genre:{g_clean}")
 
-    if lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
+    if lyrics.normalized().is_instrumental_only or lyrics.prefers_instrumental:
         q = " ".join(parts).lower()
         if not any(
             k in q

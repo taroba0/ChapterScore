@@ -52,9 +52,12 @@ class ModeOpt(str, Enum):
 
 
 class LyricsOpt(str, Enum):
+    allow_lyrics = "allow-lyrics"
+    prefer_instrumental = "prefer-instrumental"
+    instrumental_only = "instrumental-only"
+    # Legacy aliases
     yes = "yes"
     no = "no"
-    instrumental_only = "instrumental-only"
 
 
 class TasteOpt(str, Enum):
@@ -95,10 +98,12 @@ def _mode(m: ModeOpt) -> Mode:
 
 def _lyrics(l: LyricsOpt) -> LyricsPreference:
     return {
-        LyricsOpt.yes: LyricsPreference.YES,
-        LyricsOpt.no: LyricsPreference.NO,
+        LyricsOpt.allow_lyrics: LyricsPreference.ALLOW_LYRICS,
+        LyricsOpt.prefer_instrumental: LyricsPreference.PREFER_INSTRUMENTAL,
         LyricsOpt.instrumental_only: LyricsPreference.INSTRUMENTAL_ONLY,
-    }[l]
+        LyricsOpt.yes: LyricsPreference.ALLOW_LYRICS,
+        LyricsOpt.no: LyricsPreference.ALLOW_LYRICS,
+    }[l].normalized()
 
 
 def _taste(t: TasteOpt) -> TasteStrength:
@@ -145,10 +150,13 @@ def generate_cmd(
         help="overall = one cohesive playlist; chapter = ordered by chapter arcs.",
     ),
     lyrics: LyricsOpt = typer.Option(
-        LyricsOpt.no,
+        LyricsOpt.allow_lyrics,
         "--lyrics",
         "-l",
-        help="yes = prefer vocals; no = either; instrumental-only = no sung vocals.",
+        help=(
+            "allow-lyrics | prefer-instrumental | instrumental-only. "
+            "Instrumental-only is a hard filter and disables Top Artists."
+        ),
     ),
     tracks: Optional[int] = typer.Option(
         None,
@@ -233,8 +241,17 @@ def generate_cmd(
         )
         raise typer.Exit(2)
 
+    lyrics_pref = _lyrics(lyrics)
+    taste_val = _taste(taste)
+    if lyrics_pref.is_instrumental_only and taste_val != TasteStrength.DISABLE:
+        console.print(
+            "[yellow]Note:[/yellow] Top Artists is disabled in Instrumental only mode "
+            "(most top artists contain vocals)."
+        )
+        taste_val = TasteStrength.DISABLE
+
     prefs = PersonalizationPrefs(
-        taste_strength=_taste(taste),
+        taste_strength=taste_val,
         use_recommendations=recommendations,
         exploration=exploration,
     )
@@ -246,7 +263,7 @@ def generate_cmd(
     )
     console.print(
         f"[bold]Mode:[/bold] {mode.value}   "
-        f"[bold]Lyrics:[/bold] {lyrics.value}"
+        f"[bold]Lyrics:[/bold] {lyrics_pref.display_label}"
         + ("   [yellow]DRY RUN[/yellow]" if dry_run else "")
     )
     console.print(
@@ -277,7 +294,7 @@ def generate_cmd(
                 author=author,
                 isbn=isbn,
                 mode=_mode(mode),
-                lyrics=_lyrics(lyrics),
+                lyrics=lyrics_pref,
                 tracks=tracks,
                 tracks_per_chapter=tracks_per_chapter,
                 min_tracks=min_tracks,

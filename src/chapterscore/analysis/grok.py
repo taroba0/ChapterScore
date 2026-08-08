@@ -67,13 +67,14 @@ def _enforce_lyrics_preference(
     lyrics: LyricsPreference,
 ) -> BookVibeAnalysis:
     """Hard-enforce instrumental constraints on query specs."""
+    mode = lyrics.normalized()
+
     def fix_queries(queries: list[SearchQuerySpec]) -> list[SearchQuerySpec]:
         fixed: list[SearchQuerySpec] = []
         for q in queries:
             data = q.model_dump()
-            if lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
+            if mode is LyricsPreference.INSTRUMENTAL_ONLY:
                 data["instrumentalness_min"] = max(data.get("instrumentalness_min") or 0.0, 0.75)
-                # Nudge query text if it doesn't already signal instrumental
                 ql = q.query.lower()
                 if not any(
                     k in ql
@@ -89,8 +90,11 @@ def _enforce_lyrics_preference(
                     )
                 ):
                     data["query"] = f"{q.query} instrumental"
-            elif lyrics == LyricsPreference.YES:
-                # Don't force instrumentalness
+            elif mode is LyricsPreference.PREFER_INSTRUMENTAL:
+                data["instrumentalness_min"] = max(
+                    data.get("instrumentalness_min") or 0.0, 0.45
+                )
+            else:  # ALLOW_LYRICS
                 if data.get("instrumentalness_min") and data["instrumentalness_min"] > 0.5:
                     data["instrumentalness_min"] = None
             fixed.append(SearchQuerySpec.model_validate(data))
@@ -99,6 +103,9 @@ def _enforce_lyrics_preference(
     analysis.overall_search_queries = fix_queries(analysis.overall_search_queries)
     for ch in analysis.chapters:
         ch.search_queries = fix_queries(ch.search_queries)
+    # Ensure style lists exist for ranking even if model omitted them
+    if not analysis.suitable_styles and analysis.suggested_genres:
+        analysis.suitable_styles = list(analysis.suggested_genres)[:8]
     return analysis
 
 
@@ -161,7 +168,7 @@ def analyze_book_vibe(
     book: BookMetadata,
     *,
     mode: Mode = Mode.OVERALL,
-    lyrics: LyricsPreference = LyricsPreference.NO,
+    lyrics: LyricsPreference = LyricsPreference.ALLOW_LYRICS,
     use_cache: bool = True,
 ) -> BookVibeAnalysis:
     """Run Grok analysis (cached) and return structured vibe data."""

@@ -17,11 +17,15 @@ Guidelines for search queries:
 - Mix concrete genre terms with mood adjectives (e.g. "dark ambient tension",
   "intimate acoustic folk ballad", "epic orchestral adventure").
 - Prefer 2–5 word queries; avoid full sentences.
-- For instrumental/soundtrack mode, bias toward film score, ambient, neoclassical,
+- For instrumental-only mode, bias toward film score, ambient, neoclassical,
   post-rock, classical, lo-fi instrumental — never pure pop vocal hooks.
-- For lyrics-welcome mode, vocal songs are fine; still match mood tightly.
+- For allow-lyrics mode, vocal songs are fine; still match mood tightly.
+- For prefer-instrumental, bias queries toward instrumental/score language but
+  vocals may appear.
 - energy and valence are 0.0–1.0 (Spotify audio-feature scale).
-- instrumentalness_min: set ≥0.7 for instrumental-only, else omit or keep low.
+- instrumentalness_min: set ≥0.75 for instrumental-only; ~0.5 for prefer-instrumental.
+- ALWAYS fill suitable_styles (3–8 styles that fit) AND avoid_styles (3–8 styles
+  that would clash hard — e.g. country for a dystopian sci-fi epic).
 - Suggest real, searchable genres (indie folk, trip hop, darkwave, orchestral,
   ambient, jazz noir, post-rock, chamber pop, etc.).
 - Avoid generic queries like "sad song" or "happy music".
@@ -35,14 +39,16 @@ def build_user_prompt(
     lyrics: LyricsPreference,
     max_chapters: int = 20,
 ) -> str:
+    lyrics = lyrics.normalized()
     lyrics_instruction = {
-        LyricsPreference.YES: (
-            "User wants songs WITH lyrics/vocals. Prefer vocal tracks; "
-            "instrumentalness_min should be omitted or very low."
+        LyricsPreference.ALLOW_LYRICS: (
+            "User allows songs WITH lyrics/vocals. Vocals are fine; "
+            "instrumentalness_min should be omitted or very low. Match mood first."
         ),
-        LyricsPreference.NO: (
-            "User accepts either vocal or instrumental tracks. Mix freely; "
-            "match mood first."
+        LyricsPreference.PREFER_INSTRUMENTAL: (
+            "User prefers instrumental / soundtrack-leaning music but vocals are "
+            "acceptable. Bias queries toward instrumental, score, ambient; set "
+            "instrumentalness_min around 0.45–0.6 when relevant."
         ),
         LyricsPreference.INSTRUMENTAL_ONLY: (
             "User wants PURELY INSTRUMENTAL / soundtrack-style music only. "
@@ -88,6 +94,8 @@ def build_user_prompt(
   "era_feel": string,
   "key_themes": [string],
   "suggested_genres": [string],
+  "suitable_styles": [string],  // 3-8 musical styles that fit (e.g. "dark ambient", "orchestral")
+  "avoid_styles": [string],     // 3-8 styles that would clash (e.g. "country", "bubblegum pop")
   "playlist_title_suggestion": string,  // creative, ≤80 chars, include book title lightly
   "playlist_description": string,       // 1-3 sentences for Spotify description
   "overall_search_queries": [
@@ -121,6 +129,8 @@ def build_user_prompt(
   "era_feel": string,
   "key_themes": [string],
   "suggested_genres": [string],
+  "suitable_styles": [string],
+  "avoid_styles": [string],
   "playlist_title_suggestion": string,
   "playlist_description": string,  // mention chapter-by-chapter structure; keep under 300 chars
   "overall_search_queries": [],    // empty in chapter mode

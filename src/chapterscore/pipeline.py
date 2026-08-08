@@ -46,7 +46,7 @@ def generate_playlist(
     author: str | None = None,
     isbn: str | None = None,
     mode: Mode = Mode.OVERALL,
-    lyrics: LyricsPreference = LyricsPreference.NO,
+    lyrics: LyricsPreference = LyricsPreference.ALLOW_LYRICS,
     tracks: int | None = None,
     tracks_per_chapter: int | None = None,
     min_tracks: int | None = None,
@@ -74,6 +74,7 @@ def generate_playlist(
         recommendations on + exploration 40.
     """
     settings = get_settings()
+    lyrics = lyrics.normalized()
     prefs = personalization or PersonalizationPrefs()
 
     progress("Fetching book metadata…")
@@ -139,10 +140,10 @@ def generate_playlist(
         )
 
     lyrics_label = {
-        LyricsPreference.YES: "with lyrics",
-        LyricsPreference.NO: "mixed",
-        LyricsPreference.INSTRUMENTAL_ONLY: "instrumental",
-    }[lyrics]
+        LyricsPreference.ALLOW_LYRICS: "allow lyrics",
+        LyricsPreference.PREFER_INSTRUMENTAL: "prefer instrumental",
+        LyricsPreference.INSTRUMENTAL_ONLY: "instrumental only",
+    }.get(lyrics, lyrics.display_label)
 
     name = playlist_name or analysis.playlist_title_suggestion or f"ChapterScore: {book.title}"
     if mode == Mode.CHAPTER and "chapter" not in name.lower():

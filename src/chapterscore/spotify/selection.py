@@ -30,6 +30,7 @@ from chapterscore.models import (
     PersonalizationPrefs,
     RankedTrack,
     SearchQuerySpec,
+    TasteStrength,
 )
 from chapterscore.spotify.personalization import (
     TasteProfile,
@@ -89,10 +90,13 @@ def _rank_raw(
     seen_ids: set[str] | None = None,
     taste: TasteProfile | None = None,
     from_recommendations: bool = False,
+    analysis: BookVibeAnalysis | None = None,
 ) -> list[RankedTrack]:
     ranked: list[RankedTrack] = []
     exploration = taste.prefs.exploration if taste else 40
     min_pop = taste.prefs.min_popularity if taste else 0
+    suitable = analysis.style_keywords_good() if analysis else []
+    avoid = analysis.style_keywords_bad() if analysis else []
     # Soft popularity: only hard-filter when we have popularity data for most tracks
     pop_known = sum(1 for t in raw_tracks if (t.get("popularity") or 0) > 0)
     strict_pop = pop_known >= max(3, len(raw_tracks) // 2)
@@ -108,12 +112,14 @@ def _rank_raw(
             vibe_note=vibe_note,
         )
         track.is_instrumental = is_likely_instrumental(track)
+        # Priority 1: hard lyrics / instrumental constraint
         if not passes_lyrics_filter(track, lyrics, strictness=strictness):
             continue
         if min_pop > 0 and not passes_popularity_filter(
             track, min_pop, strict=strict_pop
         ):
             continue
+        # Priority 4: soft taste (0 when instrumental-only disables tops)
         affinity = taste.affinity_for_artists(track.artists) if taste else 0.0
         track.score = score_track(
             track,
@@ -126,6 +132,8 @@ def _rank_raw(
             exploration=exploration,
             min_popularity=min_pop,
             from_recommendations=from_recommendations,
+            suitable_styles=suitable,
+            avoid_styles=avoid,
         )
         if track.score < 0:
             continue
@@ -148,6 +156,7 @@ def _search_pool(
     label: str = "",
     early_stop_raw: int | None = None,
     taste: TasteProfile | None = None,
+    analysis: BookVibeAnalysis | None = None,
 ) -> list[RankedTrack]:
     """Search specs, enrich features once, rank under a given strictness."""
     settings = get_settings()
@@ -218,6 +227,7 @@ def _search_pool(
                 artist_counts=artist_counts,
                 seen_ids=seen_ids,
                 taste=taste,
+                analysis=analysis,
             )
         )
 
@@ -306,6 +316,7 @@ def select_tracks_for_analysis(
     min_tracks = min_tracks if min_tracks is not None else settings.chapterscore_min_tracks
     min_hours = min_hours if min_hours is not None else settings.chapterscore_min_hours
     prefs = personalization or PersonalizationPrefs()
+    lyrics = lyrics.normalized()
 
     session = start_search_session(
         budget_seconds=settings.chapterscore_spotify_collection_budget,
@@ -315,13 +326,24 @@ def select_tracks_for_analysis(
         f"Spotify search session: {session.hard_timeout:.0f}s/call, "
         f"{session.budget_seconds:.0f}s total budget"
     )
+    progress(f"Lyrics policy: {lyrics.display_label} (hard filter when instrumental-only)")
 
-    # Resolve personal taste once per run
-    taste = build_taste_profile(sp, prefs, progress=progress)
+    # Top Artists auto-disabled under instrumental-only
+    effective_prefs = prefs.model_copy(
+        update={"taste_strength": prefs.effective_taste(lyrics)}
+    )
+    if lyrics.is_instrumental_only and prefs.taste_strength != TasteStrength.DISABLE:
+        progress(
+            "Top Artists disabled in Instrumental only mode "
+            "(most top artists are vocal acts)"
+        )
+
+    # Resolve personal taste once per run (may be empty if disabled)
+    taste = build_taste_profile(sp, effective_prefs, progress=progress)
     progress(
-        f"Personalization: taste={prefs.taste_strength.value}, "
-        f"recommendations={'on' if prefs.use_recommendations else 'off'}, "
-        f"exploration={prefs.exploration}"
+        f"Priority: (1) lyrics → (2) book style → (3) exploration={prefs.exploration} "
+        f"→ (4) taste={effective_prefs.taste_strength.value}; "
+        f"recommendations={'on' if prefs.use_recommendations else 'off'}"
     )
 
     try:
@@ -411,10 +433,11 @@ def _select_overall(
                 lyrics,
                 matched_query="spotify:recommendations",
                 strictness=InstrumentalStrictness.MODERATE
-                if lyrics == LyricsPreference.INSTRUMENTAL_ONLY
+                if lyrics.is_instrumental_only
                 else InstrumentalStrictness.PERMISSIVE,
                 taste=taste,
                 from_recommendations=True,
+                analysis=analysis,
             )
             pool = _merge_unique(pool, rec_ranked)
             progress(f"Stage [0/recs]: {len(rec_raw)} raw → {len(rec_ranked)} after filters")
@@ -449,12 +472,13 @@ def _select_overall(
         primary_specs,
         lyrics,
         strictness=InstrumentalStrictness.STRICT
-        if lyrics == LyricsPreference.INSTRUMENTAL_ONLY
+        if lyrics.is_instrumental_only
         else InstrumentalStrictness.PERMISSIVE,
         progress=progress,
         label="1/strict",
         early_stop_raw=max(80, target * 5),
         taste=taste,
+        analysis=analysis,
     )
     pool = _merge_unique(pool, pool1)
     chosen = select_diverse(pool, target, max_per_artist=max_art)
@@ -463,10 +487,10 @@ def _select_overall(
         return chosen
 
     # ── Stage 2: relax instrumental threshold ─────────────────────────────
-    if lyrics == LyricsPreference.INSTRUMENTAL_ONLY and _stage_ok():
+    if lyrics.is_instrumental_only and _stage_ok():
         progress(
-            f"Stage 2 — relaxing instrumental filter "
-            f"({len(chosen)}/{target} so far)"
+            f"Stage 2 — relaxing instrumental uncertainty "
+            f"({len(chosen)}/{target} so far; still hard-blocking clear vocals)"
         )
         if not session.rate_limited:
             pool2 = _search_pool(
@@ -478,6 +502,7 @@ def _select_overall(
                 label="2/moderate",
                 early_stop_raw=60,
                 taste=taste,
+                analysis=analysis,
             )
             pool = _merge_unique(pool, pool2)
         chosen = select_diverse(pool, target, max_per_artist=max_art)
@@ -489,7 +514,7 @@ def _select_overall(
     broad: list[SearchQuerySpec] = []
     strictness3 = (
         InstrumentalStrictness.RELAXED
-        if lyrics == LyricsPreference.INSTRUMENTAL_ONLY
+        if lyrics.is_instrumental_only
         else InstrumentalStrictness.PERMISSIVE
     )
     if _stage_ok() and not session.rate_limited:
@@ -504,6 +529,7 @@ def _select_overall(
             label="3/broad",
             early_stop_raw=60,
             taste=taste,
+            analysis=analysis,
         )
         pool = _merge_unique(pool, pool3)
         chosen = select_diverse(pool, target, max_per_artist=max(max_art, 2))
@@ -527,6 +553,7 @@ def _select_overall(
             label="4/cinematic",
             early_stop_raw=60,
             taste=taste,
+            analysis=analysis,
         )
         pool = _merge_unique(pool, pool4)
         chosen = select_diverse(pool, target, max_per_artist=max(max_art, 2))
@@ -534,11 +561,11 @@ def _select_overall(
             progress(f"✓ Stage 4 filled playlist ({len(chosen)} tracks)")
             return chosen
 
-    # ── Stage 5: permissive last resort ───────────────────────────────────
+    # ── Stage 5: last resort (instrumental-only still hard-blocks vocals) ──
     progress(
-        f"Stage 5 — permissive filter last resort ({len(chosen)}/{target} so far)"
+        f"Stage 5 — last-resort fill ({len(chosen)}/{target} so far)"
     )
-    if lyrics == LyricsPreference.INSTRUMENTAL_ONLY and _stage_ok() and not session.rate_limited:
+    if lyrics.is_instrumental_only and _stage_ok() and not session.rate_limited:
         pool5 = _search_pool(
             sp,
             (cinema or cinematic_fallback_queries(analysis, lyrics, max_queries=4))[:4],
@@ -548,6 +575,7 @@ def _select_overall(
             label="5/permissive",
             early_stop_raw=40,
             taste=taste,
+            analysis=analysis,
         )
         pool = _merge_unique(pool, pool5)
 
@@ -559,21 +587,25 @@ def _select_overall(
         )
         return chosen
 
-    # Absolute last ditch: one ultra-generic search, no filter beyond junk
+    # Absolute last ditch: one ultra-generic search
     progress("Stage 6 — ultra-generic safety net")
     emergency_q = (
         "cinematic orchestral soundtrack"
-        if lyrics == LyricsPreference.INSTRUMENTAL_ONLY
+        if lyrics.is_instrumental_only or lyrics.prefers_instrumental
         else "cinematic soundtrack"
     )
     pool6 = _search_pool(
         sp,
         [SearchQuerySpec(query=emergency_q, reason="emergency")],
         lyrics,
-        strictness=InstrumentalStrictness.PERMISSIVE,
+        strictness=InstrumentalStrictness.RELAXED
+        if lyrics.is_instrumental_only
+        else InstrumentalStrictness.PERMISSIVE,
         progress=progress,
         label="6/emergency",
         limit_per_query=50,
+        taste=taste,
+        analysis=analysis,
     )
     chosen = select_diverse(pool6, max(tracks_requested, 10), max_per_artist=5)
     if chosen:
@@ -608,7 +640,7 @@ def _select_chapter(
 
     base_strict = (
         InstrumentalStrictness.STRICT
-        if lyrics == LyricsPreference.INSTRUMENTAL_ONLY
+        if lyrics.is_instrumental_only
         else InstrumentalStrictness.PERMISSIVE
     )
 
@@ -626,12 +658,13 @@ def _select_chapter(
             progress=progress,
             label=f"ch{ch.chapter_number}",
             taste=taste,
+            analysis=analysis,
         )
         global_pool = _merge_unique(global_pool, pool)
 
         chosen = select_diverse(pool, tracks_per_chapter, max_per_artist=max_art)
         # Relax for this chapter if thin
-        if len(chosen) < tracks_per_chapter and lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
+        if len(chosen) < tracks_per_chapter and lyrics.is_instrumental_only:
             pool_r = _search_pool(
                 sp,
                 specs + broaden_specs(specs, lyrics)[:4],
@@ -644,6 +677,7 @@ def _select_chapter(
                 progress=progress,
                 label=f"ch{ch.chapter_number}/relax",
                 taste=taste,
+                analysis=analysis,
             )
             global_pool = _merge_unique(global_pool, pool_r)
             chosen = select_diverse(
@@ -685,12 +719,13 @@ def _select_chapter(
             cinema,
             lyrics,
             strictness=InstrumentalStrictness.RELAXED
-            if lyrics == LyricsPreference.INSTRUMENTAL_ONLY
+            if lyrics.is_instrumental_only
             else InstrumentalStrictness.PERMISSIVE,
             seen_ids=seen_ids,
             progress=progress,
             label="global/cinematic",
             taste=taste,
+            analysis=analysis,
         )
         extra = select_diverse(
             [t for t in pool_c if t.id not in seen_ids],

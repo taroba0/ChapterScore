@@ -103,8 +103,9 @@ def test_missing_features_blocked_without_cues_strict():
     )
 
 
-def test_relaxed_allows_missing_features():
-    t = _track(
+def test_relaxed_requires_instrumental_signal_without_features():
+    """Instrumental-only never admits random titles without cues."""
+    bare = _track(
         "nf3",
         "Mysterious Cue",
         ["Studio Ensemble"],
@@ -112,17 +113,52 @@ def test_relaxed_allows_missing_features():
         matched_query="tense thriller",
     )
     assert (
-        passes_lyrics_filter(t, LyricsPreference.INSTRUMENTAL_ONLY, strictness=InstrumentalStrictness.RELAXED)
+        passes_lyrics_filter(
+            bare, LyricsPreference.INSTRUMENTAL_ONLY, strictness=InstrumentalStrictness.RELAXED
+        )
+        is False
+    )
+    score_cue = _track(
+        "nf4",
+        "Battle Theme Instrumental",
+        ["Studio Ensemble"],
+        features={},
+        matched_query="tense thriller score",
+    )
+    assert (
+        passes_lyrics_filter(
+            score_cue, LyricsPreference.INSTRUMENTAL_ONLY, strictness=InstrumentalStrictness.RELAXED
+        )
         is True
     )
 
 
-def test_permissive_almost_always_passes():
+def test_permissive_still_blocks_low_instrumentalness():
+    """Even last-resort stage hard-blocks clear non-instrumental features."""
     t = _track("p1", "Some Track", ["Artist"], features={"instrumentalness": 0.2})
     assert (
-        passes_lyrics_filter(t, LyricsPreference.INSTRUMENTAL_ONLY, strictness=InstrumentalStrictness.PERMISSIVE)
+        passes_lyrics_filter(
+            t, LyricsPreference.INSTRUMENTAL_ONLY, strictness=InstrumentalStrictness.PERMISSIVE
+        )
+        is False
+    )
+    ok = _track("p2", "Suite", ["Orchestra"], features={"instrumentalness": 0.9})
+    assert (
+        passes_lyrics_filter(
+            ok, LyricsPreference.INSTRUMENTAL_ONLY, strictness=InstrumentalStrictness.PERMISSIVE
+        )
         is True
     )
+
+
+def test_prefer_instrumental_allows_vocals():
+    vocal = _track(
+        "v2",
+        "Love Song",
+        ["Pop Star"],
+        features={"instrumentalness": 0.05, "speechiness": 0.1},
+    )
+    assert passes_lyrics_filter(vocal, LyricsPreference.PREFER_INSTRUMENTAL) is True
 
 
 def test_lyrics_filter_rejects_karaoke():

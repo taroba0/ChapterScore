@@ -205,70 +205,139 @@ def passes_lyrics_filter(
     strictness: InstrumentalStrictness = InstrumentalStrictness.STRICT,
 ) -> bool:
     """
-    Filter tracks by lyrics preference.
+    Priority-1 HARD filter for vocal policy.
 
-    For INSTRUMENTAL_ONLY, ``strictness`` controls how hard we filter.
-    Title heuristics are secondary — missing audio features never hard-blocks
-    at RELAXED/PERMISSIVE levels.
+    - ALLOW_LYRICS: only reject junk/karaoke
+    - PREFER_INSTRUMENTAL: soft mode — almost everything passes (scoring biases instrumental)
+    - INSTRUMENTAL_ONLY: hard reject clear vocals; ``strictness`` only relaxes
+      uncertainty when features are missing — never admits clear vocal tracks.
     """
     if is_undesirable(track):
         return False
 
-    if lyrics != LyricsPreference.INSTRUMENTAL_ONLY:
-        # Still drop pure karaoke junk for mixed / vocal modes
-        return True
-
+    mode = lyrics.normalized()
+    name = track.name or ""
+    album = track.album or ""
+    blob = f"{name} {album}"
     inst = track.features.get("instrumentalness")
     speech = track.features.get("speechiness")
     likely = is_likely_instrumental(track)
-    name = track.name or ""
     flavored = _query_is_instrumental_flavored(track.matched_query or "")
 
-    # Always reject hard vocal markers in title at STRICT/MODERATE
-    if strictness <= InstrumentalStrictness.MODERATE and _VOCAL_HARD.search(name):
+    if mode is LyricsPreference.ALLOW_LYRICS:
+        return True
+
+    if mode is LyricsPreference.PREFER_INSTRUMENTAL:
+        # Soft preference only — keep karaoke out, let scoring prefer instrumental
+        if "karaoke" in name.lower():
+            return False
+        return True
+
+    # ── INSTRUMENTAL_ONLY (hard) ──────────────────────────────────────────
+    # Always reject explicit vocal markers regardless of progressive stage
+    if _VOCAL_HARD.search(blob):
+        return False
+    if speech is not None and speech > 0.40:
+        return False
+    if likely is False:
+        return False
+    if inst is not None and inst < 0.35:
+        # Clear non-instrumental audio features
         return False
 
     if strictness == InstrumentalStrictness.STRICT:
-        if speech is not None and speech > 0.33:
-            return False
-        if likely is False:
+        if speech is not None and speech > 0.25:
             return False
         if inst is not None:
-            return inst >= 0.55
-        # No features (typical): title/artist cue OR soundtrack-flavored query
-        return likely is True or flavored
+            return inst >= 0.60
+        # No features: require title/artist instrumental cue OR score-query provenance
+        return likely is True or flavored or bool(_INSTRUMENTAL_CUES.search(blob))
 
     if strictness == InstrumentalStrictness.MODERATE:
-        if speech is not None and speech > 0.45:
-            return False
-        if likely is False and (inst is None or inst < 0.4):
+        if speech is not None and speech > 0.33:
             return False
         if inst is not None:
-            return inst >= 0.35 or likely is True
-        # Accept soundtrack-query provenance, title cues, or soft vocal absence
-        if likely is True or flavored:
-            return True
-        if _VOCAL_SOFT.search(name) and not _INSTRUMENTAL_CUES.search(name):
+            return inst >= 0.45 or likely is True
+        if _VOCAL_SOFT.search(name) and not _INSTRUMENTAL_CUES.search(blob):
             return False
-        # From an instrumental-oriented search with no hard vocal markers
-        return flavored or likely is not False
+        return likely is True or flavored or bool(_INSTRUMENTAL_CUES.search(blob))
 
     if strictness == InstrumentalStrictness.RELAXED:
-        if speech is not None and speech > 0.55:
+        if speech is not None and speech > 0.40:
             return False
-        if _VOCAL_HARD.search(name):
+        if inst is not None and inst < 0.35:
             return False
-        if inst is not None and inst < 0.15 and (speech is None or speech > 0.08):
-            return False
-        if likely is False and inst is not None and inst < 0.25:
-            return False
-        # Without features: allow anything not clearly vocal
+        # Still require some positive instrumental signal when features missing
+        if inst is None and likely is not True and not flavored:
+            if not _INSTRUMENTAL_CUES.search(blob) and not _SCORE_ARTISTS.search(
+                " ".join(track.artists or [])
+            ):
+                return False
         return likely is not False
 
-    # PERMISSIVE — almost everything except junk / karaoke
-    if "karaoke" in name.lower():
+    # PERMISSIVE last resort for instrumental-only: still block clear vocals
+    if inst is not None and inst < 0.30:
+        return False
+    if likely is False:
         return False
     return True
+
+
+# Genre / style clash tokens (normalized lowercase substrings)
+_STYLE_ALIASES: dict[str, tuple[str, ...]] = {
+    "country": ("country", "nashville", "honky", "bluegrass", "americana vocal"),
+    "bubblegum": ("bubblegum", "teen pop", "boy band"),
+    "reggae": ("reggae", "dancehall", "dub vocal"),
+    "edm": ("edm", "big room", "festival drop"),
+    "metal": ("death metal", "black metal", "screamo"),
+    "rap": ("hip hop", "hip-hop", "rap ", "trap ", "drill "),
+    "comedy": ("comedy", "parody", "novelty"),
+    "children": ("kids ", "children", "nursery"),
+    "gospel": ("gospel choir vocal", "worship vocal"),
+}
+
+
+def style_clash_score(
+    track: RankedTrack,
+    *,
+    suitable: list[str] | None = None,
+    avoid: list[str] | None = None,
+) -> float:
+    """
+    Return a multiplier in ~[0.15, 1.25] for book-style fit.
+
+    Priority 2 after lyrics: heavily penalize avoid_styles, boost suitable.
+    """
+    blob = f"{track.name} {track.album} {' '.join(track.artists)} {track.matched_query}".lower()
+    mult = 1.0
+
+    for style in avoid or []:
+        s = style.lower().strip()
+        if not s:
+            continue
+        aliases = _STYLE_ALIASES.get(s, ())
+        tokens = (s,) + aliases
+        if any(tok in blob for tok in tokens if len(tok) >= 3):
+            mult *= 0.2  # hard stylistic clash
+            break
+
+    hits = 0
+    for style in suitable or []:
+        s = style.lower().strip()
+        if not s:
+            continue
+        if s in blob or any(w in blob for w in s.split() if len(w) > 3):
+            hits += 1
+    if hits:
+        mult *= min(1.25, 1.0 + 0.08 * hits)
+
+    # Soft boost for known film-score artists when suitable includes orchestral/ambient
+    suitable_l = " ".join(suitable or []).lower()
+    if any(k in suitable_l for k in ("orchestral", "soundtrack", "ambient", "cinematic", "score")):
+        if _SCORE_ARTISTS.search(" ".join(track.artists or "")):
+            mult *= 1.1
+
+    return max(0.15, min(1.35, mult))
 
 
 def _feature_distance(actual: float | None, target: float | None, weight: float = 1.0) -> float:
@@ -310,23 +379,21 @@ def score_track(
     exploration: int = 40,
     min_popularity: int = 0,
     from_recommendations: bool = False,
+    suitable_styles: list[str] | None = None,
+    avoid_styles: list[str] | None = None,
 ) -> float:
     """
-    Composite score ~0–100.
+    Composite score ~0–100 with hard priority:
 
-    Base signals: vibe fit, popularity, keywords, diversity.
-    Personalization (when taste_affinity / exploration provided):
-      - Comfort (low exploration) boosts tracks near the user's top artists
-      - Exploration boosts unfamiliar artists and recommendation novelty
+      1. Lyrics filter applied *before* scoring (caller)
+      2. Book vibe + style fit (largest weight / style multiplier)
+      3. Exploration vs comfort
+      4. Personal taste affinity (softest; never overrides 1–2)
     """
     if seen_ids and track.id in seen_ids:
         return -1.0
 
-    # Soft popularity gate (hard filter applied upstream; mild penalty here)
-    if min_popularity > 0 and track.popularity > 0 and track.popularity < min_popularity:
-        # Allow through with penalty rather than hard-drop (pool may be thin)
-        pass
-
+    mode = lyrics.normalized()
     feats = track.features
     fit_parts = [
         _feature_distance(feats.get("energy"), spec.energy, 1.2),
@@ -338,21 +405,25 @@ def score_track(
         tempo_fit = max(0.0, 1.0 - abs(feats["tempo"] - spec.tempo_bpm) / 60.0)
         fit_parts.append(tempo_fit)
 
-    if lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
+    if mode is LyricsPreference.INSTRUMENTAL_ONLY:
         inst = feats.get("instrumentalness")
         if inst is not None:
-            target = 0.75 if strictness <= InstrumentalStrictness.MODERATE else 0.5
+            target = 0.75 if strictness <= InstrumentalStrictness.MODERATE else 0.55
             fit_parts.append(min(1.0, inst / target))
         elif is_likely_instrumental(track) is True:
-            fit_parts.append(0.85)
+            fit_parts.append(0.9)
         elif _query_is_instrumental_flavored(track.matched_query or ""):
-            fit_parts.append(0.65)
+            fit_parts.append(0.7)
         else:
-            fit_parts.append(0.45)
-    elif lyrics == LyricsPreference.YES:
+            fit_parts.append(0.4)
+    elif mode is LyricsPreference.PREFER_INSTRUMENTAL:
         inst = feats.get("instrumentalness")
         if inst is not None:
-            fit_parts.append(1.0 - min(1.0, inst))
+            fit_parts.append(0.35 + 0.65 * inst)  # soft preference
+        elif is_likely_instrumental(track) is True:
+            fit_parts.append(0.85)
+        else:
+            fit_parts.append(0.5)
 
     feature_fit = sum(fit_parts) / max(len(fit_parts), 1)
 
@@ -368,7 +439,7 @@ def score_track(
     overlap = _keyword_overlap(spec, track)
 
     provenance = 1.0 if _query_is_instrumental_flavored(track.matched_query or "") else 0.7
-    if lyrics != LyricsPreference.INSTRUMENTAL_ONLY:
+    if mode is LyricsPreference.ALLOW_LYRICS:
         provenance = 0.85 + 0.15 * overlap
     if from_recommendations:
         provenance = max(provenance, 0.9)
@@ -388,32 +459,32 @@ def score_track(
     else:
         duration_factor = 0.85
 
-    # exploration ∈ [0,100] → comfort weight vs explore weight
+    # Priority 2: book style multiplier (can heavily down-rank clashes)
+    style_mult = style_clash_score(
+        track, suitable=suitable_styles, avoid=avoid_styles
+    )
+
     explore = max(0.0, min(1.0, exploration / 100.0))
     comfort = 1.0 - explore
-
-    # Taste affinity 0–1; at high comfort, familiar artists score higher.
-    # At high exploration, *lack* of affinity gets a small novelty bonus.
     taste_score = taste_affinity
-    novelty_score = 1.0 - taste_affinity  # unfamiliar = high novelty
+    novelty_score = 1.0 - taste_affinity
 
-    # Base weights (before personalization mix)
+    # Vibe weights dominate; personalization is smaller and always after style
     if feats and popularity_known:
-        feature_weight, pop_weight, prov_weight = 30.0, 20.0, 10.0
+        feature_weight, pop_weight, prov_weight = 34.0, 18.0, 12.0
     elif feats:
-        feature_weight, pop_weight, prov_weight = 35.0, 10.0, 12.0
+        feature_weight, pop_weight, prov_weight = 38.0, 10.0, 14.0
     elif popularity_known:
-        feature_weight, pop_weight, prov_weight = 12.0, 28.0, 12.0
+        feature_weight, pop_weight, prov_weight = 14.0, 26.0, 14.0
     else:
-        feature_weight, pop_weight, prov_weight = 10.0, 10.0, 25.0
+        feature_weight, pop_weight, prov_weight = 12.0, 10.0, 28.0
 
-    # Personalization budget (~25 points) split by exploration slider
-    taste_weight = 25.0 * comfort
-    novelty_weight = 25.0 * explore
-    # When no personalization data, redistribute to vibe/pop
+    # Priority 3–4: exploration + taste (capped; never outweigh vibe)
+    taste_weight = 18.0 * comfort
+    novelty_weight = 18.0 * explore
     if taste_affinity <= 0 and explore < 0.05:
-        feature_weight += 12.0
-        pop_weight += 13.0
+        feature_weight += 10.0
+        pop_weight += 8.0
         taste_weight = 0.0
         novelty_weight = 0.0
 
@@ -422,28 +493,29 @@ def score_track(
         + pop_weight * pop_score
         + 12.0 * overlap
         + prov_weight * provenance
-        + 12.0 * diversity
+        + 10.0 * diversity
         + taste_weight * taste_score
         + novelty_weight * novelty_score
-    ) * duration_factor * quality_penalty(track, popularity_known=popularity_known)
+    ) * duration_factor * quality_penalty(track, popularity_known=popularity_known) * style_mult
 
-    if lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
+    if mode is LyricsPreference.INSTRUMENTAL_ONLY:
         likely = is_likely_instrumental(track)
         if likely is True:
-            score += 8.0
+            score += 10.0
         elif likely is False:
-            score -= 12.0
+            score -= 20.0
         inst = feats.get("instrumentalness")
         if inst is not None:
-            score += 10.0 * inst
-
-    if lyrics == LyricsPreference.YES:
+            score += 12.0 * inst
+    elif mode is LyricsPreference.PREFER_INSTRUMENTAL:
         if is_likely_instrumental(track) is True:
-            score -= 5.0
+            score += 6.0
+        inst = feats.get("instrumentalness")
+        if inst is not None:
+            score += 6.0 * inst
 
-    # Soft boost for recommendation-sourced tracks when recommendations preferred
     if from_recommendations:
-        score += 3.0 * (0.5 + 0.5 * comfort)
+        score += 2.5 * (0.5 + 0.5 * comfort)
 
     return round(score, 3)
 

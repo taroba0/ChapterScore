@@ -192,7 +192,7 @@ chapterscore --help
 | `-a, --author` | — | Author name |
 | `-i, --isbn` | — | ISBN-10/13 |
 | `-m, --mode` | `overall` | `overall` \| `chapter` |
-| `-l, --lyrics` | `no` | `yes` \| `no` \| `instrumental-only` |
+| `-l, --lyrics` | `allow-lyrics` | `allow-lyrics` \| `prefer-instrumental` \| `instrumental-only` |
 | `-n, --tracks` | `20` | Track count (overall mode) |
 | `--tracks-per-chapter` | `3` | Tracks per chapter |
 | `--public` | off | Public playlist |

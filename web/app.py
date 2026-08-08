@@ -93,10 +93,14 @@ def _map_mode(label: str) -> Mode:
 
 def _map_lyrics(label: str) -> LyricsPreference:
     return {
+        "Allow lyrics": LyricsPreference.ALLOW_LYRICS,
+        "Prefer instrumental": LyricsPreference.PREFER_INSTRUMENTAL,
+        "Instrumental only": LyricsPreference.INSTRUMENTAL_ONLY,
+        # legacy labels if any linger in session
         "instrumental-only": LyricsPreference.INSTRUMENTAL_ONLY,
-        "no": LyricsPreference.NO,
-        "yes": LyricsPreference.YES,
-    }[label]
+        "no": LyricsPreference.ALLOW_LYRICS,
+        "yes": LyricsPreference.ALLOW_LYRICS,
+    }.get(label, LyricsPreference.ALLOW_LYRICS).normalized()
 
 
 def _friendly_error(exc: BaseException) -> str:
@@ -279,12 +283,13 @@ def main() -> None:
             )
         with col2:
             lyrics_label = st.selectbox(
-                "Lyrics preference",
-                options=["instrumental-only", "no", "yes"],
+                "Vocals / instrumental",
+                options=["Allow lyrics", "Prefer instrumental", "Instrumental only"],
                 index=0,
                 help=(
-                    "instrumental-only = soundtrack / no vocals · "
-                    "no = either · yes = prefer songs with lyrics"
+                    "Allow lyrics = vocals OK · "
+                    "Prefer instrumental = soft bias · "
+                    "Instrumental only = hard filter (no clear vocals)"
                 ),
             )
 
@@ -307,26 +312,36 @@ def main() -> None:
 
         st.markdown("##### Personalization")
         st.caption(
-            "Blend the book’s vibe with **your** Spotify taste. "
-            "Requires Login with Spotify (scope: user-top-read)."
+            "Priority: **(1)** vocals policy → **(2)** book style → "
+            "**(3)** exploration → **(4)** Top Artists (soft)."
         )
-        taste_label = st.selectbox(
-            "Personal taste (Top Artists)",
-            options=["disable", "top5", "top10", "top15"],
-            index=2,
-            format_func=lambda x: {
-                "disable": "Disable — book vibe only",
-                "top5": "Top 5 artists",
-                "top10": "Top 10 artists (recommended)",
-                "top15": "Top 15 artists",
-            }[x],
-            help="How many of your Spotify Top Artists to use as seeds.",
-        )
+        instrumental_only = lyrics_label == "Instrumental only"
+        if instrumental_only:
+            st.info(
+                "Top Artists is disabled in **Instrumental only** mode because "
+                "most top artists contain vocals."
+            )
+            taste_label = "disable"
+        else:
+            taste_label = st.selectbox(
+                "Personal taste (Top Artists)",
+                options=["disable", "top5", "top10", "top15"],
+                index=2,
+                format_func=lambda x: {
+                    "disable": "Disable — book vibe only",
+                    "top5": "Top 5 artists",
+                    "top10": "Top 10 artists (recommended)",
+                    "top15": "Top 15 artists",
+                }[x],
+                help="How many of your Spotify Top Artists to use as soft seeds.",
+                disabled=False,
+            )
         use_recs = st.toggle(
             "Use Spotify Recommendations API",
             value=True,
             help=(
-                "When on, seed Recommendations with your artists + book energy/mood. "
+                "When on, seed Recommendations with book vibe "
+                "(+ your artists when Top Artists is enabled). "
                 "Falls back to search if the API is unavailable."
             ),
         )
@@ -337,7 +352,8 @@ def main() -> None:
             value=40,
             help=(
                 "0 = stick close to artists you already love · "
-                "100 = discover more new artists (still matching the book)"
+                "100 = discover more new artists (still matching the book). "
+                "Never overrides instrumental or book-style rules."
             ),
         )
         st.caption(

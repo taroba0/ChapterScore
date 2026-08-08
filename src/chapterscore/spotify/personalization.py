@@ -173,12 +173,13 @@ def _target_features(
         "target_energy": max(0.05, min(0.95, energy)),
         "target_valence": max(0.05, min(0.95, valence)),
     }
-    if lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
+    mode = lyrics.normalized()
+    if mode is LyricsPreference.INSTRUMENTAL_ONLY:
         targets["target_instrumentalness"] = 0.85
-        targets["min_instrumentalness"] = 0.4
-    elif lyrics == LyricsPreference.YES:
-        targets["target_instrumentalness"] = 0.15
-        targets["max_instrumentalness"] = 0.55
+        targets["min_instrumentalness"] = 0.5
+    elif mode is LyricsPreference.PREFER_INSTRUMENTAL:
+        targets["target_instrumentalness"] = 0.65
+    # ALLOW_LYRICS: no instrumental constraint
     return targets
 
 
@@ -287,11 +288,12 @@ def search_queries_for_personal_artists(
     if not profile.artist_names:
         return []
     mood = (analysis.overall_mood or "cinematic").split()[0]
-    suffix = "instrumental" if lyrics == LyricsPreference.INSTRUMENTAL_ONLY else ""
+    # Never used under instrumental-only (taste disabled upstream)
+    suffix = "instrumental" if lyrics.prefers_instrumental else ""
     queries = []
     for name in profile.artist_names[:max_artists]:
         q = f"{name} {mood} {suffix}".strip()
         queries.append(q)
-        if lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
+        if lyrics.prefers_instrumental:
             queries.append(f"{name} soundtrack")
     return queries[: max_artists * 2]

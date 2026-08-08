@@ -14,9 +14,57 @@ class Mode(str, Enum):
 
 
 class LyricsPreference(str, Enum):
-    YES = "yes"  # prefer songs with lyrics / vocals
-    NO = "no"  # either is fine
-    INSTRUMENTAL_ONLY = "instrumental-only"  # no vocals
+    """
+    Vocal / instrumental policy (highest-priority hard filter when strict).
+
+    Values are CLI/API tokens; UI labels are friendlier.
+    """
+
+    ALLOW_LYRICS = "allow-lyrics"  # vocals fine
+    PREFER_INSTRUMENTAL = "prefer-instrumental"  # soft bias toward instrumental
+    INSTRUMENTAL_ONLY = "instrumental-only"  # hard: no clear vocals
+
+    # Backward-compatible aliases (old CLI values)
+    YES = "yes"  # legacy → treat as allow-lyrics
+    NO = "no"  # legacy → treat as allow-lyrics
+
+    def normalized(self) -> LyricsPreference:
+        """Map legacy values onto the three canonical modes."""
+        if self in (
+            LyricsPreference.YES,
+            LyricsPreference.NO,
+            LyricsPreference.ALLOW_LYRICS,
+        ):
+            return LyricsPreference.ALLOW_LYRICS
+        return self
+
+    @property
+    def is_instrumental_only(self) -> bool:
+        return self.normalized() is LyricsPreference.INSTRUMENTAL_ONLY
+
+    @property
+    def prefers_instrumental(self) -> bool:
+        n = self.normalized()
+        return n in (
+            LyricsPreference.PREFER_INSTRUMENTAL,
+            LyricsPreference.INSTRUMENTAL_ONLY,
+        )
+
+    @property
+    def display_label(self) -> str:
+        return {
+            LyricsPreference.ALLOW_LYRICS: "Allow lyrics",
+            LyricsPreference.PREFER_INSTRUMENTAL: "Prefer instrumental",
+            LyricsPreference.INSTRUMENTAL_ONLY: "Instrumental only",
+            LyricsPreference.YES: "Allow lyrics",
+            LyricsPreference.NO: "Allow lyrics",
+        }.get(self, self.value)
+
+    def effective_taste(self, taste: TasteStrength) -> TasteStrength:
+        """Instrumental-only disables Top Artists (most tops are vocal acts)."""
+        if self.is_instrumental_only:
+            return TasteStrength.DISABLE
+        return taste
 
 
 class TasteStrength(str, Enum):
@@ -37,7 +85,14 @@ class TasteStrength(str, Enum):
 
 
 class PersonalizationPrefs(BaseModel):
-    """User-controlled personalization for track selection."""
+    """User-controlled personalization for track selection.
+
+    Priority (hard → soft):
+      1. Lyrics / instrumental constraint
+      2. Book vibe & musical style fit
+      3. Exploration vs comfort
+      4. Personal Top Artists (never overrides 1–2)
+    """
 
     taste_strength: TasteStrength = TasteStrength.TOP_10
     use_recommendations: bool = True
@@ -54,6 +109,10 @@ class PersonalizationPrefs(BaseModel):
     def explore(self) -> float:
         """0–1 exploration weight."""
         return self.exploration / 100.0
+
+    def effective_taste(self, lyrics: LyricsPreference) -> TasteStrength:
+        """Top Artists disabled under instrumental-only (most tops are vocal acts)."""
+        return lyrics.effective_taste(self.taste_strength)
 
 
 class Atmosphere(str, Enum):
@@ -160,6 +219,15 @@ class BookVibeAnalysis(BaseModel):
     chapters: list[ChapterVibe] = Field(default_factory=list)
     overall_search_queries: list[SearchQuerySpec] = Field(default_factory=list)
     suggested_genres: list[str] = Field(default_factory=list)
+    # Suitable vs unsuitable musical styles for hard re-ranking / soft filters
+    suitable_styles: list[str] = Field(
+        default_factory=list,
+        description="Musical styles that fit the book (e.g. dark ambient, orchestral, industrial)",
+    )
+    avoid_styles: list[str] = Field(
+        default_factory=list,
+        description="Styles that would clash (e.g. country, bubblegum pop, reggae)",
+    )
     playlist_title_suggestion: str = ""
     playlist_description: str = ""
 
@@ -171,6 +239,14 @@ class BookVibeAnalysis(BaseModel):
         except (TypeError, ValueError):
             return 0.5
         return max(0.0, min(1.0, f))
+
+    def style_keywords_good(self) -> list[str]:
+        """Lowercased tokens used for style matching."""
+        raw = list(self.suitable_styles or []) + list(self.suggested_genres or [])
+        return [s.strip().lower() for s in raw if s and s.strip()]
+
+    def style_keywords_bad(self) -> list[str]:
+        return [s.strip().lower() for s in (self.avoid_styles or []) if s and s.strip()]
 
 
 # ── Track selection ──────────────────────────────────────────────────────────

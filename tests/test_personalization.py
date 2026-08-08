@@ -73,25 +73,20 @@ def test_comfort_prefers_familiar_artist():
     assert s_fam > s_str
 
 
-def test_exploration_boosts_novelty():
+def test_exploration_boosts_novelty_relative_to_comfort():
     spec = SearchQuerySpec(query="epic score", energy=0.6)
     familiar = _track("Time", ["Hans Zimmer"], pop=60)
     stranger = _track("New World", ["Fresh Artist"], pop=60)
 
-    # High exploration should narrow the gap / favor novelty
-    s_fam_e = score_track(
-        familiar,
-        spec,
-        LyricsPreference.INSTRUMENTAL_ONLY,
-        taste_affinity=1.0,
-        exploration=90,
+    gap_comfort = score_track(
+        familiar, spec, LyricsPreference.INSTRUMENTAL_ONLY, taste_affinity=1.0, exploration=10
+    ) - score_track(
+        stranger, spec, LyricsPreference.INSTRUMENTAL_ONLY, taste_affinity=0.0, exploration=10
     )
-    s_str_e = score_track(
-        stranger,
-        spec,
-        LyricsPreference.INSTRUMENTAL_ONLY,
-        taste_affinity=0.0,
-        exploration=90,
+    gap_explore = score_track(
+        familiar, spec, LyricsPreference.INSTRUMENTAL_ONLY, taste_affinity=1.0, exploration=90
+    ) - score_track(
+        stranger, spec, LyricsPreference.INSTRUMENTAL_ONLY, taste_affinity=0.0, exploration=90
     )
-    # At high exploration, novelty weight is large so stranger can beat familiar
-    assert s_str_e >= s_fam_e - 5  # not heavily punished for being new
+    # Familiarity advantage shrinks as exploration rises
+    assert gap_explore < gap_comfort
