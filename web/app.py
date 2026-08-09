@@ -1,5 +1,8 @@
 """
-ChapterScore — Streamlit web UI with in-browser Spotify OAuth.
+ChapterScore — Streamlit web UI with a guided 2-step flow.
+
+  Step 1 — Look up & confirm the book (insights + reading-time estimate)
+  Step 2 — Personalize & generate (locked until Step 1 is confirmed)
 
 Launch locally:
     streamlit run web/app.py
@@ -11,6 +14,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 # Allow `streamlit run web/app.py` without an editable install
 _ROOT = Path(__file__).resolve().parents[1]
@@ -21,9 +25,18 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 import streamlit as st
 
 from chapterscore import __version__
+from chapterscore.analysis.grok import analyze_book_vibe
+from chapterscore.books.aggregator import fetch_book
 from chapterscore.config import get_settings, reload_settings
 from chapterscore.exceptions import ChapterScoreError
-from chapterscore.models import LyricsPreference, Mode, PersonalizationPrefs, TasteStrength
+from chapterscore.models import (
+    BookMetadata,
+    BookVibeAnalysis,
+    LyricsPreference,
+    Mode,
+    PersonalizationPrefs,
+    TasteStrength,
+)
 from chapterscore.pipeline import generate_playlist
 from chapterscore.spotify.web_auth import (
     SS_USER,
@@ -37,6 +50,17 @@ from chapterscore.spotify.web_auth import (
     session_is_authenticated,
     session_token_scopes,
 )
+
+# ── Session keys for the 2-step flow ─────────────────────────────────────────
+
+SS_STEP1_DONE = "cs_step1_confirmed"  # bool — unlocks Step 2
+SS_BOOK = "cs_book_data"  # BookMetadata.model_dump()
+SS_ANALYSIS = "cs_analysis_data"  # BookVibeAnalysis.model_dump()
+SS_LOOKUP_TITLE = "cs_lookup_title"
+SS_LOOKUP_AUTHOR = "cs_lookup_author"
+SS_HAS_CHAPTERS = "cs_has_real_chapters"
+SS_READING_HOURS = "cs_reading_hours"  # float, user-editable estimate
+SS_RESULT = "cs_last_result"  # last generation snapshot for display
 
 
 # ── Page setup ───────────────────────────────────────────────────────────────
@@ -52,9 +76,9 @@ st.markdown(
     """
     <style>
       .block-container {
-        padding-top: 2.25rem;
+        padding-top: 2rem;
         padding-bottom: 3rem;
-        max-width: 720px;
+        max-width: 740px;
       }
       h1 {
         font-weight: 700 !important;
@@ -64,7 +88,7 @@ st.markdown(
       .subtitle {
         color: #6b7280;
         font-size: 1.05rem;
-        margin-bottom: 1.5rem;
+        margin-bottom: 1.25rem;
       }
       .stButton > button, .stLinkButton > a {
         width: 100%;
@@ -80,6 +104,35 @@ st.markdown(
         padding: 1.25rem 1.5rem;
         margin-top: 0.5rem;
       }
+      .step-card {
+        border: 1px solid #e2e8f0;
+        border-radius: 0.9rem;
+        padding: 1.1rem 1.25rem 1.25rem;
+        margin-bottom: 1rem;
+        background: #ffffff;
+      }
+      .step-card.locked {
+        opacity: 0.55;
+        background: #f8fafc;
+      }
+      .step-badge {
+        display: inline-block;
+        font-size: 0.75rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: #64748b;
+        margin-bottom: 0.35rem;
+      }
+      .step-badge.active { color: #7c3aed; }
+      .step-badge.done { color: #059669; }
+      .confirm-box {
+        background: #f0fdf4;
+        border: 1px solid #bbf7d0;
+        border-radius: 0.75rem;
+        padding: 0.9rem 1rem;
+        margin: 0.75rem 0;
+      }
       footer { visibility: hidden; }
     </style>
     """,
@@ -87,8 +140,7 @@ st.markdown(
 )
 
 
-def _map_mode(label: str) -> Mode:
-    return Mode.CHAPTER if label == "chapter" else Mode.OVERALL
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 
 def _map_lyrics(label: str) -> LyricsPreference:
@@ -96,10 +148,6 @@ def _map_lyrics(label: str) -> LyricsPreference:
         "Allow lyrics": LyricsPreference.ALLOW_LYRICS,
         "Prefer instrumental": LyricsPreference.PREFER_INSTRUMENTAL,
         "Instrumental only": LyricsPreference.INSTRUMENTAL_ONLY,
-        # legacy labels if any linger in session
-        "instrumental-only": LyricsPreference.INSTRUMENTAL_ONLY,
-        "no": LyricsPreference.ALLOW_LYRICS,
-        "yes": LyricsPreference.ALLOW_LYRICS,
     }.get(label, LyricsPreference.ALLOW_LYRICS).normalized()
 
 
@@ -132,6 +180,66 @@ def _friendly_error(exc: BaseException) -> str:
     return text
 
 
+def estimate_reading_hours(page_count: int | None) -> float:
+    """Default reading-time estimate (~35 pages/hour). Editable by the user."""
+    if not page_count or page_count <= 0:
+        return 6.0  # unknown length — mid-length novel default
+    return round(max(0.5, min(40.0, page_count / 35.0)), 1)
+
+
+def recommend_playlist_hours(reading_hours: float) -> float:
+    """
+    Soft playlist-length recommendation from reading-time estimate.
+
+    Roughly ~40% of reading time, clamped to a practical listening window.
+    Not a hard quota — generation still prefers quality over padding.
+    """
+    try:
+        rh = float(reading_hours)
+    except (TypeError, ValueError):
+        rh = 6.0
+    return round(min(3.0, max(0.5, rh * 0.4)), 1)
+
+
+def has_real_chapter_data(book: BookMetadata) -> bool:
+    """True only when public chapter/synopsis structure exists (not synthetic)."""
+    if not book.chapters:
+        return False
+    if (book.raw or {}).get("synthetic_chapters"):
+        return False
+    # Require more than a trivial stub list
+    return len(book.chapters) >= 3
+
+
+def short_vibe_summary(analysis: BookVibeAnalysis) -> str:
+    """High-level vibe blurb for Step 1 (not the full deep dump)."""
+    parts: list[str] = []
+    if analysis.overall_mood:
+        parts.append(analysis.overall_mood)
+    if analysis.atmospheres:
+        parts.append(", ".join(analysis.atmospheres[:4]))
+    if analysis.tone:
+        parts.append(analysis.tone)
+    if analysis.distinctive_signature:
+        parts.append(analysis.distinctive_signature[:160])
+    elif analysis.emotional_arc:
+        parts.append(analysis.emotional_arc[:140])
+    return " · ".join(p for p in parts if p) or "Vibe profile ready."
+
+
+def _reset_step1_state() -> None:
+    for k in (
+        SS_STEP1_DONE,
+        SS_BOOK,
+        SS_ANALYSIS,
+        SS_HAS_CHAPTERS,
+        SS_READING_HOURS,
+        SS_RESULT,
+        "step1_reading_hours",
+    ):
+        st.session_state.pop(k, None)
+
+
 def _handle_oauth_redirect() -> None:
     """Process ?code= / ?error= from Spotify and clean the URL."""
     try:
@@ -143,7 +251,6 @@ def _handle_oauth_redirect() -> None:
     if not handled:
         return
 
-    # Clear OAuth params from the address bar
     try:
         st.query_params.clear()
     except Exception:
@@ -214,18 +321,638 @@ def _render_sidebar(settings) -> None:
 
         st.divider()
         st.caption(f"ChapterScore v{__version__}")
-        st.caption("CLI auth still works separately.")
+        st.caption("CLI remains single-step.")
+
+
+def _run_step1_lookup(title: str, author: str | None) -> tuple[BookMetadata, BookVibeAnalysis]:
+    """
+    Reuse backend: public book fetch + Grok vibe analysis (no Spotify).
+
+    want_chapters=False so we only get *real* chapter lists (no synthetic padding).
+    """
+    book = fetch_book(
+        title,
+        author=author,
+        use_cache=True,
+        want_chapters=False,
+    )
+    analysis = analyze_book_vibe(
+        book,
+        mode=Mode.OVERALL,
+        lyrics=LyricsPreference.ALLOW_LYRICS,
+        use_cache=True,
+    )
+    return book, analysis
+
+
+def _render_step1(settings) -> None:
+    confirmed = bool(st.session_state.get(SS_STEP1_DONE))
+    badge = "done" if confirmed else "active"
+    st.markdown(
+        f'<div class="step-card">'
+        f'<div class="step-badge {badge}">Step 1 · Book lookup & confirmation</div>'
+        f"<h3 style='margin:0 0 0.75rem 0;font-size:1.2rem;'>Find your book</h3>",
+        unsafe_allow_html=True,
+    )
+
+    # Widget state via keys only (avoid value= + key= conflicts)
+    if "step1_title_input" not in st.session_state:
+        st.session_state["step1_title_input"] = st.session_state.get(SS_LOOKUP_TITLE, "")
+    if "step1_author_input" not in st.session_state:
+        st.session_state["step1_author_input"] = st.session_state.get(SS_LOOKUP_AUTHOR, "")
+
+    title = st.text_input(
+        "Book title",
+        placeholder="e.g. Dune",
+        help="Required. Full title works best for metadata matching.",
+        key="step1_title_input",
+    )
+    author = st.text_input(
+        "Author (optional)",
+        placeholder="e.g. Frank Herbert",
+        key="step1_author_input",
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        analyze_clicked = st.button(
+            "Analyze Book",
+            type="primary",
+            use_container_width=True,
+            key="btn_analyze_book",
+        )
+    with c2:
+        if confirmed or st.session_state.get(SS_BOOK):
+            if st.button(
+                "Start over / change book",
+                use_container_width=True,
+                key="btn_reset_book",
+            ):
+                _reset_step1_state()
+                st.session_state[SS_LOOKUP_TITLE] = title
+                st.session_state[SS_LOOKUP_AUTHOR] = author
+                st.rerun()
+
+    if analyze_clicked:
+        if not (title or "").strip():
+            st.error("Please enter a book title.")
+        else:
+            missing = settings.missing_required(need_spotify=False, need_xai=True)
+            if missing:
+                st.error(
+                    "Missing configuration: "
+                    + ", ".join(missing)
+                    + ". Add them to Streamlit Secrets or `.env`."
+                )
+            else:
+                # New lookup invalidates prior confirmation
+                st.session_state[SS_STEP1_DONE] = False
+                st.session_state.pop(SS_RESULT, None)
+                status = st.status("Looking up book…", expanded=True)
+                try:
+                    status.write("▸ Fetching public metadata & plot…")
+                    book, analysis = _run_step1_lookup(
+                        title.strip(),
+                        author.strip() or None,
+                    )
+                    status.write(f"▸ Found: {book.display_name}")
+                    status.write("▸ Building high-level vibe summary…")
+                    status.update(label="Book ready for confirmation", state="complete")
+
+                    st.session_state[SS_BOOK] = book.model_dump(mode="json")
+                    st.session_state[SS_ANALYSIS] = analysis.model_dump(mode="json")
+                    st.session_state[SS_LOOKUP_TITLE] = title.strip()
+                    st.session_state[SS_LOOKUP_AUTHOR] = (author or "").strip()
+                    st.session_state[SS_HAS_CHAPTERS] = has_real_chapter_data(book)
+                    rh = estimate_reading_hours(book.page_count)
+                    st.session_state[SS_READING_HOURS] = rh
+                    st.session_state["step1_reading_hours"] = rh
+                    st.rerun()
+                except ChapterScoreError as exc:
+                    status.update(label="Lookup failed", state="error")
+                    st.error(_friendly_error(exc))
+                except Exception as exc:
+                    status.update(label="Lookup failed", state="error")
+                    st.error(_friendly_error(exc))
+                    with st.expander("Technical details"):
+                        st.exception(exc)
+
+    # ── Confirmation panel (after successful lookup) ─────────────────────
+    if st.session_state.get(SS_BOOK) and st.session_state.get(SS_ANALYSIS):
+        book = BookMetadata.model_validate(st.session_state[SS_BOOK])
+        analysis = BookVibeAnalysis.model_validate(st.session_state[SS_ANALYSIS])
+        has_ch = bool(st.session_state.get(SS_HAS_CHAPTERS))
+
+        st.markdown(
+            '<div class="confirm-box">',
+            unsafe_allow_html=True,
+        )
+        st.markdown("##### Confirmed match")
+        st.markdown(f"**{book.title}**")
+        st.caption(
+            f"by {book.author_str}"
+            + (f" · {book.publish_year}" if book.publish_year else "")
+            + (f" · {book.page_count} pages" if book.page_count else "")
+            + f" · sources: {book.source or '—'}"
+        )
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Chapter synopsis data", "Yes" if has_ch else "No")
+        m2.metric(
+            "Chapters found",
+            str(len(book.chapters)) if has_ch else "—",
+        )
+        m3.metric("Pages", str(book.page_count) if book.page_count else "—")
+
+        if has_ch:
+            st.caption(
+                f"Public chapter headings available ({len(book.chapters)}). "
+                "Chapter mode can use section progression."
+            )
+        else:
+            st.caption(
+                "No usable chapter-by-chapter synopsis was found in public sources. "
+                "Chapter mode will be disabled — use Overall mode for a cohesive mix."
+            )
+
+        # Editable reading-time estimate (session key drives the widget default once)
+        if "step1_reading_hours" not in st.session_state:
+            st.session_state["step1_reading_hours"] = float(
+                st.session_state.get(SS_READING_HOURS)
+                or estimate_reading_hours(book.page_count)
+            )
+        reading_hours = st.number_input(
+            "Estimated reading time (hours)",
+            min_value=0.5,
+            max_value=48.0,
+            step=0.5,
+            help=(
+                "Default estimate from page count (~35 pages/hour). "
+                "Edit freely — used only to recommend playlist length, not to force duration."
+            ),
+            key="step1_reading_hours",
+        )
+        st.session_state[SS_READING_HOURS] = float(reading_hours)
+        rec = recommend_playlist_hours(float(reading_hours))
+        st.caption(
+            f"Suggested playlist length from this estimate: **~{rec:g} hours** "
+            f"(soft target — you can change it in Step 2)."
+        )
+
+        st.markdown("##### High-level vibe")
+        st.info(short_vibe_summary(analysis))
+        if analysis.overall_energy is not None:
+            st.caption(
+                f"Energy {analysis.overall_energy:.2f}"
+                + (
+                    f" · intimacy {analysis.intimacy_vs_epic:.2f}"
+                    if analysis.intimacy_vs_epic is not None
+                    else ""
+                )
+            )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        if not confirmed:
+            if st.button(
+                "This is correct — Continue to personalization",
+                type="primary",
+                use_container_width=True,
+                key="btn_confirm_book",
+            ):
+                st.session_state[SS_STEP1_DONE] = True
+                st.session_state[SS_READING_HOURS] = float(reading_hours)
+                st.rerun()
+        else:
+            st.success("Book confirmed. Step 2 is unlocked below.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _render_step2(settings) -> None:
+    unlocked = bool(st.session_state.get(SS_STEP1_DONE))
+    locked_cls = "" if unlocked else "locked"
+    badge = "active" if unlocked else ""
+
+    st.markdown(
+        f'<div class="step-card {locked_cls}">'
+        f'<div class="step-badge {badge}">Step 2 · Personalization & generate</div>'
+        f"<h3 style='margin:0 0 0.5rem 0;font-size:1.2rem;'>Shape your playlist</h3>",
+        unsafe_allow_html=True,
+    )
+
+    if not unlocked:
+        st.caption(
+            "🔒 Complete Step 1 and confirm the book to unlock mode, length, "
+            "lyrics, and personalization controls."
+        )
+        # Greyed-out preview of controls (disabled)
+        st.selectbox(
+            "Mode",
+            options=["Overall", "Chapter"],
+            index=0,
+            disabled=True,
+            key="locked_mode",
+        )
+        st.number_input(
+            "Playlist length (hours, soft target)",
+            min_value=0.0,
+            max_value=6.0,
+            value=1.5,
+            disabled=True,
+            key="locked_hours",
+        )
+        st.selectbox(
+            "Lyrics preference",
+            options=["Allow lyrics", "Prefer instrumental", "Instrumental only"],
+            disabled=True,
+            key="locked_lyrics",
+        )
+        st.selectbox(
+            "Personal taste (Top Artists)",
+            options=["disable", "top5", "top10", "top15"],
+            index=2,
+            disabled=True,
+            key="locked_taste",
+        )
+        st.slider(
+            "Comfort ↔ Explorative",
+            0,
+            100,
+            25,
+            disabled=True,
+            key="locked_explore",
+        )
+        st.button(
+            "Generate Playlist",
+            type="primary",
+            disabled=True,
+            use_container_width=True,
+            key="locked_generate",
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    # ── Unlocked controls ────────────────────────────────────────────────
+    book = BookMetadata.model_validate(st.session_state[SS_BOOK])
+    has_ch = bool(st.session_state.get(SS_HAS_CHAPTERS))
+    reading_h = float(st.session_state.get(SS_READING_HOURS) or 6.0)
+    rec_hours = recommend_playlist_hours(reading_h)
+
+    st.caption(
+        f"Book: **{book.display_name}** · "
+        f"reading estimate **{reading_h:g} h** · "
+        f"recommended playlist **~{rec_hours:g} h** (soft)"
+    )
+
+    # 1. Mode
+    if has_ch:
+        mode_label = st.radio(
+            "1. Mode",
+            options=["Overall", "Chapter"],
+            index=0,
+            horizontal=True,
+            help=(
+                "Overall = one cohesive emotional world (shuffle-friendly). "
+                "Chapter = ordered by narrative sections."
+            ),
+            key="step2_mode",
+        )
+    else:
+        mode_label = "Overall"
+        st.radio(
+            "1. Mode",
+            options=["Overall"],
+            index=0,
+            horizontal=True,
+            help="Only Overall is available for this book.",
+            key="step2_mode_overall_only",
+        )
+        st.info(
+            "Chapter mode is disabled because no usable chapter-by-chapter synopsis "
+            "was found for this book in public sources."
+        )
+
+    # 2. Playlist length (soft)
+    st.markdown("**2. Playlist length**")
+    st.caption(
+        f"Recommended **~{rec_hours:g} hours** from your reading-time estimate "
+        f"({reading_h:g} h). This is a soft preference — quality matching wins over padding."
+    )
+    length_choice = st.radio(
+        "Length preference",
+        options=[
+            f"Recommended (~{rec_hours:g} h)",
+            "Custom hours",
+            "Track count instead",
+            "No length target",
+        ],
+        index=0,
+        key="step2_length_choice",
+        label_visibility="collapsed",
+    )
+
+    min_hours: float | None = rec_hours
+    tracks_overall: int | None = None
+    if length_choice.startswith("Recommended"):
+        min_hours = rec_hours
+    elif length_choice == "Custom hours":
+        min_hours = st.number_input(
+            "Target hours (soft)",
+            min_value=0.5,
+            max_value=6.0,
+            value=float(rec_hours),
+            step=0.25,
+            key="step2_custom_hours",
+        )
+    elif length_choice == "Track count instead":
+        min_hours = 0.0
+        tracks_overall = st.number_input(
+            "Target tracks (soft)",
+            min_value=8,
+            max_value=80,
+            value=20,
+            step=1,
+            key="step2_track_count",
+        )
+    else:
+        min_hours = 0.0
+
+    # 3. Lyrics
+    lyrics_label = st.selectbox(
+        "3. Lyrics preference",
+        options=["Allow lyrics", "Prefer instrumental", "Instrumental only"],
+        index=0,
+        help=(
+            "Allow lyrics = vocals OK · Prefer instrumental = soft bias · "
+            "Instrumental only = hard no-vocals filter (Top Artists still allowed)"
+        ),
+        key="step2_lyrics",
+    )
+
+    # 4. Taste / exploration / recommendations
+    st.markdown("**4. Personalization**")
+    st.caption(
+        "Priority: **(1)** vocals policy → **(2)** book style → "
+        "**(3)** exploration → **(4)** Top Artists (soft)."
+    )
+    taste_label = st.selectbox(
+        "Personal taste (Top Artists)",
+        options=["disable", "top5", "top10", "top15"],
+        index=2,
+        format_func=lambda x: {
+            "disable": "Disable — book vibe only",
+            "top5": "Top 5 artists",
+            "top10": "Top 10 artists (recommended)",
+            "top15": "Top 15 artists",
+        }[x],
+        help="Soft seeds from your Spotify listening — never overrides book vibe or lyrics rules.",
+        key="step2_taste",
+    )
+    if lyrics_label == "Instrumental only" and taste_label != "disable":
+        st.warning(
+            "Note: many of your top artists have vocals, so results may be limited "
+            "in **Instrumental only** mode. Top Artists stays enabled."
+        )
+
+    exploration = st.slider(
+        "Comfort ↔ Explorative",
+        min_value=0,
+        max_value=100,
+        value=25,
+        help=(
+            "0 = stick close to artists you already love · "
+            "100 = discover more new artists (still matching the book)."
+        ),
+        key="step2_exploration",
+    )
+    st.caption(
+        f"{'← Comfort' if exploration < 50 else 'Explore →'}  "
+        f"**{exploration}** "
+        f"({'mostly familiar' if exploration <= 35 else 'balanced' if exploration <= 65 else 'mostly new'})"
+    )
+
+    use_recs = st.toggle(
+        "Use Spotify Recommendations API",
+        value=True,
+        help=(
+            "Seed Recommendations with book vibe (+ your artists when Top Artists is on). "
+            "Falls back to search if unavailable."
+        ),
+        key="step2_recs",
+    )
+
+    dry_run = st.checkbox(
+        "Dry run (analyze / search plan only — no Spotify playlist write)",
+        value=False,
+        key="step2_dry_run",
+    )
+
+    # 5. Generate
+    st.markdown("**5. Generate**")
+    gen_clicked = st.button(
+        "Generate Playlist",
+        type="primary",
+        use_container_width=True,
+        key="btn_generate",
+    )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if not gen_clicked:
+        return
+
+    # ── Generate using existing pipeline ─────────────────────────────────
+    mode = Mode.CHAPTER if mode_label == "Chapter" and has_ch else Mode.OVERALL
+    lyrics = _map_lyrics(lyrics_label)
+    taste_map = {
+        "disable": TasteStrength.DISABLE,
+        "top5": TasteStrength.TOP_5,
+        "top10": TasteStrength.TOP_10,
+        "top15": TasteStrength.TOP_15,
+    }
+    prefs = PersonalizationPrefs(
+        taste_strength=taste_map[taste_label],
+        use_recommendations=bool(use_recs),
+        exploration=int(exploration),
+    )
+
+    need_spotify = not dry_run
+    missing = settings.missing_required(need_spotify=need_spotify, need_xai=True)
+    if missing:
+        st.error(
+            "Missing configuration: "
+            + ", ".join(missing)
+            + ". Add them to Streamlit Secrets or `.env`."
+        )
+        return
+
+    if need_spotify and not session_is_authenticated(st.session_state):
+        st.error(
+            "Please **Login with Spotify** first (sidebar) to create a real playlist. "
+            "Or enable **Dry run**."
+        )
+        return
+
+    sp = None
+    if need_spotify:
+        try:
+            sp = get_session_spotify(st.session_state)
+        except ChapterScoreError as exc:
+            st.error(_friendly_error(exc))
+            return
+
+    status = st.status("Generating playlist…", expanded=True)
+
+    def progress(msg: str) -> None:
+        status.update(label=msg[:80], state="running")
+        status.write(f"▸ {msg}")
+
+    try:
+        # Reuse full pipeline; book identity from Step 1 inputs
+        result = generate_playlist(
+            book.title,
+            author=book.authors[0] if book.authors else (
+                st.session_state.get(SS_LOOKUP_AUTHOR) or None
+            ),
+            mode=mode,
+            lyrics=lyrics,
+            tracks=int(tracks_overall) if tracks_overall else None,
+            min_hours=float(min_hours) if min_hours and min_hours > 0 else 0.0,
+            public=False,
+            dry_run=dry_run,
+            use_cache=True,
+            progress=progress,
+            spotify_client=sp,
+            personalization=prefs,
+        )
+        status.update(label="Done", state="complete")
+    except TypeError as exc:
+        if "spotify_client" in str(exc):
+            status.update(label="Deploy outdated", state="error")
+            st.error(
+                "This deployment is running an **old** `generate_playlist` without "
+                "`spotify_client` support.\n\n"
+                f"Loaded pipeline: `{generate_playlist.__code__.co_filename}`\n"
+                f"ChapterScore version: **{__version__}**\n\n"
+                "Push the latest code and reboot the Streamlit Cloud app."
+            )
+            return
+        status.update(label="Failed", state="error")
+        st.error(_friendly_error(exc))
+        return
+    except ChapterScoreError as exc:
+        status.update(label="Failed", state="error")
+        st.error(_friendly_error(exc))
+        return
+    except Exception as exc:
+        status.update(label="Failed", state="error")
+        st.error(_friendly_error(exc))
+        with st.expander("Technical details"):
+            st.exception(exc)
+        return
+
+    # Snapshot for result panel (session-safe primitives)
+    snap: dict[str, Any] = {
+        "dry_run": dry_run,
+        "mode": mode.value,
+        "book_title": result.book.display_name,
+        "mood": result.analysis.overall_mood,
+        "energy": result.analysis.overall_energy,
+        "signature": result.analysis.distinctive_signature or "",
+        "description": result.analysis.playlist_description or "",
+        "playlist_title": result.analysis.playlist_title_suggestion or "",
+        "styles": list(result.analysis.suitable_styles or [])[:8],
+        "avoid": list(result.analysis.avoid_styles or [])[:8],
+        "tracks": [
+            {
+                "name": t.name,
+                "artists": t.artist_str,
+                "chapter": t.chapter_number,
+            }
+            for t in (result.tracks or [])
+        ],
+        "playlist": None,
+    }
+    if result.playlist:
+        snap["playlist"] = {
+            "name": result.playlist.name,
+            "url": result.playlist.url,
+            "track_count": result.playlist.track_count,
+        }
+    st.session_state[SS_RESULT] = snap
+    st.rerun()
+
+
+def _render_results() -> None:
+    snap = st.session_state.get(SS_RESULT)
+    if not snap:
+        return
+
+    dry = bool(snap.get("dry_run"))
+    st.success("Generation complete" + (" (dry run)" if dry else ""))
+
+    st.markdown("##### Book & vibe")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Mood", snap.get("mood") or "—")
+    energy = snap.get("energy")
+    m2.metric("Energy", f"{energy:.2f}" if isinstance(energy, (int, float)) else "—")
+    m3.metric("Mode", snap.get("mode") or "—")
+
+    if snap.get("signature"):
+        st.markdown(f"**Signature:** {snap['signature']}")
+    if snap.get("description"):
+        st.info(snap["description"])
+    if snap.get("styles") or snap.get("avoid"):
+        c1, c2 = st.columns(2)
+        if snap.get("styles"):
+            c1.markdown("**Styles:** " + ", ".join(snap["styles"]))
+        if snap.get("avoid"):
+            c2.markdown("**Avoid:** " + ", ".join(snap["avoid"]))
+    st.caption(f"**{snap.get('book_title', '—')}**")
+
+    if dry:
+        st.markdown("##### Would create")
+        st.write(f"**{snap.get('playlist_title') or 'ChapterScore playlist'}**")
+        if snap.get("description"):
+            st.write(snap["description"])
+        st.caption("Uncheck **Dry run** and generate again to create a real playlist.")
+        return
+
+    pl = snap.get("playlist")
+    if pl:
+        st.markdown("##### Your playlist")
+        st.markdown(
+            f"""
+            <div class="result-card">
+              <div style="font-size:1.25rem;font-weight:700;margin-bottom:0.35rem;">
+                {pl.get("name", "Playlist")}
+              </div>
+              <div style="color:#64748b;margin-bottom:0.75rem;">
+                {pl.get("track_count", 0)} tracks
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if pl.get("url"):
+            st.link_button("Open Spotify playlist", pl["url"], use_container_width=True)
+
+    tracks = snap.get("tracks") or []
+    if tracks:
+        with st.expander(f"Track list ({len(tracks)})", expanded=False):
+            for i, t in enumerate(tracks, 1):
+                ch = f" · ch {t['chapter']}" if t.get("chapter") is not None else ""
+                st.write(f"{i}. **{t.get('name', '?')}** — {t.get('artists', '')}{ch}")
 
 
 def main() -> None:
-    # Secrets → env before Settings loads
     load_streamlit_secrets_into_env()
     reload_settings()
     settings = get_settings()
 
     _handle_oauth_redirect()
 
-    # Flash messages from OAuth
     if st.session_state.pop("auth_flash_ok", None):
         st.toast("Spotify connected", icon="✅")
     flash_err = st.session_state.pop("auth_flash_error", None)
@@ -234,18 +961,15 @@ def main() -> None:
 
     st.markdown("# ChapterScore")
     st.markdown(
-        '<p class="subtitle">Soundtracks for the books you love</p>',
+        '<p class="subtitle">Soundtracks for the books you love — in two easy steps</p>',
         unsafe_allow_html=True,
     )
 
     _render_sidebar(settings)
 
-    logged_in = session_is_authenticated(st.session_state)
-
-    # Main-page login CTA when not authenticated
-    if not logged_in:
+    if not session_is_authenticated(st.session_state):
         st.info(
-            "Connect Spotify to create playlists. Dry-run analysis works without login."
+            "Connect Spotify to create playlists. Step 1 book analysis works without login."
         )
         meta = login_button_meta(st.session_state)
         c1, c2 = st.columns([1, 1])
@@ -259,388 +983,15 @@ def main() -> None:
         with c2:
             st.caption(f"Redirect: `{meta['redirect_uri']}`")
 
-    # ── Form ────────────────────────────────────────────────────────────────
-    with st.form("generate_form", clear_on_submit=False):
-        st.markdown("##### Book")
-        title = st.text_input(
-            "Book title",
-            placeholder="e.g. Dune",
-            help="Required. Use the full title for best metadata matches.",
-        )
-        author = st.text_input(
-            "Author (optional)",
-            placeholder="e.g. Frank Herbert",
-        )
+    # Progress indicator
+    step1_done = bool(st.session_state.get(SS_STEP1_DONE))
+    p1, p2 = st.columns(2)
+    p1.markdown("**① Book** " + ("✅" if step1_done else "…"))
+    p2.markdown("**② Personalize** " + ("✅ unlocked" if step1_done else "🔒 locked"))
 
-        st.markdown("##### Playlist options")
-        col1, col2 = st.columns(2)
-        with col1:
-            mode_label = st.selectbox(
-                "Mode",
-                options=["overall", "chapter"],
-                index=0,
-                help=(
-                    "Overall = one cohesive emotional world (shuffle-friendly). "
-                    "Chapter = ordered narrative progression."
-                ),
-            )
-        with col2:
-            lyrics_label = st.selectbox(
-                "Vocals / instrumental",
-                options=["Allow lyrics", "Prefer instrumental", "Instrumental only"],
-                index=0,
-                help=(
-                    "Allow lyrics = vocals OK · "
-                    "Prefer instrumental = soft bias · "
-                    "Instrumental only = hard no-vocals filter "
-                    "(Top Artists still allowed as a soft seed)"
-                ),
-            )
-
-        col3, col4 = st.columns(2)
-        with col3:
-            min_hours = st.number_input(
-                "Target hours (soft)",
-                min_value=0.0,
-                max_value=6.0,
-                value=1.5,
-                step=0.5,
-                help=(
-                    "Soft length aim. Quality-matched tracks are preferred even if "
-                    "the playlist ends up a bit shorter. Set 0 to disable. "
-                    "Not derived from book length."
-                ),
-            )
-        with col4:
-            st.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
-            dry_run = st.checkbox(
-                "Dry run (analyze only — no Spotify playlist)",
-                value=False,
-            )
-            review_first = st.checkbox(
-                "Review analysis first (optional)",
-                value=False,
-                help=(
-                    "Show the book vibe summary before creating a playlist. "
-                    "Default remains one-step generation."
-                ),
-            )
-
-        st.markdown("##### Personalization")
-        st.caption(
-            "Priority: **(1)** vocals policy → **(2)** book style → "
-            "**(3)** exploration → **(4)** Top Artists (soft)."
-        )
-        instrumental_only = lyrics_label == "Instrumental only"
-        taste_label = st.selectbox(
-            "Personal taste (Top Artists)",
-            options=["disable", "top5", "top10", "top15"],
-            index=2,
-            format_func=lambda x: {
-                "disable": "Disable — book vibe only",
-                "top5": "Top 5 artists",
-                "top10": "Top 10 artists (recommended)",
-                "top15": "Top 15 artists",
-            }[x],
-            help="How many of your Spotify Top Artists to use as soft seeds.",
-        )
-        if instrumental_only and taste_label != "disable":
-            st.warning(
-                "Note: many of your top artists have vocals, so results may be limited "
-                "in **Instrumental only** mode. Top Artists stays enabled."
-            )
-        use_recs = st.toggle(
-            "Use Spotify Recommendations API",
-            value=True,
-            help=(
-                "When on, seed Recommendations with book vibe "
-                "(+ your artists when Top Artists is enabled). "
-                "Falls back to search if the API is unavailable."
-            ),
-        )
-        exploration = st.slider(
-            "Exploration vs comfort",
-            min_value=0,
-            max_value=100,
-            value=25,
-            help=(
-                "0 = stick close to artists you already love · "
-                "100 = discover more new artists (still matching the book). "
-                "Never overrides instrumental or book-style rules."
-            ),
-        )
-        st.caption(
-            f"{'← Comfort' if exploration < 50 else 'Explore →'}  "
-            f"Current: **{exploration}** "
-            f"({'mostly familiar' if exploration <= 35 else 'balanced' if exploration <= 65 else 'mostly new'})"
-        )
-
-        submitted = st.form_submit_button("Generate Playlist", type="primary")
-
-    # ── Optional continue from prior review-first analysis ─────────────────
-    pending = st.session_state.get("cs_pending_generate")
-    if pending and not submitted:
-        st.info("Vibe analysis ready — review below, then continue if it looks right.")
-        prev = pending.get("analysis_summary") or {}
-        st.markdown("##### Book & vibe (review)")
-        st.write(f"**{prev.get('title', '—')}**")
-        st.caption(
-            f"Mood: {prev.get('mood', '—')} · Energy: {prev.get('energy', '—')} · "
-            f"Signature: {prev.get('signature', '—')}"
-        )
-        if prev.get("description"):
-            st.write(prev["description"])
-        st.caption(
-            "Length targets are soft (quality over padding). "
-            "Overall mode is shuffle-friendly; chapter mode is progression-aware, not time-synced."
-        )
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Continue & create playlist", type="primary"):
-                st.session_state["cs_force_generate"] = True
-                st.rerun()
-        with c2:
-            if st.button("Discard review"):
-                st.session_state.pop("cs_pending_generate", None)
-                st.session_state.pop("cs_force_generate", None)
-                st.rerun()
-        if not st.session_state.get("cs_force_generate"):
-            return
-
-    force_generate = bool(st.session_state.pop("cs_force_generate", False))
-    if force_generate and pending:
-        title = pending["title"]
-        gen_base = pending["gen_base"]
-        mode_label = pending.get("mode_label", "overall")
-        dry_run = False
-        review_first = False
-        run_from_pending = True
-    elif not submitted:
-        return
-    else:
-        run_from_pending = False
-        if not (title or "").strip():
-            st.error("Please enter a book title.")
-            return
-        taste_map = {
-            "disable": TasteStrength.DISABLE,
-            "top5": TasteStrength.TOP_5,
-            "top10": TasteStrength.TOP_10,
-            "top15": TasteStrength.TOP_15,
-        }
-        prefs = PersonalizationPrefs(
-            taste_strength=taste_map[taste_label],
-            use_recommendations=bool(use_recs),
-            exploration=int(exploration),
-        )
-        gen_base = dict(
-            author=author.strip() or None,
-            mode=_map_mode(mode_label),
-            lyrics=_map_lyrics(lyrics_label),
-            min_hours=float(min_hours) if min_hours and min_hours > 0 else 0.0,
-            public=False,
-            use_cache=True,
-            personalization=prefs,
-        )
-
-    # First pass of review-first = analysis only; dry_run always analysis only
-    run_dry = bool(dry_run) or (bool(review_first) and not run_from_pending)
-    need_spotify = not run_dry
-
-    missing_now = settings.missing_required(need_spotify=need_spotify, need_xai=True)
-    if missing_now:
-        st.error(
-            "Missing configuration: "
-            + ", ".join(missing_now)
-            + ". Add them to Streamlit Secrets or `.env`."
-        )
-        return
-
-    if need_spotify and not session_is_authenticated(st.session_state):
-        st.error(
-            "Please **Login with Spotify** first (sidebar or button above) "
-            "to create a real playlist. Or enable **Dry run** / **Review analysis first**."
-        )
-        return
-
-    status_box = st.status("Starting…", expanded=True)
-
-    def progress(msg: str) -> None:
-        status_box.update(label=msg[:80], state="running")
-        status_box.write(f"▸ {msg}")
-
-    sp = None
-    if need_spotify:
-        try:
-            sp = get_session_spotify(st.session_state)
-        except ChapterScoreError as exc:
-            status_box.update(label="Auth failed", state="error")
-            st.error(_friendly_error(exc))
-            return
-
-    try:
-        gen_kwargs = dict(
-            **gen_base,
-            dry_run=run_dry,
-            progress=progress,
-            spotify_client=sp,
-        )
-        result = generate_playlist(
-            (title if isinstance(title, str) else str(title)).strip(),
-            **gen_kwargs,
-        )
-        status_box.update(label="Done", state="complete")
-    except TypeError as exc:
-        # Helps diagnose stale deploys that still run an old pipeline.py
-        if "spotify_client" in str(exc):
-            status_box.update(label="Deploy outdated", state="error")
-            st.error(
-                "This deployment is running an **old** `generate_playlist` without "
-                "`spotify_client` support.\n\n"
-                f"Loaded pipeline: `{generate_playlist.__code__.co_filename}`\n"
-                f"ChapterScore version: **{__version__}** (need ≥ 0.1.1)\n\n"
-                "Push the latest `src/chapterscore/pipeline.py` to GitHub and "
-                "**reboot** the Streamlit Cloud app."
-            )
-            return
-        status_box.update(label="Failed", state="error")
-        st.error(_friendly_error(exc))
-        return
-    except ChapterScoreError as exc:
-        status_box.update(label="Failed", state="error")
-        st.error(_friendly_error(exc))
-        return
-    except Exception as exc:
-        status_box.update(label="Failed", state="error")
-        st.error(_friendly_error(exc))
-        with st.expander("Technical details"):
-            st.exception(exc)
-        return
-
-    # ── Results ──────────────────────────────────────────────────────────────
-    book = result.book
-    analysis = result.analysis
-
-    # Review-first first pass: stash params and invite continue
-    if run_dry and review_first and not dry_run:
-        st.session_state["cs_pending_generate"] = {
-            "title": book.title,
-            "gen_base": gen_base,
-            "mode_label": mode_label,
-            "analysis_summary": {
-                "title": book.display_name,
-                "mood": analysis.overall_mood,
-                "energy": f"{analysis.overall_energy:.2f}",
-                "signature": (analysis.distinctive_signature or "")[:200],
-                "description": analysis.playlist_description or "",
-            },
-        }
-        st.success("Analysis ready — review the vibe, then continue when you like it.")
-    elif run_dry:
-        st.success("Generation complete (dry run)")
-        st.session_state.pop("cs_pending_generate", None)
-    else:
-        st.success("Generation complete")
-        st.session_state.pop("cs_pending_generate", None)
-
-    st.markdown("##### Book & vibe")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Mood", analysis.overall_mood or "—")
-    m2.metric("Energy", f"{analysis.overall_energy:.2f}")
-    m3.metric("Mode", mode_label)
-
-    m4, m5, m6 = st.columns(3)
-    m4.metric("Intimacy", f"{analysis.intimacy_vs_epic:.2f}")
-    m5.metric("Humor", f"{analysis.humor_level:.2f}")
-    m6.metric("Dreaminess", f"{analysis.realism_vs_dreaminess:.2f}")
-
-    vibe_bits = []
-    if analysis.atmospheres:
-        vibe_bits.append(", ".join(analysis.atmospheres[:6]))
-    if analysis.emotional_arc:
-        vibe_bits.append(analysis.emotional_arc)
-    if analysis.playlist_description:
-        vibe_bits.append(analysis.playlist_description)
-    if vibe_bits:
-        st.info(" · ".join(vibe_bits[:3]))
-
-    if analysis.distinctive_signature:
-        st.markdown(f"**Signature:** {analysis.distinctive_signature}")
-    if analysis.narrative_voice or analysis.writing_style:
-        st.caption(
-            " · ".join(
-                filter(
-                    None,
-                    [
-                        f"Voice: {analysis.narrative_voice}" if analysis.narrative_voice else "",
-                        f"Prose: {analysis.writing_style}" if analysis.writing_style else "",
-                    ],
-                )
-            )
-        )
-    if analysis.suitable_styles or analysis.avoid_styles:
-        cols = st.columns(2)
-        if analysis.suitable_styles:
-            cols[0].markdown(
-                "**Styles:** " + ", ".join(analysis.suitable_styles[:8])
-            )
-        if analysis.avoid_styles:
-            cols[1].markdown(
-                "**Avoid:** " + ", ".join(analysis.avoid_styles[:8])
-            )
-    if analysis.anti_generic_notes:
-        st.caption("Anti-generic: " + "; ".join(analysis.anti_generic_notes[:4]))
-
-    st.caption(
-        f"**{book.display_name}**"
-        + (f" · {book.publish_year}" if book.publish_year else "")
-        + f" · sources: {book.source or '—'}"
-    )
-
-    if run_dry:
-        st.markdown("##### Would create")
-        st.write(
-            f"**{analysis.playlist_title_suggestion or f'ChapterScore: {book.title}'}**"
-        )
-        if analysis.playlist_description:
-            st.write(analysis.playlist_description)
-        if review_first and not dry_run:
-            st.caption(
-                "Optional review step complete. Click **Continue & create playlist** above "
-                "(re-run if the panel is collapsed) — or generate again with Review off."
-            )
-            # Immediate continue button on same page after analysis
-            if st.button("Continue & create playlist now", type="primary", key="cs_continue_now"):
-                st.session_state["cs_force_generate"] = True
-                st.rerun()
-        else:
-            st.caption("Uncheck **Dry run** and generate again to create a real playlist.")
-        return
-
-    if result.playlist:
-        pl = result.playlist
-        st.markdown("##### Your playlist")
-        st.markdown(
-            f"""
-            <div class="result-card">
-              <div style="font-size:1.25rem;font-weight:700;margin-bottom:0.35rem;">
-                {pl.name}
-              </div>
-              <div style="color:#64748b;margin-bottom:0.75rem;">
-                {pl.track_count} tracks
-                {" · " + (analysis.playlist_description or "") if analysis.playlist_description else ""}
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.link_button("Open Spotify playlist", pl.url, use_container_width=True)
-
-    if result.tracks:
-        with st.expander(f"Track list ({len(result.tracks)})", expanded=False):
-            for i, t in enumerate(result.tracks, 1):
-                ch = f" · ch {t.chapter_number}" if t.chapter_number is not None else ""
-                st.write(f"{i}. **{t.name}** — {t.artist_str}{ch}")
+    _render_step1(settings)
+    _render_step2(settings)
+    _render_results()
 
 
 if __name__ == "__main__":

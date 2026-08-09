@@ -26,7 +26,7 @@ It combines:
 - **Secure Spotify OAuth** — browser login, token cache with auto-refresh
 - **Disk cache** — book lookups and vibe analyses cached locally (7-day TTL)
 - **Polished CLI** — progress output, rich literary profile table, `doctor`, `--dry-run`
-- **Streamlit web UI** — single-page form to generate playlists in the browser
+- **Streamlit web UI** — guided **2-step** flow (confirm book → personalize → generate)
 
 ---
 
@@ -85,7 +85,7 @@ chapterscore doctor          # check config + network
 chapterscore auth --force    # browser OAuth (accept all playlist scopes)
 ```
 
-### 4a. Web UI (browser Spotify login)
+### 4a. Web UI (browser Spotify login) — 2-step flow
 
 ```bash
 cd ChapterScore
@@ -95,18 +95,16 @@ streamlit run web/app.py
 
 Open the URL Streamlit prints (usually **http://localhost:8501**).
 
-1. Click **Login with Spotify** (sidebar or main page).
-2. Approve the scopes on Spotify’s site.
-3. You return to the app logged in — generate a real playlist.
+1. Click **Login with Spotify** (sidebar) if you want a real playlist.
+2. **Step 1** — enter title/author → **Analyze Book** → confirm the match.
+3. **Step 2** unlocks only after confirmation — mode, length, lyrics, taste → **Generate Playlist**.
 
-| Field | Notes |
-|--------|--------|
-| Book title | Required |
-| Author | Optional |
-| Mode | `overall` or `chapter` |
-| Lyrics | `instrumental-only`, `no`, or `yes` (Top Artists still allowed with instrumental) |
-| Target hours (soft) | Default `1.5` (set `0` to disable; quality preferred over padding) |
-| Dry run | Analyze only — no Spotify write |
+| Step | What you do |
+|------|-------------|
+| **1 · Book** | Title (required), author (optional) → analyze → see match, chapter-data yes/no, editable reading-time estimate, short vibe summary → **This is correct — Continue** |
+| **2 · Personalize** | Mode (Chapter disabled if no public chapter synopsis) · soft playlist length (recommended from reading time) · lyrics · Top Artists / comfort / recommendations → **Generate** |
+
+Step 2 stays locked/greyed out until Step 1 is confirmed. CLI remains single-step.
 
 #### Spotify Redirect URIs (required)
 
@@ -268,14 +266,14 @@ Instead of one generic “music supervisor” pass, ChapterScore runs **two Grok
 - Length (hours / track count) is a **soft target** — quality over padding  
 - Overall mode stays shuffle-friendly; chapter mode is progression-aware, not time-synced  
 
-### Optional: review analysis first
+### Optional: review analysis first (CLI)
 
 ```bash
 # CLI — analyze, confirm, then create playlist
 chapterscore generate "Dune" -a "Frank Herbert" --review-first
 ```
 
-Web UI: check **Review analysis first (optional)** — not required for normal one-step generation.
+Web UI uses a dedicated **2-step flow** (book confirmation → personalization) instead.
 
 ### Stage 4 — Playlist
 
