@@ -84,6 +84,97 @@ def _infer_genre_labels(book: BookMetadata) -> list[str]:
     return labels
 
 
+def lookup_book_quick(
+    title: str,
+    author: str | None = None,
+    isbn: str | None = None,
+    *,
+    use_cache: bool = True,
+) -> BookMetadata:
+    """
+    Fast identity lookup for UI Step 1 (target: a few seconds).
+
+    Uses Open Library + Google Books only — no Wikipedia plot/reception,
+    no tone-snippet mining, no Grok. Optional cheap Wikipedia *section-index*
+    check for a chapter-list hint (no section text download).
+
+    Full enrichment still happens later via ``fetch_book`` during generate.
+    """
+    title = (title or "").strip()
+    if not title and not isbn:
+        raise BookNotFoundError("Provide a book title or ISBN.")
+
+    cache = Cache()
+    cache_key = book_cache_key(title or "", author, isbn) + "|quick_v1"
+    if use_cache:
+        cached = cache.get_model("book_quick", cache_key, BookMetadata)
+        if cached is not None:
+            logger.debug("Quick book cache hit: %s", cache_key)
+            return cached
+
+    with create_client() as client:
+        ol: BookMetadata | None = None
+        gb: BookMetadata | None = None
+        try:
+            ol = search_open_library(title, author, isbn, client=client)
+        except Exception as exc:
+            logger.debug("Open Library (quick) failed: %s", exc)
+        try:
+            gb = search_google_books(
+                title or (ol.title if ol else ""), author, isbn, client=client
+            )
+        except Exception as exc:
+            logger.debug("Google Books (quick) failed: %s", exc)
+
+        if ol is None and gb is None:
+            raise BookNotFoundError(
+                f"Could not find book metadata for “{title}”.",
+                hint="Try a more exact title, add an author, or pass an ISBN.",
+            )
+
+        if ol and gb:
+            primary, secondary = (
+                (ol, gb) if len(ol.description or "") >= len(gb.description or "") else (gb, ol)
+            )
+            book = _merge_metadata(primary, secondary)
+        else:
+            book = ol or gb  # type: ignore[assignment]
+
+        if gb and gb.description:
+            book.publisher_blurb = book.publisher_blurb or gb.description
+        if not book.publisher_blurb and book.description:
+            book.publisher_blurb = book.description
+
+        book.genre_labels = list(
+            dict.fromkeys(book.genre_labels + _infer_genre_labels(book))
+        )[:20]
+        book.source = "+".join(
+            filter(None, [(book.source or "").replace("+wikipedia", "").strip("+"), "quick"])
+        ) or "quick"
+
+        # Cheap chapter-list hint (section titles only — no plot download)
+        try:
+            from chapterscore.books.wikipedia import quick_chapter_list_available
+
+            hint = quick_chapter_list_available(
+                book.title,
+                book.authors[0] if book.authors else author,
+                client=client,
+            )
+            book.raw = {
+                **(book.raw or {}),
+                "quick_lookup": True,
+                "quick_chapter_hint": bool(hint),
+            }
+        except Exception as exc:
+            logger.debug("Quick chapter hint failed: %s", exc)
+            book.raw = {**(book.raw or {}), "quick_lookup": True, "quick_chapter_hint": False}
+
+    if use_cache:
+        cache.set("book_quick", cache_key, book)
+    return book
+
+
 def fetch_book(
     title: str,
     author: str | None = None,

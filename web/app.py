@@ -1,8 +1,9 @@
 """
 ChapterScore — Streamlit web UI with a guided 2-step flow.
 
-  Step 1 — Look up & confirm the book (insights + reading-time estimate)
-  Step 2 — Personalize & generate (locked until Step 1 is confirmed)
+  Step 1 — Fast book identity lookup + confirm (no Grok, no deep wiki)
+  Step 2 — Personalize & generate (locked until Step 1 is confirmed;
+            full literary vibe analysis runs here via generate_playlist)
 
 Launch locally:
     streamlit run web/app.py
@@ -25,13 +26,11 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 import streamlit as st
 
 from chapterscore import __version__
-from chapterscore.analysis.grok import analyze_book_vibe
-from chapterscore.books.aggregator import fetch_book
+from chapterscore.books.aggregator import lookup_book_quick
 from chapterscore.config import get_settings, reload_settings
 from chapterscore.exceptions import ChapterScoreError
 from chapterscore.models import (
     BookMetadata,
-    BookVibeAnalysis,
     LyricsPreference,
     Mode,
     PersonalizationPrefs,
@@ -54,11 +53,10 @@ from chapterscore.spotify.web_auth import (
 # ── Session keys for the 2-step flow ─────────────────────────────────────────
 
 SS_STEP1_DONE = "cs_step1_confirmed"  # bool — unlocks Step 2
-SS_BOOK = "cs_book_data"  # BookMetadata.model_dump()
-SS_ANALYSIS = "cs_analysis_data"  # BookVibeAnalysis.model_dump()
+SS_BOOK = "cs_book_data"  # BookMetadata.model_dump() from quick lookup
 SS_LOOKUP_TITLE = "cs_lookup_title"
 SS_LOOKUP_AUTHOR = "cs_lookup_author"
-SS_HAS_CHAPTERS = "cs_has_real_chapters"
+SS_HAS_CHAPTERS = "cs_has_real_chapters"  # cheap chapter-list hint
 SS_READING_HOURS = "cs_reading_hours"  # float, user-editable estimate
 SS_RESULT = "cs_last_result"  # last generation snapshot for display
 
@@ -201,37 +199,22 @@ def recommend_playlist_hours(reading_hours: float) -> float:
     return round(min(3.0, max(0.5, rh * 0.4)), 1)
 
 
-def has_real_chapter_data(book: BookMetadata) -> bool:
-    """True only when public chapter/synopsis structure exists (not synthetic)."""
-    if not book.chapters:
-        return False
-    if (book.raw or {}).get("synthetic_chapters"):
-        return False
-    # Require more than a trivial stub list
-    return len(book.chapters) >= 3
+def has_chapter_data_hint(book: BookMetadata) -> bool:
+    """
+    Cheap Step 1 signal for enabling Chapter mode later.
 
-
-def short_vibe_summary(analysis: BookVibeAnalysis) -> str:
-    """High-level vibe blurb for Step 1 (not the full deep dump)."""
-    parts: list[str] = []
-    if analysis.overall_mood:
-        parts.append(analysis.overall_mood)
-    if analysis.atmospheres:
-        parts.append(", ".join(analysis.atmospheres[:4]))
-    if analysis.tone:
-        parts.append(analysis.tone)
-    if analysis.distinctive_signature:
-        parts.append(analysis.distinctive_signature[:160])
-    elif analysis.emotional_arc:
-        parts.append(analysis.emotional_arc[:140])
-    return " · ".join(p for p in parts if p) or "Vibe profile ready."
+    Uses either a real chapter list (if present) or the quick Wikipedia
+    section-index hint from ``lookup_book_quick`` — never requires full plot download.
+    """
+    if book.chapters and len(book.chapters) >= 3 and not (book.raw or {}).get("synthetic_chapters"):
+        return True
+    return bool((book.raw or {}).get("quick_chapter_hint"))
 
 
 def _reset_step1_state() -> None:
     for k in (
         SS_STEP1_DONE,
         SS_BOOK,
-        SS_ANALYSIS,
         SS_HAS_CHAPTERS,
         SS_READING_HOURS,
         SS_RESULT,
@@ -324,35 +307,18 @@ def _render_sidebar(settings) -> None:
         st.caption("CLI remains single-step.")
 
 
-def _run_step1_lookup(title: str, author: str | None) -> tuple[BookMetadata, BookVibeAnalysis]:
-    """
-    Reuse backend: public book fetch + Grok vibe analysis (no Spotify).
-
-    want_chapters=False so we only get *real* chapter lists (no synthetic padding).
-    """
-    book = fetch_book(
-        title,
-        author=author,
-        use_cache=True,
-        want_chapters=False,
-    )
-    analysis = analyze_book_vibe(
-        book,
-        mode=Mode.OVERALL,
-        lyrics=LyricsPreference.ALLOW_LYRICS,
-        use_cache=True,
-    )
-    return book, analysis
-
-
 def _render_step1(settings) -> None:
     confirmed = bool(st.session_state.get(SS_STEP1_DONE))
     badge = "done" if confirmed else "active"
     st.markdown(
         f'<div class="step-card">'
-        f'<div class="step-badge {badge}">Step 1 · Book lookup & confirmation</div>'
+        f'<div class="step-badge {badge}">Step 1 · Quick book lookup</div>'
         f"<h3 style='margin:0 0 0.75rem 0;font-size:1.2rem;'>Find your book</h3>",
         unsafe_allow_html=True,
+    )
+    st.caption(
+        "Fast identity check only (catalogue metadata). "
+        "Full literary vibe analysis runs later when you generate the playlist."
     )
 
     # Widget state via keys only (avoid value= + key= conflicts)
@@ -375,11 +341,11 @@ def _render_step1(settings) -> None:
 
     c1, c2 = st.columns(2)
     with c1:
-        analyze_clicked = st.button(
-            "Analyze Book",
+        lookup_clicked = st.button(
+            "Look up book",
             type="primary",
             use_container_width=True,
-            key="btn_analyze_book",
+            key="btn_lookup_book",
         )
     with c2:
         if confirmed or st.session_state.get(SS_BOOK):
@@ -393,61 +359,53 @@ def _render_step1(settings) -> None:
                 st.session_state[SS_LOOKUP_AUTHOR] = author
                 st.rerun()
 
-    if analyze_clicked:
+    if lookup_clicked:
         if not (title or "").strip():
             st.error("Please enter a book title.")
         else:
-            missing = settings.missing_required(need_spotify=False, need_xai=True)
-            if missing:
-                st.error(
-                    "Missing configuration: "
-                    + ", ".join(missing)
-                    + ". Add them to Streamlit Secrets or `.env`."
+            # Step 1 needs no xAI key — only public catalogue APIs
+            st.session_state[SS_STEP1_DONE] = False
+            st.session_state.pop(SS_RESULT, None)
+            status = st.status("Looking up book…", expanded=True)
+            try:
+                status.write("▸ Open Library + Google Books (identity)…")
+                book = lookup_book_quick(
+                    title.strip(),
+                    author=author.strip() or None,
+                    use_cache=True,
                 )
-            else:
-                # New lookup invalidates prior confirmation
-                st.session_state[SS_STEP1_DONE] = False
-                st.session_state.pop(SS_RESULT, None)
-                status = st.status("Looking up book…", expanded=True)
-                try:
-                    status.write("▸ Fetching public metadata & plot…")
-                    book, analysis = _run_step1_lookup(
-                        title.strip(),
-                        author.strip() or None,
-                    )
-                    status.write(f"▸ Found: {book.display_name}")
-                    status.write("▸ Building high-level vibe summary…")
-                    status.update(label="Book ready for confirmation", state="complete")
+                status.write(f"▸ Found: {book.display_name}")
+                if book.page_count:
+                    status.write(f"▸ Pages: {book.page_count}")
+                status.update(label="Book ready for confirmation", state="complete")
 
-                    st.session_state[SS_BOOK] = book.model_dump(mode="json")
-                    st.session_state[SS_ANALYSIS] = analysis.model_dump(mode="json")
-                    st.session_state[SS_LOOKUP_TITLE] = title.strip()
-                    st.session_state[SS_LOOKUP_AUTHOR] = (author or "").strip()
-                    st.session_state[SS_HAS_CHAPTERS] = has_real_chapter_data(book)
-                    rh = estimate_reading_hours(book.page_count)
-                    st.session_state[SS_READING_HOURS] = rh
-                    st.session_state["step1_reading_hours"] = rh
-                    st.rerun()
-                except ChapterScoreError as exc:
-                    status.update(label="Lookup failed", state="error")
-                    st.error(_friendly_error(exc))
-                except Exception as exc:
-                    status.update(label="Lookup failed", state="error")
-                    st.error(_friendly_error(exc))
-                    with st.expander("Technical details"):
-                        st.exception(exc)
+                st.session_state[SS_BOOK] = book.model_dump(mode="json")
+                st.session_state[SS_LOOKUP_TITLE] = title.strip()
+                st.session_state[SS_LOOKUP_AUTHOR] = (author or "").strip()
+                st.session_state[SS_HAS_CHAPTERS] = has_chapter_data_hint(book)
+                rh = estimate_reading_hours(book.page_count)
+                st.session_state[SS_READING_HOURS] = rh
+                st.session_state["step1_reading_hours"] = rh
+                st.rerun()
+            except ChapterScoreError as exc:
+                status.update(label="Lookup failed", state="error")
+                st.error(_friendly_error(exc))
+            except Exception as exc:
+                status.update(label="Lookup failed", state="error")
+                st.error(_friendly_error(exc))
+                with st.expander("Technical details"):
+                    st.exception(exc)
 
     # ── Confirmation panel (after successful lookup) ─────────────────────
-    if st.session_state.get(SS_BOOK) and st.session_state.get(SS_ANALYSIS):
+    if st.session_state.get(SS_BOOK):
         book = BookMetadata.model_validate(st.session_state[SS_BOOK])
-        analysis = BookVibeAnalysis.model_validate(st.session_state[SS_ANALYSIS])
         has_ch = bool(st.session_state.get(SS_HAS_CHAPTERS))
 
         st.markdown(
             '<div class="confirm-box">',
             unsafe_allow_html=True,
         )
-        st.markdown("##### Confirmed match")
+        st.markdown("##### Is this the right book?")
         st.markdown(f"**{book.title}**")
         st.caption(
             f"by {book.author_str}"
@@ -456,26 +414,27 @@ def _render_step1(settings) -> None:
             + f" · sources: {book.source or '—'}"
         )
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Chapter synopsis data", "Yes" if has_ch else "No")
-        m2.metric(
-            "Chapters found",
-            str(len(book.chapters)) if has_ch else "—",
-        )
-        m3.metric("Pages", str(book.page_count) if book.page_count else "—")
+        # Short catalogue blurb only (not Grok analysis)
+        blurb = (book.publisher_blurb or book.description or "").strip()
+        if blurb:
+            st.write(blurb[:400] + ("…" if len(blurb) > 400 else ""))
+
+        m1, m2 = st.columns(2)
+        m1.metric("Pages", str(book.page_count) if book.page_count else "Unknown")
+        m2.metric("Chapter list available", "Likely" if has_ch else "No / unknown")
 
         if has_ch:
             st.caption(
-                f"Public chapter headings available ({len(book.chapters)}). "
-                "Chapter mode can use section progression."
+                "A public chapter/contents section was detected. "
+                "Chapter mode will be available in Step 2."
             )
         else:
             st.caption(
-                "No usable chapter-by-chapter synopsis was found in public sources. "
-                "Chapter mode will be disabled — use Overall mode for a cohesive mix."
+                "No public chapter-list signal found (quick check). "
+                "Chapter mode will be disabled — use Overall mode."
             )
 
-        # Editable reading-time estimate (session key drives the widget default once)
+        # Editable reading-time estimate
         if "step1_reading_hours" not in st.session_state:
             st.session_state["step1_reading_hours"] = float(
                 st.session_state.get(SS_READING_HOURS)
@@ -487,7 +446,7 @@ def _render_step1(settings) -> None:
             max_value=48.0,
             step=0.5,
             help=(
-                "Default estimate from page count (~35 pages/hour). "
+                "Default from page count (~35 pages/hour). "
                 "Edit freely — used only to recommend playlist length, not to force duration."
             ),
             key="step1_reading_hours",
@@ -495,21 +454,9 @@ def _render_step1(settings) -> None:
         st.session_state[SS_READING_HOURS] = float(reading_hours)
         rec = recommend_playlist_hours(float(reading_hours))
         st.caption(
-            f"Suggested playlist length from this estimate: **~{rec:g} hours** "
-            f"(soft target — you can change it in Step 2)."
+            f"Suggested playlist length: **~{rec:g} hours** "
+            f"(soft target — adjustable in Step 2)."
         )
-
-        st.markdown("##### High-level vibe")
-        st.info(short_vibe_summary(analysis))
-        if analysis.overall_energy is not None:
-            st.caption(
-                f"Energy {analysis.overall_energy:.2f}"
-                + (
-                    f" · intimacy {analysis.intimacy_vs_epic:.2f}"
-                    if analysis.intimacy_vs_epic is not None
-                    else ""
-                )
-            )
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -524,7 +471,9 @@ def _render_step1(settings) -> None:
                 st.session_state[SS_READING_HOURS] = float(reading_hours)
                 st.rerun()
         else:
-            st.success("Book confirmed. Step 2 is unlocked below.")
+            st.success(
+                "Book confirmed. Step 2 is unlocked — full vibe analysis runs when you generate."
+            )
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -603,6 +552,10 @@ def _render_step2(settings) -> None:
         f"Book: **{book.display_name}** · "
         f"reading estimate **{reading_h:g} h** · "
         f"recommended playlist **~{rec_hours:g} h** (soft)"
+    )
+    st.caption(
+        "Generating runs the full literary vibe analysis + Spotify search "
+        "(deferred from Step 1 so lookup stays fast)."
     )
 
     # 1. Mode

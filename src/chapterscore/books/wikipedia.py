@@ -87,6 +87,48 @@ def search_wikipedia_page(client: httpx.Client, book_title: str, author: str | N
     return None
 
 
+def quick_chapter_list_available(
+    book_title: str,
+    author: str | None = None,
+    *,
+    client: httpx.Client | None = None,
+) -> bool:
+    """
+    Cheap check: does the Wikipedia article have a Chapters/Contents section?
+
+    Only fetches the section *index* (not section bodies or full HTML).
+    Suitable for UI Step 1 — not a substitute for real chapter extraction.
+    """
+    own_client = client is None
+    client = client or create_client()
+    try:
+        page = search_wikipedia_page(client, book_title, author)
+        if not page:
+            return False
+        data = get_json(
+            client,
+            API_URL,
+            params={
+                "action": "parse",
+                "page": page,
+                "prop": "sections",
+                "format": "json",
+            },
+        )
+        sections = ((data.get("parse") or {}).get("sections") or []) if isinstance(data, dict) else []
+        for sec in sections:
+            line = (sec.get("line") or "").lower()
+            # "Chapters" / "Contents" / "Chapter list" — not plain "Plot"
+            if re.search(r"\b(chapters?|contents|chapter\s+list|structure)\b", line):
+                return True
+        return False
+    except Exception:
+        return False
+    finally:
+        if own_client:
+            client.close()
+
+
 def fetch_wikipedia_plot(
     book_title: str,
     author: str | None = None,
