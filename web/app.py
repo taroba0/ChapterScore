@@ -317,6 +317,14 @@ def main() -> None:
                 "Dry run (analyze only — no Spotify playlist)",
                 value=False,
             )
+            review_first = st.checkbox(
+                "Review analysis first (optional)",
+                value=False,
+                help=(
+                    "Show the book vibe summary before creating a playlist. "
+                    "Default remains one-step generation."
+                ),
+            )
 
         st.markdown("##### Personalization")
         st.caption(
@@ -369,14 +377,76 @@ def main() -> None:
 
         submitted = st.form_submit_button("Generate Playlist", type="primary")
 
-    if not submitted:
-        return
+    # ── Optional continue from prior review-first analysis ─────────────────
+    pending = st.session_state.get("cs_pending_generate")
+    if pending and not submitted:
+        st.info("Vibe analysis ready — review below, then continue if it looks right.")
+        prev = pending.get("analysis_summary") or {}
+        st.markdown("##### Book & vibe (review)")
+        st.write(f"**{prev.get('title', '—')}**")
+        st.caption(
+            f"Mood: {prev.get('mood', '—')} · Energy: {prev.get('energy', '—')} · "
+            f"Signature: {prev.get('signature', '—')}"
+        )
+        if prev.get("description"):
+            st.write(prev["description"])
+        st.caption(
+            "Length targets are soft (quality over padding). "
+            "Overall mode is shuffle-friendly; chapter mode is progression-aware, not time-synced."
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Continue & create playlist", type="primary"):
+                st.session_state["cs_force_generate"] = True
+                st.rerun()
+        with c2:
+            if st.button("Discard review"):
+                st.session_state.pop("cs_pending_generate", None)
+                st.session_state.pop("cs_force_generate", None)
+                st.rerun()
+        if not st.session_state.get("cs_force_generate"):
+            return
 
-    if not (title or "").strip():
-        st.error("Please enter a book title.")
+    force_generate = bool(st.session_state.pop("cs_force_generate", False))
+    if force_generate and pending:
+        title = pending["title"]
+        gen_base = pending["gen_base"]
+        mode_label = pending.get("mode_label", "overall")
+        dry_run = False
+        review_first = False
+        run_from_pending = True
+    elif not submitted:
         return
+    else:
+        run_from_pending = False
+        if not (title or "").strip():
+            st.error("Please enter a book title.")
+            return
+        taste_map = {
+            "disable": TasteStrength.DISABLE,
+            "top5": TasteStrength.TOP_5,
+            "top10": TasteStrength.TOP_10,
+            "top15": TasteStrength.TOP_15,
+        }
+        prefs = PersonalizationPrefs(
+            taste_strength=taste_map[taste_label],
+            use_recommendations=bool(use_recs),
+            exploration=int(exploration),
+        )
+        gen_base = dict(
+            author=author.strip() or None,
+            mode=_map_mode(mode_label),
+            lyrics=_map_lyrics(lyrics_label),
+            min_hours=float(min_hours) if min_hours and min_hours > 0 else 0.0,
+            public=False,
+            use_cache=True,
+            personalization=prefs,
+        )
 
-    need_spotify = not dry_run
+    # First pass of review-first = analysis only; dry_run always analysis only
+    run_dry = bool(dry_run) or (bool(review_first) and not run_from_pending)
+    need_spotify = not run_dry
+
     missing_now = settings.missing_required(need_spotify=need_spotify, need_xai=True)
     if missing_now:
         st.error(
@@ -389,7 +459,7 @@ def main() -> None:
     if need_spotify and not session_is_authenticated(st.session_state):
         st.error(
             "Please **Login with Spotify** first (sidebar or button above) "
-            "to create a real playlist. Or enable **Dry run** for analysis only."
+            "to create a real playlist. Or enable **Dry run** / **Review analysis first**."
         )
         return
 
@@ -408,33 +478,17 @@ def main() -> None:
             st.error(_friendly_error(exc))
             return
 
-    taste_map = {
-        "disable": TasteStrength.DISABLE,
-        "top5": TasteStrength.TOP_5,
-        "top10": TasteStrength.TOP_10,
-        "top15": TasteStrength.TOP_15,
-    }
-    prefs = PersonalizationPrefs(
-        taste_strength=taste_map[taste_label],
-        use_recommendations=bool(use_recs),
-        exploration=int(exploration),
-    )
-
     try:
-        # spotify_client: session OAuth client from browser login (None for dry-run)
         gen_kwargs = dict(
-            author=author.strip() or None,
-            mode=_map_mode(mode_label),
-            lyrics=_map_lyrics(lyrics_label),
-            min_hours=float(min_hours) if min_hours and min_hours > 0 else 0.0,
-            public=False,
-            dry_run=dry_run,
-            use_cache=True,
+            **gen_base,
+            dry_run=run_dry,
             progress=progress,
             spotify_client=sp,
-            personalization=prefs,
         )
-        result = generate_playlist(title.strip(), **gen_kwargs)
+        result = generate_playlist(
+            (title if isinstance(title, str) else str(title)).strip(),
+            **gen_kwargs,
+        )
         status_box.update(label="Done", state="complete")
     except TypeError as exc:
         # Helps diagnose stale deploys that still run an old pipeline.py
@@ -464,10 +518,30 @@ def main() -> None:
         return
 
     # ── Results ──────────────────────────────────────────────────────────────
-    st.success("Generation complete" + (" (dry run)" if dry_run else ""))
-
     book = result.book
     analysis = result.analysis
+
+    # Review-first first pass: stash params and invite continue
+    if run_dry and review_first and not dry_run:
+        st.session_state["cs_pending_generate"] = {
+            "title": book.title,
+            "gen_base": gen_base,
+            "mode_label": mode_label,
+            "analysis_summary": {
+                "title": book.display_name,
+                "mood": analysis.overall_mood,
+                "energy": f"{analysis.overall_energy:.2f}",
+                "signature": (analysis.distinctive_signature or "")[:200],
+                "description": analysis.playlist_description or "",
+            },
+        }
+        st.success("Analysis ready — review the vibe, then continue when you like it.")
+    elif run_dry:
+        st.success("Generation complete (dry run)")
+        st.session_state.pop("cs_pending_generate", None)
+    else:
+        st.success("Generation complete")
+        st.session_state.pop("cs_pending_generate", None)
 
     st.markdown("##### Book & vibe")
     m1, m2, m3 = st.columns(3)
@@ -523,14 +597,24 @@ def main() -> None:
         + f" · sources: {book.source or '—'}"
     )
 
-    if dry_run:
+    if run_dry:
         st.markdown("##### Would create")
         st.write(
             f"**{analysis.playlist_title_suggestion or f'ChapterScore: {book.title}'}**"
         )
         if analysis.playlist_description:
             st.write(analysis.playlist_description)
-        st.caption("Uncheck **Dry run** and generate again to create a real playlist.")
+        if review_first and not dry_run:
+            st.caption(
+                "Optional review step complete. Click **Continue & create playlist** above "
+                "(re-run if the panel is collapsed) — or generate again with Review off."
+            )
+            # Immediate continue button on same page after analysis
+            if st.button("Continue & create playlist now", type="primary", key="cs_continue_now"):
+                st.session_state["cs_force_generate"] = True
+                st.rerun()
+        else:
+            st.caption("Uncheck **Dry run** and generate again to create a real playlist.")
         return
 
     if result.playlist:

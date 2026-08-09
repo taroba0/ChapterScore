@@ -201,6 +201,14 @@ def generate_cmd(
         "--dry-run",
         help="Fetch book + analyze vibe only; do not touch Spotify.",
     ),
+    review_first: bool = typer.Option(
+        False,
+        "--review-first",
+        help=(
+            "Optional: analyze the book vibe first, show the summary, then confirm "
+            "before searching Spotify (one-step remains the default)."
+        ),
+    ),
     no_cache: bool = typer.Option(False, "--no-cache", help="Bypass book/analysis cache."),
     taste: TasteOpt = typer.Option(
         TasteOpt.top10,
@@ -263,10 +271,19 @@ def generate_cmd(
         + (f"  [dim]by {author}[/dim]" if author else "")
         + (f"  [dim]ISBN {isbn}[/dim]" if isbn else "")
     )
+    # Optional review-first: analyze once, confirm, then full generate (still soft length)
+    effective_dry = dry_run
+    if review_first and not dry_run:
+        console.print(
+            "[dim]Review-first: will show vibe analysis before Spotify search.[/dim]"
+        )
+        effective_dry = True  # first pass is analysis-only
+
     console.print(
         f"[bold]Mode:[/bold] {mode.value}   "
         f"[bold]Lyrics:[/bold] {lyrics_pref.display_label}"
         + ("   [yellow]DRY RUN[/yellow]" if dry_run else "")
+        + ("   [yellow]REVIEW FIRST[/yellow]" if review_first and not dry_run else "")
     )
     console.print(
         f"[bold]Taste:[/bold] {prefs.taste_strength.value}   "
@@ -278,7 +295,7 @@ def generate_cmd(
     def progress(msg: str) -> None:
         console.print(f"  [cyan]▸[/cyan] {msg}")
 
-    try:
+    def _run_generate(*, dry: bool):
         with Progress(
             SpinnerColumn(style="magenta"),
             TextColumn("[progress.description]{task.description}"),
@@ -291,7 +308,7 @@ def generate_cmd(
                 spinner.update(task, description=msg[:80])
                 progress(msg)
 
-            result = generate_playlist(
+            return generate_playlist(
                 title,
                 author=author,
                 isbn=isbn,
@@ -303,11 +320,14 @@ def generate_cmd(
                 min_hours=min_hours,
                 public=public,
                 playlist_name=name,
-                dry_run=dry_run,
+                dry_run=dry,
                 use_cache=not no_cache,
                 progress=progress_spin,
                 personalization=prefs,
             )
+
+    try:
+        result = _run_generate(dry=effective_dry)
     except ChapterScoreError as exc:
         _print_error(exc)
         raise typer.Exit(1) from exc
@@ -410,7 +430,8 @@ def generate_cmd(
             )
         console.print(ch_table)
 
-    if dry_run:
+    # Shared: show sample queries on dry-run / review-first analysis pass
+    if dry_run or (review_first and not result.tracks):
         q_table = Table(
             title="Spotify search queries", box=box.SIMPLE_HEAD, header_style="bold"
         )
@@ -428,6 +449,8 @@ def generate_cmd(
                 (sq.reason or "")[:50],
             )
         console.print(q_table)
+
+    if dry_run:
         console.print(
             Panel(
                 f"[green]Dry run complete.[/green] Playlist title would be:\n"
@@ -438,6 +461,33 @@ def generate_cmd(
             )
         )
         return
+
+    # Optional review-first: confirm before Spotify search (not a forced two-step)
+    if review_first and not result.tracks:
+        console.print(
+            Panel(
+                f"[bold]{analysis.playlist_title_suggestion}[/bold]\n\n"
+                f"{analysis.playlist_description}\n\n"
+                "[dim]Length targets are soft — quality match is preferred over "
+                "padding to a fixed duration. No book-time sync.[/dim]",
+                title="Review analysis",
+                border_style="yellow",
+                box=box.ROUNDED,
+            )
+        )
+        if not typer.confirm("Continue and create the Spotify playlist?", default=True):
+            console.print("[yellow]Stopped after analysis review.[/yellow]")
+            raise typer.Exit(0)
+        try:
+            result = _run_generate(dry=False)
+        except ChapterScoreError as exc:
+            _print_error(exc)
+            raise typer.Exit(1) from exc
+        except KeyboardInterrupt:
+            err_console.print("\n[yellow]Cancelled.[/yellow]")
+            raise typer.Exit(130) from None
+        book = result.book
+        analysis = result.analysis
 
     if result.tracks:
         t_table = Table(

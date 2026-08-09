@@ -1,15 +1,23 @@
 """
 End-to-end track selection with progressive fallback.
 
+Design principles:
+  - Hard reject podcasts / speech / commentary / non-music (all modes)
+  - Hard lyrics / instrumental constraint when selected
+  - Soft length targets (quality over padding to hours/count)
+  - Overall mode: cohesive, shuffle-friendly emotional world
+  - Chapter mode: section progression, not minute-by-minute reading sync
+  - No duplicate recordings
+
 Fallback stages (overall mode):
   1. Expanded vibe queries + STRICT instrumental filter
   2. Same candidate pool + MODERATE filter
   3. Broadened queries + RELAXED filter
   4. Cinematic/soundtrack fallback bank + RELAXED filter
-  5. Same bank + PERMISSIVE filter (almost never empty)
+  5. Same bank + PERMISSIVE filter (quality floor still applies)
 
-Chapter mode runs a lighter version of the same ladder per chapter,
-then a global fill pass if the playlist is still thin.
+Chapter mode runs a lighter ladder per chapter, then a soft global fill
+only when still thin.
 """
 
 from __future__ import annotations
@@ -49,7 +57,9 @@ from chapterscore.spotify.ranking import (
     InstrumentalStrictness,
     apply_overall_cohesion,
     dedupe_tracks,
+    filter_music_only,
     is_likely_instrumental,
+    passes_content_filter,
     passes_lyrics_filter,
     passes_popularity_filter,
     score_track,
@@ -115,6 +125,9 @@ def _rank_raw(
             vibe_note=vibe_note,
         )
         track.is_instrumental = is_likely_instrumental(track)
+        # Priority 0: hard content filter (no podcasts / speech / commentary)
+        if not passes_content_filter(track):
+            continue
         # Priority 1: hard lyrics / instrumental constraint
         if not passes_lyrics_filter(track, lyrics, strictness=strictness):
             continue
@@ -122,7 +135,7 @@ def _rank_raw(
             track, min_pop, strict=strict_pop
         ):
             continue
-        # Priority 4: soft taste (0 when instrumental-only disables tops)
+        # Priority 4: soft taste (never overrides content / lyrics / book vibe)
         affinity = taste.affinity_for_artists(track.artists) if taste else 0.0
         track.score = score_track(
             track,
@@ -341,11 +354,13 @@ def _pick_quality(
     if cohesive and book_energy is not None:
         candidates = apply_overall_cohesion(candidates, book_energy=book_energy)
 
+    # Never select speech/podcast/non-music even if scored
+    candidates = filter_music_only(candidates)
     floor = _quality_floor(lyrics)
     chosen = select_diverse(
         candidates, target, max_per_artist=max_per_artist, min_score=floor
     )
-    # Only lower the floor if the playlist is still very thin
+    # Only lower the floor if the playlist is still very thin (still no weak padding)
     if len(chosen) < max(5, int(target * 0.35)):
         chosen = select_diverse(
             candidates,
@@ -353,7 +368,7 @@ def _pick_quality(
             max_per_artist=max_per_artist,
             min_score=floor * 0.55,
         )
-    return dedupe_tracks(chosen)
+    return filter_music_only(dedupe_tracks(chosen))
 
 
 def _max_per_artist(exploration: int) -> int:
@@ -452,7 +467,8 @@ def select_tracks_for_analysis(
                 f"elapsed={time.monotonic() - ended.started_at:.0f}s"
             )
 
-    return dedupe_tracks(result)
+    # Final safety: de-dupe + strip any speech/non-music that slipped through
+    return filter_music_only(dedupe_tracks(result))
 
 
 def _select_overall(
@@ -857,6 +873,9 @@ def _select_chapter(
             seen_ids.add(t.id)
             final.append(t)
 
-    final = dedupe_tracks(final)
-    progress(f"Chapter mode assembled {len(final)} tracks (soft aim ~{target})")
+    final = filter_music_only(dedupe_tracks(final))
+    progress(
+        f"Chapter mode assembled {len(final)} tracks "
+        f"(soft aim ~{target}; progression by section, not minute-sync)"
+    )
     return final

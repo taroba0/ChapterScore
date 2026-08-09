@@ -263,7 +263,19 @@ Instead of one generic “music supervisor” pass, ChapterScore runs **two Grok
 - Query expansion uses voice, setting, suitable styles, intimacy band, and act-level cues  
 - Ranking prioritizes **book vibe fit** over generic cinematic prestige  
 - Intimate books penalize epic trailer / battle scores; epic books may use them  
+- **Hard content filter** rejects podcasts, interviews, commentary, audiobook clips, and high-speechiness audio (all modes)  
 - Instrumental-only remains a hard track-level filter when selected  
+- Length (hours / track count) is a **soft target** — quality over padding  
+- Overall mode stays shuffle-friendly; chapter mode is progression-aware, not time-synced  
+
+### Optional: review analysis first
+
+```bash
+# CLI — analyze, confirm, then create playlist
+chapterscore generate "Dune" -a "Frank Herbert" --review-first
+```
+
+Web UI: check **Review analysis first (optional)** — not required for normal one-step generation.
 
 ### Stage 4 — Playlist
 

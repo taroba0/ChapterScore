@@ -149,13 +149,13 @@ def create_playlist_from_tracks(
             hint="Try a different lyrics mode or overall mode for broader search results.",
         )
 
-    # Strict de-dupe before write (id + same-recording variants)
-    from chapterscore.spotify.ranking import dedupe_tracks
+    # Strict de-dupe + music-only safety net before write
+    from chapterscore.spotify.ranking import dedupe_tracks, filter_music_only
 
-    tracks = dedupe_tracks(tracks)
+    tracks = filter_music_only(dedupe_tracks(tracks))
     if not tracks:
         raise SpotifyAPIError(
-            "No unique tracks left after de-duplication.",
+            "No unique music tracks left after filtering.",
             hint="Try a different lyrics mode or overall mode for broader search results.",
         )
 

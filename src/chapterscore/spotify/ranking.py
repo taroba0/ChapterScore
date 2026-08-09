@@ -72,6 +72,44 @@ _UNDESIRABLE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
+# Hard reject: podcasts, commentary, interviews, pure speech, audiobook clips
+# Applies in ALL lyrics modes — prefer false negatives (reject music-adjacent talk).
+_SPEECH_NON_MUSIC = re.compile(
+    r"\b("
+    r"podcast|pod\s*cast|"
+    r"interview|interviews|"
+    r"commentary|comment\s*track|audio\s*comment|"
+    r"spoken[\s-]?word|spoken[\s-]?word\s*poetry|"
+    r"audiobook|audio[\s-]?book|book\s*on\s*tape|"
+    r"narrat(?:ed|ion|or)|as\s*read\s*by|read\s*by\b|"
+    r"monologue|soliloquy|"
+    r"lecture|sermon|speech\b|keynote|"
+    r"talk\s*show|radio\s*show|radio\s*play|radio\s*drama|"
+    r"full\s*episode|episode\s*#?\s*\d+|ep\.?\s*#?\s*\d+|"
+    r"q\s*&\s*a|q\s*and\s*a|\bama\b|"
+    r"book\s*club|author\s*talk|panel\s*discussion|"
+    r"director'?s?\s*commentary|cast\s*commentary|"
+    r"behind\s*the\s*scenes\s*interview|"
+    r"true\s*crime\s*(podcast|episode)|"
+    r"stand[\s-]?up\s*comedy|"  # pure talk performances
+    r"guided\s*meditation\s*(talk|script)|"
+    r"affirmations?\b|"
+    r"sleep\s*story|bedtime\s*story\b|"
+    r"teaser\s*trailer\s*(voice|narration)|"
+    r"voice[\s-]?over\s*only|vo\s*only"
+    r")\b",
+    re.IGNORECASE,
+)
+# Album / show titles that almost always mean non-music catalogue
+_SPEECH_ALBUM_SHOW = re.compile(
+    r"\b("
+    r"podcast|the\s+interview|spoken\s+word|audiobook|"
+    r"full\s+cast\s+audio|bbc\s+radio\s+drama|"
+    r"original\s+radio\s+broadcast"
+    r")\b",
+    re.IGNORECASE,
+)
 _LOW_QUALITY = re.compile(
     r"\b("
     r"epic\s+version|epic\s+cover|piano\s+cover|violin\s+cover|"
@@ -257,6 +295,74 @@ def is_undesirable(track: RankedTrack) -> bool:
     return False
 
 
+def is_speech_or_non_music(track: RankedTrack) -> bool:
+    """
+    HARD content filter: True if the item is primarily speech / non-music.
+
+    Rejects podcasts, interviews, commentary, audiobook-style narration,
+    monologues, and high-speechiness audio. Prefer rejecting ambiguous talk
+    over letting speech into the playlist. Applies in every lyrics mode.
+    """
+    name = track.name or ""
+    album = track.album or ""
+    artists = _artist_blob(track)
+    blob = f"{name} {album} {artists}"
+    mq = (track.matched_query or "").lower()
+
+    # Lexical cues on title / album / artist
+    if _SPEECH_NON_MUSIC.search(blob):
+        return True
+    if _SPEECH_ALBUM_SHOW.search(album) or _SPEECH_ALBUM_SHOW.search(name):
+        return True
+
+    # Podcast-ish artist names (e.g. "Something Podcast")
+    if re.search(r"\bpodcasts?\b", artists, re.I):
+        return True
+
+    # Search provenance was explicitly non-music (rare but defensive)
+    if any(
+        k in mq
+        for k in (
+            "podcast",
+            "interview",
+            "audiobook",
+            "spoken word",
+            "commentary episode",
+        )
+    ):
+        # Only reject if the track itself also lacks strong music cues
+        if not _INSTRUMENTAL_CUES.search(blob) and not _SCORE_ARTISTS.search(artists):
+            return True
+
+    speech = track.features.get("speechiness")
+    inst = track.features.get("instrumentalness")
+    # Spotify: >0.66 ≈ entirely spoken; 0.33–0.66 mixed speech/music
+    if speech is not None:
+        if speech >= 0.55:
+            return True  # primarily talking
+        if speech >= 0.40 and (inst is None or inst < 0.35):
+            return True
+        if speech >= 0.33 and (inst is not None and inst < 0.15):
+            # High speech + almost no instrumental content
+            if not _INSTRUMENTAL_CUES.search(blob) and not _SCORE_ARTISTS.search(artists):
+                return True
+
+    return False
+
+
+def passes_content_filter(track: RankedTrack) -> bool:
+    """
+    Universal hard gate: music-only catalogue quality.
+
+    Blocks speech/podcast/commentary AND low-quality junk. Always on.
+    """
+    if is_speech_or_non_music(track):
+        return False
+    if is_undesirable(track):
+        return False
+    return True
+
+
 def quality_penalty(track: RankedTrack, *, popularity_known: bool = True) -> float:
     """Return a multiplicative score factor for catalogue quality signals."""
     factor = 1.0
@@ -288,12 +394,15 @@ def passes_lyrics_filter(
     strictness: InstrumentalStrictness = InstrumentalStrictness.STRICT,
 ) -> bool:
     """
-    Priority-1 HARD filter for vocal policy.
+    Priority-1 HARD filters:
+      0. Content: no podcasts / speech / commentary (all modes)
+      1. Lyrics / instrumental policy
 
     INSTRUMENTAL_ONLY is intentionally harsh: prefer empty pool over vocals.
     Track-level evidence is required — search-query wording is never enough.
     """
-    if is_undesirable(track):
+    # Universal: never admit speech / podcast / non-music
+    if not passes_content_filter(track):
         return False
 
     mode = lyrics.normalized()
@@ -306,10 +415,14 @@ def passes_lyrics_filter(
     likely = is_likely_instrumental(track)
 
     if mode is LyricsPreference.ALLOW_LYRICS:
+        # Sung vocals OK; pure speech already blocked above
         return True
 
     if mode is LyricsPreference.PREFER_INSTRUMENTAL:
-        if "karaoke" in name.lower() or _UNDESIRABLE.search(blob):
+        if "karaoke" in name.lower():
+            return False
+        # Soft bias: still block very high speech even if features are partial
+        if speech is not None and speech > 0.45:
             return False
         return True
 
@@ -925,6 +1038,11 @@ def dedupe_tracks(tracks: list[RankedTrack]) -> list[RankedTrack]:
             seen_recordings.add(rec)
         out.append(t)
     return out
+
+
+def filter_music_only(tracks: list[RankedTrack]) -> list[RankedTrack]:
+    """Final safety net: drop any speech/podcast/junk that slipped through."""
+    return [t for t in tracks if passes_content_filter(t)]
 
 
 def select_diverse(
