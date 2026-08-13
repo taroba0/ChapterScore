@@ -26,7 +26,8 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 import streamlit as st
 
 from chapterscore import __version__
-from chapterscore.books.aggregator import lookup_book_quick
+from chapterscore.books.aggregator import search_book_candidates
+from chapterscore.books.wikipedia import quick_chapter_list_available
 from chapterscore.config import get_settings, reload_settings
 from chapterscore.exceptions import ChapterScoreError
 from chapterscore.models import (
@@ -53,7 +54,9 @@ from chapterscore.spotify.web_auth import (
 # ── Session keys for the 2-step flow ─────────────────────────────────────────
 
 SS_STEP1_DONE = "cs_step1_confirmed"  # bool — unlocks Step 2
-SS_BOOK = "cs_book_data"  # BookMetadata.model_dump() from quick lookup
+SS_BOOK = "cs_book_data"  # confirmed BookMetadata.model_dump()
+SS_CANDIDATES = "cs_candidates"  # list[BookMetadata dumps] from multi-search
+SS_CANDIDATE_IDX = "cs_candidate_idx"  # selected radio index
 SS_LOOKUP_TITLE = "cs_lookup_title"
 SS_LOOKUP_AUTHOR = "cs_lookup_author"
 SS_HAS_CHAPTERS = "cs_has_real_chapters"  # cheap chapter-list hint
@@ -215,12 +218,23 @@ def _reset_step1_state() -> None:
     for k in (
         SS_STEP1_DONE,
         SS_BOOK,
+        SS_CANDIDATES,
+        SS_CANDIDATE_IDX,
         SS_HAS_CHAPTERS,
         SS_READING_HOURS,
         SS_RESULT,
         "step1_reading_hours",
+        "step1_pick_radio",
     ):
         st.session_state.pop(k, None)
+
+
+def _candidate_label(book: BookMetadata, index: int) -> str:
+    year = f" ({book.publish_year})" if book.publish_year else ""
+    pages = f" · {book.page_count} pp" if book.page_count else ""
+    rh = estimate_reading_hours(book.page_count)
+    read = f" · ~{rh:g} h read" if book.page_count else ""
+    return f"{index + 1}. {book.title} — {book.author_str}{year}{pages}{read}"
 
 
 def _handle_oauth_redirect() -> None:
@@ -312,12 +326,12 @@ def _render_step1(settings) -> None:
     badge = "done" if confirmed else "active"
     st.markdown(
         f'<div class="step-card">'
-        f'<div class="step-badge {badge}">Step 1 · Quick book lookup</div>'
-        f"<h3 style='margin:0 0 0.75rem 0;font-size:1.2rem;'>Find your book</h3>",
+        f'<div class="step-badge {badge}">Step 1 · Find & confirm your book</div>'
+        f"<h3 style='margin:0 0 0.75rem 0;font-size:1.2rem;'>Search catalogues</h3>",
         unsafe_allow_html=True,
     )
     st.caption(
-        "Fast identity check only (catalogue metadata). "
+        "Multi-strategy search on Open Library + Google Books (fast identity only). "
         "Full literary vibe analysis runs later when you generate the playlist."
     )
 
@@ -329,26 +343,27 @@ def _render_step1(settings) -> None:
 
     title = st.text_input(
         "Book title",
-        placeholder="e.g. Dune",
-        help="Required. Full title works best for metadata matching.",
+        placeholder="e.g. I Who Have Never Known Men",
+        help="Required. Partial titles often work — we'll show top matches.",
         key="step1_title_input",
     )
     author = st.text_input(
         "Author (optional)",
-        placeholder="e.g. Frank Herbert",
+        placeholder="e.g. Jacqueline Harpman",
+        help="Adding the author improves ranking when the title is common.",
         key="step1_author_input",
     )
 
     c1, c2 = st.columns(2)
     with c1:
         lookup_clicked = st.button(
-            "Look up book",
+            "Search books",
             type="primary",
             use_container_width=True,
             key="btn_lookup_book",
         )
     with c2:
-        if confirmed or st.session_state.get(SS_BOOK):
+        if confirmed or st.session_state.get(SS_BOOK) or st.session_state.get(SS_CANDIDATES):
             if st.button(
                 "Start over / change book",
                 use_container_width=True,
@@ -363,49 +378,76 @@ def _render_step1(settings) -> None:
         if not (title or "").strip():
             st.error("Please enter a book title.")
         else:
-            # Step 1 needs no xAI key — only public catalogue APIs
             st.session_state[SS_STEP1_DONE] = False
             st.session_state.pop(SS_RESULT, None)
-            status = st.status("Looking up book…", expanded=True)
+            st.session_state.pop(SS_BOOK, None)
+            st.session_state.pop(SS_CANDIDATES, None)
+            st.session_state.pop("step1_pick_radio", None)
+            status = st.status("Searching catalogues…", expanded=True)
             try:
-                status.write("▸ Open Library + Google Books (identity)…")
-                book = lookup_book_quick(
+                status.write("▸ Open Library (exact / fuzzy / free-text)…")
+                status.write("▸ Google Books (intitle / quoted / free-text)…")
+                candidates = search_book_candidates(
                     title.strip(),
                     author=author.strip() or None,
+                    limit=8,
                     use_cache=True,
                 )
-                status.write(f"▸ Found: {book.display_name}")
-                if book.page_count:
-                    status.write(f"▸ Pages: {book.page_count}")
-                status.update(label="Book ready for confirmation", state="complete")
+                status.write(f"▸ Ranked {len(candidates)} candidate(s)")
+                status.update(label="Pick the correct book", state="complete")
 
-                st.session_state[SS_BOOK] = book.model_dump(mode="json")
+                st.session_state[SS_CANDIDATES] = [
+                    c.model_dump(mode="json") for c in candidates
+                ]
+                st.session_state[SS_CANDIDATE_IDX] = 0
                 st.session_state[SS_LOOKUP_TITLE] = title.strip()
                 st.session_state[SS_LOOKUP_AUTHOR] = (author or "").strip()
-                st.session_state[SS_HAS_CHAPTERS] = has_chapter_data_hint(book)
-                rh = estimate_reading_hours(book.page_count)
-                st.session_state[SS_READING_HOURS] = rh
-                st.session_state["step1_reading_hours"] = rh
                 st.rerun()
             except ChapterScoreError as exc:
-                status.update(label="Lookup failed", state="error")
+                status.update(label="No strong match", state="error")
                 st.error(_friendly_error(exc))
+                st.info(
+                    "**Tips:** try a shorter title fragment, check spelling, "
+                    "add the author name, or use an ISBN-13."
+                )
             except Exception as exc:
                 status.update(label="Lookup failed", state="error")
                 st.error(_friendly_error(exc))
                 with st.expander("Technical details"):
                     st.exception(exc)
 
-    # ── Confirmation panel (after successful lookup) ─────────────────────
-    if st.session_state.get(SS_BOOK):
-        book = BookMetadata.model_validate(st.session_state[SS_BOOK])
-        has_ch = bool(st.session_state.get(SS_HAS_CHAPTERS))
+    # ── Multi-candidate picker ───────────────────────────────────────────
+    raw_cands = st.session_state.get(SS_CANDIDATES) or []
+    if raw_cands and not confirmed:
+        candidates = [BookMetadata.model_validate(c) for c in raw_cands]
+        st.markdown("##### Select the correct match")
+        st.caption(
+            f"Showing top {len(candidates)} result(s) for "
+            f"**{st.session_state.get(SS_LOOKUP_TITLE, '')}**"
+            + (
+                f" · author filter: {st.session_state.get(SS_LOOKUP_AUTHOR)}"
+                if st.session_state.get(SS_LOOKUP_AUTHOR)
+                else ""
+            )
+            + ". Best guess is first."
+        )
+
+        labels = [_candidate_label(c, i) for i, c in enumerate(candidates)]
+        pick = st.radio(
+            "Candidates",
+            options=list(range(len(candidates))),
+            format_func=lambda i: labels[i],
+            index=int(st.session_state.get(SS_CANDIDATE_IDX) or 0),
+            key="step1_pick_radio",
+            label_visibility="collapsed",
+        )
+        st.session_state[SS_CANDIDATE_IDX] = int(pick)
+        book = candidates[int(pick)]
 
         st.markdown(
             '<div class="confirm-box">',
             unsafe_allow_html=True,
         )
-        st.markdown("##### Is this the right book?")
         st.markdown(f"**{book.title}**")
         st.caption(
             f"by {book.author_str}"
@@ -413,33 +455,20 @@ def _render_step1(settings) -> None:
             + (f" · {book.page_count} pages" if book.page_count else "")
             + f" · sources: {book.source or '—'}"
         )
-
-        # Short catalogue blurb only (not Grok analysis)
         blurb = (book.publisher_blurb or book.description or "").strip()
         if blurb:
-            st.write(blurb[:400] + ("…" if len(blurb) > 400 else ""))
+            st.write(blurb[:360] + ("…" if len(blurb) > 360 else ""))
 
-        m1, m2 = st.columns(2)
-        m1.metric("Pages", str(book.page_count) if book.page_count else "Unknown")
-        m2.metric("Chapter list available", "Likely" if has_ch else "No / unknown")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Year", str(book.publish_year) if book.publish_year else "—")
+        m2.metric("Pages", str(book.page_count) if book.page_count else "Unknown")
+        default_rh = estimate_reading_hours(book.page_count)
+        m3.metric("Est. reading", f"~{default_rh:g} h")
 
-        if has_ch:
-            st.caption(
-                "A public chapter/contents section was detected. "
-                "Chapter mode will be available in Step 2."
-            )
-        else:
-            st.caption(
-                "No public chapter-list signal found (quick check). "
-                "Chapter mode will be disabled — use Overall mode."
-            )
-
-        # Editable reading-time estimate
-        if "step1_reading_hours" not in st.session_state:
-            st.session_state["step1_reading_hours"] = float(
-                st.session_state.get(SS_READING_HOURS)
-                or estimate_reading_hours(book.page_count)
-            )
+        # Editable reading-time (keyed per selection so it refreshes when pick changes)
+        read_key = f"step1_reading_hours_{int(pick)}"
+        if read_key not in st.session_state:
+            st.session_state[read_key] = float(default_rh)
         reading_hours = st.number_input(
             "Estimated reading time (hours)",
             min_value=0.5,
@@ -447,33 +476,59 @@ def _render_step1(settings) -> None:
             step=0.5,
             help=(
                 "Default from page count (~35 pages/hour). "
-                "Edit freely — used only to recommend playlist length, not to force duration."
+                "Edit freely — used only to recommend playlist length."
             ),
-            key="step1_reading_hours",
+            key=read_key,
         )
-        st.session_state[SS_READING_HOURS] = float(reading_hours)
         rec = recommend_playlist_hours(float(reading_hours))
         st.caption(
             f"Suggested playlist length: **~{rec:g} hours** "
             f"(soft target — adjustable in Step 2)."
         )
-
         st.markdown("</div>", unsafe_allow_html=True)
 
-        if not confirmed:
-            if st.button(
-                "This is correct — Continue to personalization",
-                type="primary",
-                use_container_width=True,
-                key="btn_confirm_book",
-            ):
-                st.session_state[SS_STEP1_DONE] = True
-                st.session_state[SS_READING_HOURS] = float(reading_hours)
-                st.rerun()
-        else:
-            st.success(
-                "Book confirmed. Step 2 is unlocked — full vibe analysis runs when you generate."
-            )
+        if st.button(
+            "This is correct — Continue to personalization",
+            type="primary",
+            use_container_width=True,
+            key="btn_confirm_book",
+        ):
+            # Optional cheap chapter hint only for the confirmed pick
+            has_ch = has_chapter_data_hint(book)
+            if not has_ch:
+                try:
+                    has_ch = bool(
+                        quick_chapter_list_available(
+                            book.title,
+                            book.authors[0] if book.authors else None,
+                        )
+                    )
+                except Exception:
+                    has_ch = False
+            book.raw = {**(book.raw or {}), "quick_chapter_hint": has_ch}
+
+            st.session_state[SS_BOOK] = book.model_dump(mode="json")
+            st.session_state[SS_HAS_CHAPTERS] = has_ch
+            st.session_state[SS_READING_HOURS] = float(reading_hours)
+            st.session_state["step1_reading_hours"] = float(reading_hours)
+            st.session_state[SS_STEP1_DONE] = True
+            st.rerun()
+
+    # ── Confirmed summary (after Continue) ───────────────────────────────
+    if confirmed and st.session_state.get(SS_BOOK):
+        book = BookMetadata.model_validate(st.session_state[SS_BOOK])
+        has_ch = bool(st.session_state.get(SS_HAS_CHAPTERS))
+        rh = float(st.session_state.get(SS_READING_HOURS) or estimate_reading_hours(book.page_count))
+        st.success(
+            f"Confirmed: **{book.display_name}**"
+            + (f" · {book.publish_year}" if book.publish_year else "")
+            + (f" · {book.page_count} pages" if book.page_count else "")
+            + f" · ~{rh:g} h reading estimate"
+        )
+        st.caption(
+            ("Chapter mode available. " if has_ch else "Chapter mode disabled (no chapter-list signal). ")
+            + "Step 2 is unlocked — full vibe analysis runs when you generate."
+        )
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -762,12 +817,13 @@ def _render_step2(settings) -> None:
         status.write(f"▸ {msg}")
 
     try:
-        # Reuse full pipeline; book identity from Step 1 inputs
+        # Reuse full pipeline; identity from confirmed Stage 1 candidate
         result = generate_playlist(
             book.title,
             author=book.authors[0] if book.authors else (
                 st.session_state.get(SS_LOOKUP_AUTHOR) or None
             ),
+            isbn=book.isbn,
             mode=mode,
             lyrics=lyrics,
             tracks=int(tracks_overall) if tracks_overall else None,

@@ -101,7 +101,7 @@ Open the URL Streamlit prints (usually **http://localhost:8501**).
 
 | Step | What you do |
 |------|-------------|
-| **1 · Book** | Title (required), author (optional) → **Look up book** (fast catalogue ID only: Open Library + Google Books) → confirm match, pages, reading-time estimate → **Continue** |
+| **1 · Book** | Title (required), author (optional) → **Search books** (multi-strategy Open Library + Google Books, ranked candidates) → pick match, pages, reading-time estimate → **Continue** |
 | **2 · Personalize** | Mode (Chapter disabled if no chapter-list hint) · soft playlist length · lyrics · Top Artists / comfort / recommendations → **Generate** (full Grok vibe + Spotify) |
 
 Step 2 stays locked/greyed out until Step 1 is confirmed. CLI remains single-step.
