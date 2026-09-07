@@ -87,9 +87,11 @@ class PersonalizationPrefs(BaseModel):
 
     Priority (hard → soft):
       1. Lyrics / instrumental constraint
-      2. Book vibe & musical style fit
-      3. Exploration vs comfort
-      4. Personal Top Artists (never overrides 1–2)
+      2. No speech / duplicates / dead-note tracks
+      3. Book vibe & musical style fit
+      4. Catalogue quality (popularity floor)
+      5. Exploration vs comfort
+      6. Personal Top Artists (never overrides 1–4)
     """
 
     taste_strength: TasteStrength = TasteStrength.TOP_10
@@ -97,6 +99,7 @@ class PersonalizationPrefs(BaseModel):
     # 0 = max comfort (familiar artists), 100 = max exploration (new artists)
     # Default leans comfort (user wants familiarity); 0=comfort, 100=explore
     exploration: int = Field(default=25, ge=0, le=100)
+    # Spotify popularity floor (0–100). Tracks below this are rejected when pop is known.
     min_popularity: int = Field(default=30, ge=0, le=100)
 
     @property

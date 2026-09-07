@@ -288,15 +288,16 @@ def test_select_diverse_dedupes_ids():
 def test_dedupe_same_recording_different_ids():
     from chapterscore.spotify.ranking import dedupe_tracks
 
-    t1 = _track("id1", "Main Theme (Remastered 2018)", ["Hans Zimmer"], popularity=80)
-    t2 = _track("id2", "Main Theme", ["Hans Zimmer"], popularity=75)
-    t3 = _track("id3", "Main Theme", ["John Williams"], popularity=70)
+    t1 = _track("id1", "Cornfield Chase (Remastered 2018)", ["Hans Zimmer"], popularity=80)
+    t2 = _track("id2", "Cornfield Chase", ["Hans Zimmer"], popularity=75)
+    t3 = _track("id3", "Cornfield Chase - From Interstellar", ["City of Prague Philharmonic"], popularity=40)
     for t in (t1, t2, t3):
         t.score = 50.0
+    t1.score = 60.0  # best score wins
     out = dedupe_tracks([t1, t2, t3])
-    # Same primary artist + normalized title → one; different artist OK
-    assert len(out) == 2
-    assert {t.artists[0] for t in out} == {"Hans Zimmer", "John Williams"}
+    # Same composition across artists/editions → keep one (highest score)
+    assert len(out) == 1
+    assert out[0].id == "id1"
 
 
 def test_select_diverse_dedupes_remaster_variants():

@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     # Soft floor: aim for at least this many tracks / hours when possible
     chapterscore_min_tracks: int = Field(default=12, ge=1, le=100)
     chapterscore_min_hours: float = Field(default=1.5, ge=0.0, le=6.0)
+    # Hard-ish catalogue quality floor (Spotify popularity 0–100). Prefer fewer better tracks.
+    chapterscore_min_popularity: int = Field(
+        default=30,
+        ge=0,
+        le=100,
+        description="Reject tracks below this Spotify popularity when popularity is known",
+    )
     # Spotify resilience — longer budget for thorough cinematic searches
     chapterscore_spotify_timeout: float = Field(
         default=12.0, ge=3.0, le=30.0, description="Hard wall-clock timeout per Spotify API call (s)"

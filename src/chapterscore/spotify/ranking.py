@@ -65,11 +65,82 @@ _UNDESIRABLE = re.compile(
     r"\b("
     r"karaoke|tribute\s*band|midi|ringtone|8-?bit|chipmunk|"
     r"slowed\s*\+?\s*reverb|nightcore|screwed|white\s*noise|"
-    r"sleep\s*sounds?|rain\s*sounds?|fan\s*noise|"
+    r"brown\s*noise|pink\s*noise|sleep\s*sounds?|rain\s*sounds?|fan\s*noise|"
     r"royalty\s*free|copyright\s*free|no\s*copyright|ncs\b|"
     r"stock\s*music|background\s*music|youtube\s*audio|free\s*music|"
-    r"energy\s*sound|ashamaluev|soundstripe"
+    r"energy\s*sound|ashamaluev|soundstripe|"
+    r"test\s*tone|sine\s*wave|440\s*hz|hz\s*tone|silence\b"
     r")\b",
+    re.IGNORECASE,
+)
+
+# Generic short titles — composition dedupe still keys on artist to avoid
+# collapsing unrelated "Time" / "Theme" / "Prelude" pieces across composers.
+_GENERIC_COMPOSITION_TITLES = frozenset(
+    {
+        "theme",
+        "maintheme",
+        "maintitle",
+        "title",
+        "titles",
+        "time",
+        "home",
+        "love",
+        "life",
+        "dream",
+        "hope",
+        "end",
+        "ending",
+        "begin",
+        "beginning",
+        "intro",
+        "opening",
+        "closing",
+        "credits",
+        "prelude",
+        "overture",
+        "suite",
+        "movement",
+        "adagio",
+        "allegro",
+        "andante",
+        "nocturne",
+        "sonata",
+        "interlude",
+        "finale",
+        "epilogue",
+        "prologue",
+        "untitled",
+        "track",
+        "song",
+        "piece",
+        "music",
+    }
+)
+
+# Dead / non-listenable "music": single-key drones, scale exercises, tuning, etc.
+# Prefer rejecting ambiguous practice tracks over including them.
+_DEAD_OR_EXERCISE = re.compile(
+    r"("
+    # Title is essentially just a musical key (G minor, A major, Bb, C# minor…)
+    r"(^|[\s\-–—:|/])([a-g](?:#|b|♯|♭|sharp|flat)?)\s*"
+    r"(major|minor|maj|min|m)\b(\s*(scale|arpeggio|etude|étude|exercise))?|"
+    r"\b([a-g](?:#|b|♯|♭)?)\s*(major|minor|maj|min)\s*(scale|arpeggio)s?\b|"
+    r"\b(scale|scales|arpeggio|arpeggios|chromatic\s*scale)\b|"
+    r"\b(tuning|drone|drones|ostinato|pedal\s*tone|held\s*note|single\s*note|one\s*note)\b|"
+    r"\b(etude|étude|exercise|warm[\s-]?up|practice\s*piece|finger\s*exercise)\b|"
+    r"\b(metronome|click\s*track|count[\s-]?in)\b|"
+    r"\b(loop\s*pack|sample\s*pack|construction\s*kit)\b"
+    r")",
+    re.IGNORECASE,
+)
+# Whole-title key-only patterns: "G minor", "A Major", "Bb", "C#m"
+_KEY_ONLY_TITLE = re.compile(
+    r"^(?:the\s+)?"
+    r"([a-g](?:#|b|♯|♭|sharp|flat)?)\s*"
+    r"(major|minor|maj|min|m)?"
+    r"(?:\s*(?:for\s+)?(?:orchestra|piano|strings|solo|ensemble))?$"
+    ,
     re.IGNORECASE,
 )
 
@@ -288,10 +359,131 @@ def _query_is_instrumental_flavored(query: str) -> bool:
     return bool(_SOUNDTRACK_QUERY.search(query or ""))
 
 
+def normalize_composition_title(name: str) -> str:
+    """
+    Aggressive title normalization for composition-level de-duplication.
+
+    Strips punctuation, remaster/live/remix/version/mix/instrumental suffixes,
+    and "from …" / "theme from …" movie-soundtrack tails so variants of the
+    same work collapse to one key.
+    """
+    s = (name or "").lower()
+    s = s.replace("&", " and ")
+    # Drop parenthetical / bracketed edition tags
+    s = re.sub(
+        r"[\(\[\{][^\)\]\}]{0,80}[\)\]\}]",
+        " ",
+        s,
+    )
+    # "From Interstellar / From the Motion Picture …"
+    s = re.sub(
+        r"\b(from|theme\s+from|taken\s+from)\s+(the\s+)?(motion\s+picture|movie|film|series|show|game)\b.*$",
+        " ",
+        s,
+        flags=re.I,
+    )
+    s = re.sub(r"\bfrom\s+[\"'].+?[\"']\s*$", " ", s, flags=re.I)
+    s = re.sub(r"\bfrom\s+[a-z0-9][a-z0-9\s:&'\-]{1,40}$", " ", s, flags=re.I)
+    # Common variant suffixes (not core title words like "theme" alone)
+    s = re.sub(
+        r"\b("
+        r"remaster(ed)?(\s*\d{4})?|live(\s+at|\s+in|\s+from)?|"
+        r"radio\s*edit|extended(\s+mix)?|deluxe|bonus(\s+track)?|"
+        r"instrumental(\s+version)?|karaoke|acoustic(\s+version)?|"
+        r"piano\s+version|orchestral\s+version|film\s+version|"
+        r"(original\s+)?(version|remix|mix|edit)|cover|tribute|"
+        r"original\s+(motion\s+picture\s+)?soundtrack|"
+        r"ost\b|movie\s+soundtrack|soundtrack\s+version|"
+        r"end\s+credits(\s+suite)?"
+        r")\b",
+        " ",
+        s,
+        flags=re.I,
+    )
+    # Trailing " - Something" edition markers
+    s = re.sub(
+        r"\s*[-–—:|/]+\s*(remaster|live|remix|mix|edit|version|instrumental|from)\b.*$",
+        " ",
+        s,
+        flags=re.I,
+    )
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+
 def is_undesirable(track: RankedTrack) -> bool:
     blob = f"{track.name or ''} {track.album or ''} {' '.join(track.artists or [])}"
     if _UNDESIRABLE.search(blob):
         return True
+    return False
+
+
+def is_dead_or_exercise_track(track: RankedTrack) -> bool:
+    """
+    HARD reject: non-listenable / practice / empty 'music'.
+
+    Catches single-key drones ("G minor"), scale exercises, tuning tones,
+    ostinato loops, and similar catalogue noise. Prefer reject when unsure.
+    """
+    name = (track.name or "").strip()
+    album = track.album or ""
+    artists = _artist_blob(track)
+    blob = f"{name} {album}"
+
+    if not name:
+        return True
+
+    # Whole title is just a key / key + "for orchestra"
+    if _KEY_ONLY_TITLE.match(name):
+        return True
+
+    if _DEAD_OR_EXERCISE.search(name):
+        # Allow real pieces that merely mention a key in a longer artistic title
+        # e.g. "Moonlight Sonata in C# Minor" — keep if it has a substantial name head
+        head = re.split(r"\bin\s+[a-g]", name, maxsplit=1, flags=re.I)[0].strip()
+        artistic = bool(
+            re.search(
+                r"\b("
+                r"sonata|concerto|symphony|nocturne|prelude|fugue|rhapsody|"
+                r"ballade|impromptu|scherzo|waltz|suite|overture|requiem|"
+                r"theme|fantasia|capriccio|intermezzo|romance"
+                r")\b",
+                head,
+                re.I,
+            )
+        )
+        # "G minor" alone / "Scale in G" / "Drone" → reject
+        # "Piano Sonata in G minor" → keep
+        if not artistic or len(re.sub(r"[^a-z0-9]", "", head.lower())) < 6:
+            return True
+
+    # Album cues for exercise packs
+    if re.search(
+        r"\b(scales?\s*(and|&)?\s*arpeggios?|practice\s*tracks?|tuning\s*notes?|"
+        r"orchestra\s*tuning|warm[\s-]?ups?)\b",
+        album,
+        re.I,
+    ):
+        return True
+
+    # Extremely empty features: near-zero energy + near-zero valence + long duration
+    # often indicates a held drone / silence bed
+    energy = track.features.get("energy")
+    valence = track.features.get("valence")
+    dur_ms = track.duration_ms or 0
+    if (
+        energy is not None
+        and valence is not None
+        and energy < 0.08
+        and valence < 0.12
+        and dur_ms >= 180_000
+        and not _SCORE_ARTISTS.search(artists)
+        and not _INSTRUMENTAL_CUES.search(name)
+    ):
+        # Title also looks sparse / technical
+        if len(normalize_composition_title(name)) <= 8:
+            return True
+
     return False
 
 
@@ -352,13 +544,16 @@ def is_speech_or_non_music(track: RankedTrack) -> bool:
 
 def passes_content_filter(track: RankedTrack) -> bool:
     """
-    Universal hard gate: music-only catalogue quality.
+    Universal hard gate: real, listenable music only.
 
-    Blocks speech/podcast/commentary AND low-quality junk. Always on.
+    Blocks speech/podcast/commentary, junk, AND dead-note / exercise tracks.
+    Always on — prefer reject when unsure.
     """
     if is_speech_or_non_music(track):
         return False
     if is_undesirable(track):
+        return False
+    if is_dead_or_exercise_track(track):
         return False
     return True
 
@@ -371,11 +566,15 @@ def quality_penalty(track: RankedTrack, *, popularity_known: bool = True) -> flo
         factor *= 0.45
     if popularity_known:
         if track.popularity <= 0:
-            factor *= 0.55
+            factor *= 0.5
         elif track.popularity < 15:
-            factor *= 0.75
-        elif track.popularity < 30:
-            factor *= 0.9
+            factor *= 0.55
+        elif track.popularity < 25:
+            factor *= 0.7
+        elif track.popularity < 35:
+            factor *= 0.85
+        elif track.popularity >= 55:
+            factor *= 1.08
     # Mild quality cues only — book vibe multiplier decides epic vs intimate fit
     if _SCORE_ARTISTS.search(" ".join(track.artists or [])):
         factor *= 1.12
@@ -384,7 +583,7 @@ def quality_penalty(track: RankedTrack, *, popularity_known: bool = True) -> flo
         factor *= 1.1
     elif any(k in album.lower() for k in ("soundtrack", "motion picture", "score", "ost")):
         factor *= 1.08
-    return min(1.6, factor)
+    return min(1.65, factor)
 
 
 def passes_lyrics_filter(
@@ -989,59 +1188,91 @@ def passes_popularity_filter(
 
 
 def _norm_title(name: str) -> str:
-    """Normalize a track title for duplicate detection."""
-    s = (name or "").lower()
-    s = re.sub(
-        r"[\(\[\{].*?(remaster|live|radio\s*edit|version|mix|edit|bonus|deluxe).*?[\)\]\}]",
-        "",
-        s,
-        flags=re.I,
-    )
-    s = re.sub(
-        r"\b(remaster(ed)?(\s*\d{4})?|live|radio\s*edit|extended|deluxe|bonus\s*track)\b",
-        "",
-        s,
-        flags=re.I,
-    )
-    return re.sub(r"[^a-z0-9]+", "", s)
+    """Backward-compatible alias for composition title normalization."""
+    return normalize_composition_title(name)
+
+
+def _primary_artist_key(track: RankedTrack) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (track.artists[0] if track.artists else "").lower())
+
+
+def composition_key(track: RankedTrack) -> str:
+    """
+    Identity for the same *composition* / work across recordings.
+
+    Same normalized title (after stripping remaster/live/from-movie/instrumental
+    suffixes) is treated as one work — even across different artists — unless
+    the title is too generic (then artist is included to avoid false merges).
+    """
+    nt = normalize_composition_title(track.name)
+    if not nt:
+        return f"id:{track.id}" if track.id else "empty"
+    if len(nt) < 5 or nt in _GENERIC_COMPOSITION_TITLES:
+        return f"gen:{_primary_artist_key(track)}|{nt}"
+    return f"comp:{nt}"
 
 
 def recording_key(track: RankedTrack) -> str:
-    """
-    Identity for the same recording: Spotify id, or artist+normalized title.
+    """Same as composition_key (kept for older imports/tests)."""
+    return composition_key(track)
 
-    Same title by different artists is allowed; remaster/live variants of the
-    same work by the same primary artist are treated as duplicates.
-    """
-    if track.id:
-        return f"id:{track.id}"
-    artist = re.sub(r"[^a-z0-9]+", "", (track.artists[0] if track.artists else "").lower())
-    return f"rec:{artist}|{_norm_title(track.name)}"
+
+def _track_quality_tuple(track: RankedTrack) -> tuple:
+    """Higher is better — used when keeping the best of duplicate compositions."""
+    return (
+        float(track.score or 0.0),
+        int(track.popularity or 0),
+        1 if _SCORE_ARTISTS.search(_artist_blob(track)) else 0,
+        -(track.duration_ms or 0),  # mild preference for not-absurdly-long beds
+    )
 
 
 def dedupe_tracks(tracks: list[RankedTrack]) -> list[RankedTrack]:
-    """Strict final pass: unique by track id and by artist+title recording key."""
-    out: list[RankedTrack] = []
-    seen_ids: set[str] = set()
-    seen_recordings: set[str] = set()
+    """
+    Strict final pass: one track per Spotify id and per composition.
+
+    When multiple recordings of the same work appear, keep the best by
+    score → popularity → known score-artist legitimacy.
+    """
+    best_by_id: dict[str, RankedTrack] = {}
+    no_id: list[RankedTrack] = []
     for t in tracks:
-        if t.id and t.id in seen_ids:
-            continue
-        # Always check artist+title even when id differs (re-uploads / remasters)
-        artist = re.sub(r"[^a-z0-9]+", "", (t.artists[0] if t.artists else "").lower())
-        rec = f"{artist}|{_norm_title(t.name)}"
-        if rec and rec != "|" and rec in seen_recordings:
-            continue
         if t.id:
-            seen_ids.add(t.id)
-        if rec and rec != "|":
-            seen_recordings.add(rec)
-        out.append(t)
+            prev = best_by_id.get(t.id)
+            if prev is None or _track_quality_tuple(t) > _track_quality_tuple(prev):
+                best_by_id[t.id] = t
+        else:
+            no_id.append(t)
+    pool = list(best_by_id.values()) + no_id
+
+    best_by_comp: dict[str, RankedTrack] = {}
+    for t in pool:
+        key = composition_key(t)
+        prev = best_by_comp.get(key)
+        if prev is None or _track_quality_tuple(t) > _track_quality_tuple(prev):
+            best_by_comp[key] = t
+
+    # Preserve first-seen playlist order of winning compositions
+    seen_keys: set[str] = set()
+    out: list[RankedTrack] = []
+    for t in tracks:
+        key = composition_key(t)
+        winner = best_by_comp.get(key)
+        if winner is None or key in seen_keys:
+            continue
+        if winner is t or (t.id and winner.id == t.id):
+            out.append(winner)
+            seen_keys.add(key)
+    if len(out) < len(best_by_comp):
+        for key, winner in best_by_comp.items():
+            if key not in seen_keys:
+                out.append(winner)
+                seen_keys.add(key)
     return out
 
 
 def filter_music_only(tracks: list[RankedTrack]) -> list[RankedTrack]:
-    """Final safety net: drop any speech/podcast/junk that slipped through."""
+    """Final safety net: drop speech / junk / dead-note tracks."""
     return [t for t in tracks if passes_content_filter(t)]
 
 
@@ -1052,23 +1283,20 @@ def select_diverse(
     max_per_artist: int = 2,
     min_score: float = 0.0,
 ) -> list[RankedTrack]:
-    """Pick up to n tracks by score with artist diversity and strict de-duplication."""
-    ordered = sorted(
-        (t for t in candidates if t.score >= min_score),
-        key=lambda t: t.score,
-        reverse=True,
-    )
+    """Pick up to n tracks by score with artist diversity and composition de-dupe."""
+    # Pre-collapse duplicate compositions, keeping the better scoring variant
+    candidates = dedupe_tracks([t for t in candidates if t.score >= min_score])
+    ordered = sorted(candidates, key=_track_quality_tuple, reverse=True)
     chosen: list[RankedTrack] = []
     artist_counts: Counter[str] = Counter()
     seen_ids: set[str] = set()
-    seen_recordings: set[str] = set()
+    seen_compositions: set[str] = set()
 
     def _take(track: RankedTrack, *, respect_artist_cap: bool) -> bool:
         if track.id and track.id in seen_ids:
             return False
-        artist = re.sub(r"[^a-z0-9]+", "", (track.artists[0] if track.artists else "").lower())
-        rec = f"{artist}|{_norm_title(track.name)}"
-        if rec and rec != "|" and rec in seen_recordings:
+        ck = composition_key(track)
+        if ck in seen_compositions:
             return False
         primary = (track.artists[0] if track.artists else "").lower()
         if respect_artist_cap and primary and artist_counts[primary] >= max_per_artist:
@@ -1076,8 +1304,7 @@ def select_diverse(
         chosen.append(track)
         if track.id:
             seen_ids.add(track.id)
-        if rec and rec != "|":
-            seen_recordings.add(rec)
+        seen_compositions.add(ck)
         if primary:
             artist_counts[primary] += 1
         return True
@@ -1087,7 +1314,7 @@ def select_diverse(
             break
         _take(track, respect_artist_cap=True)
 
-    # Relax artist cap only — never relax duplicate rules
+    # Relax artist cap only — never relax duplicate / composition rules
     if len(chosen) < n:
         for track in ordered:
             if len(chosen) >= n:

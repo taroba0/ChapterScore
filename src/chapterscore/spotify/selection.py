@@ -3,11 +3,13 @@ End-to-end track selection with progressive fallback.
 
 Design principles:
   - Hard reject podcasts / speech / commentary / non-music (all modes)
+  - Hard reject dead-note / scale / drone / exercise tracks
   - Hard lyrics / instrumental constraint when selected
+  - Composition-level de-dupe (one best version of each work)
+  - Popularity quality floor (prefer fewer better tracks)
   - Soft length targets (quality over padding to hours/count)
   - Overall mode: cohesive, shuffle-friendly emotional world
   - Chapter mode: section progression, not minute-by-minute reading sync
-  - No duplicate recordings
 
 Fallback stages (overall mode):
   1. Expanded vibe queries + STRICT instrumental filter
@@ -107,12 +109,16 @@ def _rank_raw(
 ) -> list[RankedTrack]:
     ranked: list[RankedTrack] = []
     exploration = taste.prefs.exploration if taste else 40
-    min_pop = taste.prefs.min_popularity if taste else 0
+    settings = get_settings()
+    # Quality floor: at least config default (~30); prefs may raise it further
+    cfg_floor = settings.chapterscore_min_popularity
+    pref_floor = taste.prefs.min_popularity if taste else cfg_floor
+    min_pop = max(cfg_floor, pref_floor)
     suitable = analysis.style_keywords_good() if analysis else []
     avoid = analysis.style_keywords_bad() if analysis else []
-    # Soft popularity: only hard-filter when we have popularity data for most tracks
+    # Hard popularity when known; unknown (0) only allowed if the batch is mostly unknown
     pop_known = sum(1 for t in raw_tracks if (t.get("popularity") or 0) > 0)
-    strict_pop = pop_known >= max(3, len(raw_tracks) // 2)
+    strict_pop = pop_known >= max(2, len(raw_tracks) // 3)
 
     for t in raw_tracks:
         base = track_dict_to_base(t)
@@ -125,12 +131,13 @@ def _rank_raw(
             vibe_note=vibe_note,
         )
         track.is_instrumental = is_likely_instrumental(track)
-        # Priority 0: hard content filter (no podcasts / speech / commentary)
+        # Priority 0: hard content filter (speech / junk / dead-note exercises)
         if not passes_content_filter(track):
             continue
         # Priority 1: hard lyrics / instrumental constraint
         if not passes_lyrics_filter(track, lyrics, strictness=strictness):
             continue
+        # Priority 1b: catalogue quality floor (popularity when known)
         if min_pop > 0 and not passes_popularity_filter(
             track, min_pop, strict=strict_pop
         ):
