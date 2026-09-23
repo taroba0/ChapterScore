@@ -544,16 +544,18 @@ def is_speech_or_non_music(track: RankedTrack) -> bool:
 
 def passes_content_filter(track: RankedTrack) -> bool:
     """
-    Universal hard gate: real, listenable music only.
+    Universal hard gate: real, listenable, reading-safe music only.
 
-    Blocks speech/podcast/commentary, junk, AND dead-note / exercise tracks.
-    Always on — prefer reject when unsure.
+    Blocks speech/podcast/commentary, junk, dead-note / exercise tracks,
+    and blasting trailer-level intensity. Prefer reject when unsure.
     """
     if is_speech_or_non_music(track):
         return False
     if is_undesirable(track):
         return False
     if is_dead_or_exercise_track(track):
+        return False
+    if is_too_intense_for_reading(track):
         return False
     return True
 
@@ -761,7 +763,6 @@ _INTIMATE_MARKERS = re.compile(
     re.IGNORECASE,
 )
 
-
 _DREAMY_MARKERS = re.compile(
     r"("
     r"dream|ethereal|surreal|ambient|hazy|shoegaze|reverb|"
@@ -776,6 +777,124 @@ _PLAYFUL_MARKERS = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+# Too loud / aggressive for reading focus (hard preference to reject)
+_READING_TOO_INTENSE = re.compile(
+    r"("
+    r"two steps from hell|thomas bergersen|audiomachine|immediate music|"
+    r"trailer\s*music|hybrid\s*trailer|epic\s*battle|war\s*drums|"
+    r"brass\s*fanfare|scream(ing)?|death\s*metal|black\s*metal|"
+    r"dubstep\s*drop|festival\s*drop|brostep|"
+    r"aggressive|crushing|brutal|chaos|chaotic|"
+    r"transformers|avengers|man of steel|gladiator\s*main"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def reading_safe_energy_target(
+    book_energy: float | None,
+    *,
+    intimacy_vs_epic: float | None = None,
+    target_max: float | None = None,
+) -> float:
+    """
+    Map literary book energy into a reading-safe musical energy target.
+
+    High-energy books become taut / expectant, not blasting. Comfortable
+    continuity for focus beats matching peak plot intensity.
+    """
+    e = 0.5 if book_energy is None else max(0.0, min(1.0, float(book_energy)))
+    intimacy = 0.5 if intimacy_vs_epic is None else max(0.0, min(1.0, float(intimacy_vs_epic)))
+    # Soft curve: compress the high end into a readable band
+    compressed = 0.16 + 0.42 * (e**0.9)
+    try:
+        from chapterscore.config import get_settings
+
+        tmax = target_max if target_max is not None else get_settings().chapterscore_reading_energy_target_max
+    except Exception:
+        tmax = target_max if target_max is not None else 0.56
+    if intimacy >= 0.7:
+        compressed = min(compressed, 0.46)
+    elif intimacy >= 0.55:
+        compressed = min(compressed, 0.52)
+    return float(min(tmax, max(0.14, compressed)))
+
+
+def reading_energy_ceiling() -> float:
+    try:
+        from chapterscore.config import get_settings
+
+        return float(get_settings().chapterscore_reading_energy_ceiling)
+    except Exception:
+        return 0.68
+
+
+def track_energy_estimate(track: RankedTrack) -> float:
+    """Spotify energy feature, or a lexical heuristic when features are missing."""
+    e = track.features.get("energy")
+    if e is not None:
+        return float(e)
+    blob = f"{track.name or ''} {track.album or ''} {' '.join(track.artists or [])}".lower()
+    if _READING_TOO_INTENSE.search(blob) or _EPIC_TRAILER_MARKERS.search(blob):
+        return 0.78
+    if _INTIMATE_MARKERS.search(blob):
+        return 0.28
+    if _DREAMY_MARKERS.search(blob):
+        return 0.32
+    if _PLAYFUL_MARKERS.search(blob):
+        return 0.48
+    return 0.45
+
+
+def is_too_intense_for_reading(track: RankedTrack) -> bool:
+    """
+    Reading-safe hard-ish gate: reject blasting / trailer / scream-level tracks.
+
+    Prefer texture over volume. Book tension is allowed; chaos is not.
+    """
+    blob = f"{track.name or ''} {track.album or ''} {' '.join(track.artists or [])}".lower()
+    if _READING_TOO_INTENSE.search(blob):
+        return True
+    energy = track.features.get("energy")
+    loudness_proxy = track.features.get("loudness")  # often missing; dB when present
+    ceiling = reading_energy_ceiling()
+    if energy is not None and float(energy) > ceiling:
+        return True
+    # Very high energy + low acousticness ≈ dense/noisy production
+    acoustic = track.features.get("acousticness")
+    if energy is not None and acoustic is not None:
+        if float(energy) > ceiling - 0.05 and float(acoustic) < 0.12:
+            return True
+    if loudness_proxy is not None and float(loudness_proxy) > -5.5 and (
+        energy is None or float(energy) > 0.55
+    ):
+        return True
+    return False
+
+
+def reading_energy_fit(
+    track_energy: float | None,
+    target: float,
+    *,
+    ceiling: float | None = None,
+) -> float:
+    """
+    Asymmetric fit: overshooting the reading target hurts more than being calmer.
+
+    Returns a 0–1 factor for scoring.
+    """
+    if track_energy is None:
+        return 0.7
+    te = float(track_energy)
+    ceil = ceiling if ceiling is not None else reading_energy_ceiling()
+    if te > ceil:
+        return 0.12
+    if te > target:
+        gap = te - target
+        return max(0.28, 1.0 - 2.0 * gap)
+    gap = target - te
+    return max(0.5, 1.0 - 0.85 * gap)
 
 
 def book_vibe_multiplier(
@@ -794,17 +913,20 @@ def book_vibe_multiplier(
     realism_vs_dreaminess: float | None = None,
     anti_generic_notes: list[str] | None = None,
     vibe_keywords: list[str] | None = None,
+    era_feel: str | None = None,
+    pacing: str | None = None,
 ) -> float:
     """
-    Multiplier ~[0.18, 1.45] for how well a track fits the book's emotional world.
+    Multiplier ~[0.15, 1.5] for reading-companion book fit.
 
-    Uses multi-dimensional literary signals (intimacy scale, voice, humor,
-    dreaminess) so same-genre books don't collapse to identical rankings.
+    Atmosphere-first: setting, era, intended emotion, and pacing outweigh raw
+    plot-intensity matching. High-energy books stay taut, never trailer-loud.
     """
     energy = 0.5 if book_energy is None else float(book_energy)
     intimacy = 0.5 if intimacy_vs_epic is None else float(intimacy_vs_epic)
     humor = 0.3 if humor_level is None else float(humor_level)
     dream = 0.4 if realism_vs_dreaminess is None else float(realism_vs_dreaminess)
+    safe_target = reading_safe_energy_target(energy, intimacy_vs_epic=intimacy)
     atms = {a.lower() for a in (atmospheres or [])}
     tones = {t.lower() for t in (dominant_tones or [])}
     mood = (overall_mood or "").lower()
@@ -812,6 +934,8 @@ def book_vibe_multiplier(
     voice = (narrative_voice or "").lower()
     signature = (distinctive_signature or "").lower()
     setting = (setting_texture or "").lower()
+    era = (era_feel or "").lower()
+    pace = (pacing or "").lower()
     anti = " ".join(anti_generic_notes or []).lower()
     blob = f"{track.name} {track.album} {' '.join(track.artists)} {track.matched_query}".lower()
 
@@ -834,32 +958,24 @@ def book_vibe_multiplier(
         )
         or any(k in voice for k in ("intimate", "confessional", "wry", "earnest"))
     )
-    epic_book = (
+    # "Epic world" ≠ permission for trailer volume when reading
+    epic_world = (
         intimacy <= 0.35
-        or energy >= 0.72
-        or bool(atms & {"epic", "triumphant", "adventurous", "angry"})
+        or bool(atms & {"epic", "adventurous", "mythic"})
+        or any(k in setting or k in era for k in ("myth", "empire", "quest", "battlefield"))
     ) and intimacy < 0.55
     blocks_epic = any(
         k in anti for k in ("not epic", "no epic", "not trailer", "no trailer", "not battle")
     )
     if blocks_epic:
         intimate_book = True
-        epic_book = False
+        epic_world = False
 
-    # Token overlap from rich literary pool
-    vibe_tokens: set[str] = set()
-    for source in (
-        list(atms),
-        list(tones),
-        [mood, themes, voice, signature, setting],
-        vibe_keywords or [],
-    ):
-        if isinstance(source, list):
-            for item in source:
-                vibe_tokens.update(w for w in re.findall(r"[a-z]+", str(item).lower()) if len(w) > 3)
-        else:
-            vibe_tokens.update(w for w in re.findall(r"[a-z]+", str(source).lower()) if len(w) > 3)
-    vibe_tokens -= {
+    # Atmosphere-first token pools (heavier weight than generic themes)
+    def _tokens(text: str) -> set[str]:
+        return {w for w in re.findall(r"[a-z]+", text.lower()) if len(w) > 3}
+
+    stop = {
         "music",
         "book",
         "story",
@@ -878,58 +994,105 @@ def book_vibe_multiplier(
         "genre",
         "typical",
         "rather",
+        "reading",
+        "reader",
     }
-    hits = sum(1 for t in vibe_tokens if t in blob)
-    if hits:
-        mult *= min(1.4, 1.0 + 0.06 * hits)
+    setting_tokens = (_tokens(setting) | _tokens(era)) - stop
+    emotion_tokens = (
+        _tokens(mood) | tones | {a for a in atms if len(a) > 3} | _tokens(signature)
+    ) - stop
+    theme_tokens = _tokens(themes) - stop
+    voice_tokens = _tokens(voice) - stop
+    extra = set()
+    for item in vibe_keywords or []:
+        extra |= _tokens(str(item))
+    extra -= stop
 
-    t_energy = track.features.get("energy")
-    if t_energy is not None:
-        gap = abs(t_energy - energy)
-        if gap > 0.35:
-            mult *= max(0.35, 1.0 - 1.1 * (gap - 0.35))
-        elif gap < 0.15:
+    setting_hits = sum(1 for t in setting_tokens if t in blob)
+    emotion_hits = sum(1 for t in emotion_tokens if t in blob)
+    theme_hits = sum(1 for t in theme_tokens if t in blob)
+    voice_hits = sum(1 for t in voice_tokens if t in blob)
+    extra_hits = sum(1 for t in extra if t in blob)
+
+    if setting_hits:
+        mult *= min(1.35, 1.0 + 0.10 * setting_hits)  # strongest
+    if emotion_hits:
+        mult *= min(1.32, 1.0 + 0.08 * emotion_hits)
+    if voice_hits:
+        mult *= min(1.18, 1.0 + 0.05 * voice_hits)
+    if theme_hits:
+        mult *= min(1.15, 1.0 + 0.04 * theme_hits)
+    if extra_hits:
+        mult *= min(1.12, 1.0 + 0.03 * extra_hits)
+
+    # Pacing texture cues
+    if pace:
+        if "slow" in pace and any(k in blob for k in ("ambient", "drone", "piano", "quiet", "still")):
             mult *= 1.08
+        if "fast" in pace or "propulsive" in pace:
+            if any(k in blob for k in ("pulse", "driving", "tense", "ostinato", "motorik")):
+                mult *= 1.06
+            if _EPIC_TRAILER_MARKERS.search(blob):
+                mult *= 0.7  # propulsion ≠ trailer blast
 
-    if intimate_book and not epic_book:
-        if _EPIC_TRAILER_MARKERS.search(blob):
-            mult *= 0.18 if intimacy >= 0.7 else 0.22
+    # Reading-safe energy fit (asymmetric — loud overshoot hurts)
+    t_energy = track.features.get("energy")
+    e_fit = reading_energy_fit(t_energy if t_energy is not None else track_energy_estimate(track), safe_target)
+    mult *= 0.55 + 0.55 * e_fit
+
+    # Universal reading companion: never reward trailer/battle music much
+    if _EPIC_TRAILER_MARKERS.search(blob) or _READING_TOO_INTENSE.search(blob):
+        mult *= 0.22 if intimate_book else 0.35
+    if intimate_book:
         if re.search(
             r"hans zimmer|two steps|john williams|howard shore",
             blob,
             re.I,
         ) and not _INTIMATE_MARKERS.search(blob):
             if re.search(
-                r"battle|pirates|gladiator|dark knight|inception\s*main|\btime\b",
+                r"battle|pirates|gladiator|dark knight|inception\s*main",
                 blob,
                 re.I,
             ):
-                mult *= 0.32
-            elif energy < 0.5 or intimacy >= 0.6:
-                mult *= 0.5
+                mult *= 0.35
+            else:
+                mult *= 0.65
         if _INTIMATE_MARKERS.search(blob):
-            mult *= 1.25 if intimacy >= 0.65 else 1.2
+            mult *= 1.22 if intimacy >= 0.65 else 1.15
 
-    if epic_book and _EPIC_TRAILER_MARKERS.search(blob):
-        mult *= 1.15
-    if epic_book and _INTIMATE_MARKERS.search(blob) and energy > 0.75:
-        mult *= 0.85
+    # Mythic / historical / fantasy worlds: texture over volume
+    world_blob = f"{setting} {era} {mood} {themes}"
+    if any(k in world_blob for k in ("myth", "ancient", "historical", "fantasy", "folklore", "ritual")):
+        if any(k in blob for k in ("folk", "lyre", "chant", "choir", "ancient", "modal", "harp", "lute")):
+            mult *= 1.12
+        if _EPIC_TRAILER_MARKERS.search(blob):
+            mult *= 0.55
+    if any(k in world_blob for k in ("realist", "contemporary", "domestic", "everyday")):
+        if _EPIC_TRAILER_MARKERS.search(blob):
+            mult *= 0.4
+        if any(k in blob for k in ("indie", "piano", "acoustic", "chamber", "neoclassical")):
+            mult *= 1.08
 
-    # Humor / irony → reward playful cues, penalize solemn epic when comedy-forward
+    # Even "epic world" books: modest lift for adventurous texture, not trailer banks
+    if epic_world and not intimate_book:
+        if any(k in blob for k in ("adventure", "explore", "journey", "horizon", "wind")):
+            mult *= 1.08
+        if _EPIC_TRAILER_MARKERS.search(blob):
+            mult *= 0.85  # was a boost — now a soft penalty for reading
+
     if humor >= 0.55:
         if _PLAYFUL_MARKERS.search(blob):
             mult *= 1.18
-        if _EPIC_TRAILER_MARKERS.search(blob) and intimacy > 0.4:
-            mult *= 0.55
+        if _EPIC_TRAILER_MARKERS.search(blob):
+            mult *= 0.5
 
-    # Dreamy / surreal books → ambient/ethereal fit
     if dream >= 0.6:
         if _DREAMY_MARKERS.search(blob):
             mult *= 1.15
-        if _EPIC_TRAILER_MARKERS.search(blob) and intimacy > 0.45:
-            mult *= 0.7
+        if _EPIC_TRAILER_MARKERS.search(blob):
+            mult *= 0.55
 
-    return max(0.18, min(1.45, mult))
+    return max(0.15, min(1.5, mult))
 
 
 def _feature_distance(actual: float | None, target: float | None, weight: float = 1.0) -> float:
@@ -986,27 +1149,34 @@ def score_track(
     realism_vs_dreaminess: float | None = None,
     anti_generic_notes: list[str] | None = None,
     vibe_keywords: list[str] | None = None,
+    era_feel: str | None = None,
+    pacing: str | None = None,
 ) -> float:
     """
-    Composite score ~0–100 with hard priority:
+    Composite score ~0–100 for a *reading companion* playlist:
 
-      1. Lyrics filter applied *before* scoring (caller)
-      2. Book vibe & emotional tone (largest weight)
-      3. User taste / comfort
-      4. Light cinematic preference only when it fits the book
+      1. Lyrics / content filters applied before scoring (caller)
+      2. Atmosphere / setting / emotion fit (dominant)
+      3. Reading-safe energy (not peak plot intensity)
+      4. Catalogue quality
+      5. Soft taste / comfort (never overrides 1–4)
     """
     if seen_ids and track.id in seen_ids:
         return -1.0
 
     mode = lyrics.normalized()
     feats = track.features
-    # Prefer energy target from book when available
-    energy_target = book_energy if book_energy is not None else spec.energy
+    # Reading-safe energy target (compresses high book energy into a focus-friendly band)
+    energy_target = reading_safe_energy_target(
+        book_energy if book_energy is not None else spec.energy,
+        intimacy_vs_epic=intimacy_vs_epic,
+    )
     fit_parts = [
-        _feature_distance(feats.get("energy"), energy_target, 1.4),
-        _feature_distance(feats.get("valence"), spec.valence, 1.1),
-        _feature_distance(feats.get("acousticness"), spec.acousticness, 0.7),
-        _feature_distance(feats.get("danceability"), spec.danceability, 0.4),
+        # Softer weight on raw energy distance — atmosphere matters more
+        _feature_distance(feats.get("energy"), energy_target, 0.9),
+        _feature_distance(feats.get("valence"), spec.valence, 1.0),
+        _feature_distance(feats.get("acousticness"), spec.acousticness, 0.85),
+        _feature_distance(feats.get("danceability"), spec.danceability, 0.35),
     ]
     if spec.tempo_bpm and feats.get("tempo"):
         tempo_fit = max(0.0, 1.0 - abs(feats["tempo"] - spec.tempo_bpm) / 60.0)
@@ -1068,7 +1238,7 @@ def score_track(
     else:
         duration_factor = 0.85
 
-    # Priority 2: book emotional world (dominant)
+    # Atmosphere / setting / emotion (dominant for reading companion)
     style_mult = style_clash_score(track, suitable=suitable_styles, avoid=avoid_styles)
     vibe_mult = book_vibe_multiplier(
         track,
@@ -1085,6 +1255,8 @@ def score_track(
         realism_vs_dreaminess=realism_vs_dreaminess,
         anti_generic_notes=anti_generic_notes,
         vibe_keywords=vibe_keywords,
+        era_feel=era_feel,
+        pacing=pacing,
     )
 
     explore = max(0.0, min(1.0, exploration / 100.0))
@@ -1092,43 +1264,40 @@ def score_track(
     taste_score = taste_affinity
     novelty_score = 1.0 - taste_affinity
 
-    # Light cinematic bonus only when book vibe allows it (not forced)
+    # Cinematic bonus only for delicate / atmospheric cues — never trailer banks
     cine = cinematic_fit(track)
-    e = book_energy if book_energy is not None else (spec.energy or 0.5)
     intimacy = 0.5 if intimacy_vs_epic is None else float(intimacy_vs_epic)
-    atms = {a.lower() for a in (atmospheres or [])}
-    intimate = intimacy >= 0.6 or e <= 0.5 or bool(
-        atms & {"intimate", "melancholic", "nostalgic", "hopeful", "playful", "romantic", "calm"}
-    )
-    if intimate and (e < 0.65 or intimacy >= 0.6):
-        # Intimate books: only reward delicate cinematic, not epic
-        cine_weight = 6.0 * (
-            1.0
-            if _INTIMATE_MARKERS.search(
-                f"{track.name} {track.album} {' '.join(track.artists)}"
-            )
-            else 0.25
-        )
+    blob = f"{track.name} {track.album} {' '.join(track.artists)}"
+    if _READING_TOO_INTENSE.search(blob) or _EPIC_TRAILER_MARKERS.search(blob):
+        cine_weight = 0.5
+        cine *= 0.2
+    elif _INTIMATE_MARKERS.search(blob) or _DREAMY_MARKERS.search(blob):
+        cine_weight = 7.0
     else:
-        cine_weight = 10.0  # mild preference when epic/drama fits
+        cine_weight = 3.5  # mild; atmosphere > cinema prestige
 
-    # Vibe-first weights (Top Artists is always soft; book vibe wins)
+    # Reading-safe energy factor (extra to feature_fit)
+    e_safe = reading_energy_fit(
+        feats.get("energy") if feats.get("energy") is not None else track_energy_estimate(track),
+        energy_target,
+    )
+
+    # Atmosphere-first weights; taste is softest
     if mode is LyricsPreference.INSTRUMENTAL_ONLY:
-        feature_weight, pop_weight, prov_weight = 28.0, 10.0, 8.0
-        vibe_overlap_weight = 16.0
-        # Soft taste boost even under instrumental-only (never overrides lyrics/vibe)
-        taste_weight = (14.0 * comfort + 4.0) if taste_affinity > 0 else 0.0
-        novelty_weight = 6.0 * explore
+        feature_weight, pop_weight, prov_weight = 22.0, 10.0, 8.0
+        vibe_overlap_weight = 20.0
+        taste_weight = (10.0 * comfort + 3.0) if taste_affinity > 0 else 0.0
+        novelty_weight = 5.0 * explore
     else:
         if feats and popularity_known:
-            feature_weight, pop_weight, prov_weight = 26.0, 14.0, 8.0
+            feature_weight, pop_weight, prov_weight = 20.0, 12.0, 8.0
         elif feats:
-            feature_weight, pop_weight, prov_weight = 30.0, 10.0, 10.0
+            feature_weight, pop_weight, prov_weight = 24.0, 10.0, 10.0
         else:
-            feature_weight, pop_weight, prov_weight = 14.0, 12.0, 18.0
-        vibe_overlap_weight = 14.0
-        taste_weight = 28.0 * comfort + 6.0
-        novelty_weight = 12.0 * explore
+            feature_weight, pop_weight, prov_weight = 12.0, 12.0, 16.0
+        vibe_overlap_weight = 18.0
+        taste_weight = 18.0 * comfort + 4.0
+        novelty_weight = 10.0 * explore
         if taste_affinity <= 0:
             feature_weight += taste_weight * 0.55
             pop_weight += taste_weight * 0.25
@@ -1144,6 +1313,7 @@ def score_track(
         + taste_weight * taste_score
         + novelty_weight * novelty_score
         + cine_weight * cine
+        + 14.0 * e_safe  # reading continuity / safe intensity
     ) * duration_factor * quality_penalty(track, popularity_known=popularity_known) * style_mult * vibe_mult
 
     if mode is LyricsPreference.INSTRUMENTAL_ONLY:
@@ -1328,27 +1498,131 @@ def apply_overall_cohesion(
     tracks: list[RankedTrack],
     *,
     book_energy: float | None,
-    max_energy_gap: float = 0.38,
+    intimacy_vs_epic: float | None = None,
+    max_energy_gap: float = 0.28,
 ) -> list[RankedTrack]:
     """
-    Soft-penalize tracks far from the book's overall energy so overall-mode
-    playlists stay one emotional world under shuffle.
+    Soft-penalize tracks far from the *reading-safe* energy target so overall
+    mode stays one emotional world (shuffle-friendly, focus-friendly).
     """
-    if book_energy is None:
-        return tracks
-    energy = float(book_energy)
+    target = reading_safe_energy_target(book_energy, intimacy_vs_epic=intimacy_vs_epic)
+    ceiling = reading_energy_ceiling()
     adjusted: list[RankedTrack] = []
     for t in tracks:
-        te = t.features.get("energy")
-        if te is not None:
-            gap = abs(float(te) - energy)
+        te = track_energy_estimate(t)
+        if te > ceiling:
+            t.score = round(t.score * 0.2, 3)
+        else:
+            fit = reading_energy_fit(te, target, ceiling=ceiling)
+            # Pull scores toward reading-safe center
+            t.score = round(t.score * (0.55 + 0.55 * fit), 3)
+            gap = abs(te - target)
             if gap > max_energy_gap:
-                # Deep copy score only — mutate score in place is fine for ranking
-                t.score = round(t.score * max(0.35, 1.0 - 1.2 * (gap - max_energy_gap)), 3)
-            elif gap < 0.12:
-                t.score = round(t.score * 1.06, 3)
+                t.score = round(t.score * max(0.35, 1.0 - 1.3 * (gap - max_energy_gap)), 3)
         adjusted.append(t)
     return adjusted
+
+
+def smooth_playlist_order(
+    tracks: list[RankedTrack],
+    *,
+    max_jump: float | None = None,
+    drop_jarring: bool = True,
+) -> list[RankedTrack]:
+    """
+    Reorder tracks so adjacent energy/intensity jumps stay small.
+
+    Greedy nearest-neighbor from a mid-energy seed. Prefer dropping a leftover
+    jarring track over inserting a soft→violent shock. Reading continuity first.
+    """
+    if len(tracks) <= 2:
+        return list(tracks)
+    try:
+        from chapterscore.config import get_settings
+
+        jump = (
+            max_jump
+            if max_jump is not None
+            else float(get_settings().chapterscore_max_adjacent_energy_jump)
+        )
+    except Exception:
+        jump = max_jump if max_jump is not None else 0.20
+
+    remaining = list(tracks)
+    remaining.sort(key=track_energy_estimate)
+    # Start near the median energy for cohesion under shuffle too
+    start_idx = len(remaining) // 2
+    ordered: list[RankedTrack] = [remaining.pop(start_idx)]
+
+    while remaining:
+        last_e = track_energy_estimate(ordered[-1])
+        within = [
+            (i, t)
+            for i, t in enumerate(remaining)
+            if abs(track_energy_estimate(t) - last_e) <= jump
+        ]
+        if within:
+            # Among smooth neighbors, prefer higher score then closer energy
+            i, _ = max(
+                within,
+                key=lambda it: (
+                    float(it[1].score or 0.0),
+                    -abs(track_energy_estimate(it[1]) - last_e),
+                ),
+            )
+            ordered.append(remaining.pop(i))
+            continue
+
+        # No smooth neighbor — take closest
+        i, closest = min(
+            enumerate(remaining),
+            key=lambda it: abs(track_energy_estimate(it[1]) - last_e),
+        )
+        delta = abs(track_energy_estimate(closest) - last_e)
+        if drop_jarring and delta > jump * 1.65:
+            # Prefer fewer continuous tracks over a focus-breaking jump
+            remaining.pop(i)
+            continue
+        ordered.append(remaining.pop(i))
+
+    return ordered
+
+
+def smooth_chapter_playlist(
+    tracks: list[RankedTrack],
+    *,
+    max_jump: float | None = None,
+) -> list[RankedTrack]:
+    """
+    Smooth within each chapter block, then soft-bridge between chapters.
+
+    Progression across chapters is preserved; soft→violent jumps are not.
+    """
+    if not tracks:
+        return []
+    from collections import OrderedDict
+
+    groups: OrderedDict[str | int | None, list[RankedTrack]] = OrderedDict()
+    for t in tracks:
+        groups.setdefault(t.chapter_number, []).append(t)
+
+    out: list[RankedTrack] = []
+    prev_e: float | None = None
+    for _ch, group in groups.items():
+        smoothed = smooth_playlist_order(group, max_jump=max_jump, drop_jarring=True)
+        if prev_e is not None and len(smoothed) > 1:
+            # Rotate so the block opens closest to the previous chapter's ending energy
+            best_i = min(
+                range(len(smoothed)),
+                key=lambda i: abs(track_energy_estimate(smoothed[i]) - prev_e),
+            )
+            smoothed = smoothed[best_i:] + smoothed[:best_i]
+            # Re-smooth the rotated list lightly for internal continuity
+            smoothed = smooth_playlist_order(smoothed, max_jump=max_jump, drop_jarring=False)
+        out.extend(smoothed)
+        if smoothed:
+            prev_e = track_energy_estimate(smoothed[-1])
+    return out
 
 
 def total_duration_ms(tracks: list[RankedTrack]) -> int:

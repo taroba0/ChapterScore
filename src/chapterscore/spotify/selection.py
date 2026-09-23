@@ -61,11 +61,15 @@ from chapterscore.spotify.ranking import (
     dedupe_tracks,
     filter_music_only,
     is_likely_instrumental,
+    is_too_intense_for_reading,
     passes_content_filter,
     passes_lyrics_filter,
     passes_popularity_filter,
+    reading_safe_energy_target,
     score_track,
     select_diverse,
+    smooth_chapter_playlist,
+    smooth_playlist_order,
     total_duration_ms,
 )
 from chapterscore.spotify.search import (
@@ -131,8 +135,10 @@ def _rank_raw(
             vibe_note=vibe_note,
         )
         track.is_instrumental = is_likely_instrumental(track)
-        # Priority 0: hard content filter (speech / junk / dead-note exercises)
+        # Priority 0: hard content filter (speech / junk / dead-note / too-loud)
         if not passes_content_filter(track):
+            continue
+        if is_too_intense_for_reading(track):
             continue
         # Priority 1: hard lyrics / instrumental constraint
         if not passes_lyrics_filter(track, lyrics, strictness=strictness):
@@ -142,7 +148,7 @@ def _rank_raw(
             track, min_pop, strict=strict_pop
         ):
             continue
-        # Priority 4: soft taste (never overrides content / lyrics / book vibe)
+        # Soft taste — never overrides content / lyrics / reading continuity / vibe
         affinity = taste.affinity_for_artists(track.artists) if taste else 0.0
         track.score = score_track(
             track,
@@ -170,6 +176,8 @@ def _rank_raw(
             realism_vs_dreaminess=analysis.realism_vs_dreaminess if analysis else None,
             anti_generic_notes=list(analysis.anti_generic_notes) if analysis else None,
             vibe_keywords=analysis.vibe_keyword_pool() if analysis else None,
+            era_feel=analysis.era_feel if analysis else None,
+            pacing=analysis.pacing_profile or analysis.pacing if analysis else None,
         )
         if track.score < 0:
             continue
@@ -349,19 +357,26 @@ def _pick_quality(
     max_per_artist: int,
     lyrics: LyricsPreference,
     book_energy: float | None = None,
+    intimacy_vs_epic: float | None = None,
     cohesive: bool = False,
+    smooth: bool = True,
 ) -> list[RankedTrack]:
     """
     Quality-first selection up to a soft target.
 
-    Never pads with weak tracks just to hit a number. Applies overall-mode
-    cohesion when requested. Always de-duplicates.
+    Never pads with weak/jarring tracks. Applies reading-safe cohesion and
+    adjacent-energy smoothing. Always de-duplicates.
     """
-    candidates = list(pool)
-    if cohesive and book_energy is not None:
-        candidates = apply_overall_cohesion(candidates, book_energy=book_energy)
+    candidates = [
+        t for t in pool if passes_content_filter(t) and not is_too_intense_for_reading(t)
+    ]
+    if cohesive:
+        candidates = apply_overall_cohesion(
+            candidates,
+            book_energy=book_energy,
+            intimacy_vs_epic=intimacy_vs_epic,
+        )
 
-    # Never select speech/podcast/non-music even if scored
     candidates = filter_music_only(candidates)
     floor = _quality_floor(lyrics)
     chosen = select_diverse(
@@ -375,7 +390,10 @@ def _pick_quality(
             max_per_artist=max_per_artist,
             min_score=floor * 0.55,
         )
-    return filter_music_only(dedupe_tracks(chosen))
+    chosen = filter_music_only(dedupe_tracks(chosen))
+    if smooth and chosen:
+        chosen = smooth_playlist_order(chosen, drop_jarring=True)
+    return chosen
 
 
 def _max_per_artist(exploration: int) -> int:
@@ -437,10 +455,19 @@ def select_tracks_for_analysis(
         f"→ (4) taste={prefs.taste_strength.value}; "
         f"recommendations={'on' if prefs.use_recommendations else 'off'}"
     )
+    safe_e = reading_safe_energy_target(
+        analysis.overall_energy,
+        intimacy_vs_epic=analysis.intimacy_vs_epic,
+    )
     if mode == Mode.OVERALL or not analysis.chapters:
-        progress("Overall mode: cohesive emotional world (shuffle-friendly)")
+        progress(
+            f"Overall mode: reading companion · cohesive world · "
+            f"safe energy target ~{safe_e:.2f} (shuffle-friendly)"
+        )
     else:
-        progress("Chapter mode: ordered narrative progression")
+        progress(
+            f"Chapter mode: smoothed progression · reading-safe energy ~{safe_e:.2f}"
+        )
 
     try:
         if mode == Mode.OVERALL or not analysis.chapters:
@@ -474,8 +501,19 @@ def select_tracks_for_analysis(
                 f"elapsed={time.monotonic() - ended.started_at:.0f}s"
             )
 
-    # Final safety: de-dupe + strip any speech/non-music that slipped through
-    return filter_music_only(dedupe_tracks(result))
+    # Final safety: de-dupe + strip speech/non-music/too-loud, then smooth order
+    cleaned = filter_music_only(
+        [t for t in dedupe_tracks(result) if not is_too_intense_for_reading(t)]
+    )
+    if mode == Mode.CHAPTER and cleaned and any(t.chapter_number is not None for t in cleaned):
+        cleaned = smooth_chapter_playlist(cleaned)
+    elif cleaned:
+        cleaned = smooth_playlist_order(cleaned, drop_jarring=True)
+    progress(
+        f"Reading companion: {len(cleaned)} tracks after continuity smoothing "
+        f"(dropped jarring / over-loud leftovers)"
+    )
+    return cleaned
 
 
 def _select_overall(
@@ -515,13 +553,15 @@ def _select_overall(
             max_per_artist=max_art,
             lyrics=lyrics,
             book_energy=analysis.overall_energy,
+            intimacy_vs_epic=analysis.intimacy_vs_epic,
             cohesive=True,
+            smooth=True,
         )
         if chosen:
             progress(
                 f"✓ {label}: {len(chosen)} tracks "
                 f"(duration ≈ {total_duration_ms(chosen) / 60000:.0f} min; "
-                f"soft aim was ~{target})"
+                f"soft aim was ~{target}; reading-smoothed)"
             )
         return chosen
 

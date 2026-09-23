@@ -157,8 +157,14 @@ def _target_features(
     analysis: BookVibeAnalysis,
     lyrics: LyricsPreference,
 ) -> dict[str, float]:
-    """Map book vibe → Spotify recommendation target_* params."""
-    energy = float(analysis.overall_energy if analysis.overall_energy is not None else 0.5)
+    """Map book vibe → Spotify recommendation target_* params (reading-safe)."""
+    from chapterscore.spotify.ranking import reading_safe_energy_target
+
+    raw_energy = float(analysis.overall_energy if analysis.overall_energy is not None else 0.5)
+    energy = reading_safe_energy_target(
+        raw_energy,
+        intimacy_vs_epic=analysis.intimacy_vs_epic,
+    )
     # Valence from atmospheres (rough)
     atmospheres = {a.lower() for a in (analysis.atmospheres or [])}
     valence = 0.45
@@ -170,8 +176,9 @@ def _target_features(
         valence = 0.4
 
     targets: dict[str, float] = {
-        "target_energy": max(0.05, min(0.95, energy)),
+        "target_energy": max(0.05, min(0.75, energy)),
         "target_valence": max(0.05, min(0.95, valence)),
+        "max_energy": 0.72,  # reading companion ceiling hint for Recommendations API
     }
     mode = lyrics.normalized()
     if mode is LyricsPreference.INSTRUMENTAL_ONLY:

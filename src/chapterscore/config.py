@@ -74,6 +74,25 @@ class Settings(BaseSettings):
         le=100,
         description="Reject tracks below this Spotify popularity when popularity is known",
     )
+    # Reading companion: keep music focus-friendly (not trailer-loud)
+    chapterscore_reading_energy_ceiling: float = Field(
+        default=0.68,
+        ge=0.4,
+        le=0.9,
+        description="Hard-ish max Spotify energy for reading-safe tracks",
+    )
+    chapterscore_reading_energy_target_max: float = Field(
+        default=0.56,
+        ge=0.3,
+        le=0.75,
+        description="Max mapped reading-safe energy target even for high-energy books",
+    )
+    chapterscore_max_adjacent_energy_jump: float = Field(
+        default=0.20,
+        ge=0.08,
+        le=0.45,
+        description="Preferred max energy delta between adjacent playlist tracks",
+    )
     # Spotify resilience — longer budget for thorough cinematic searches
     chapterscore_spotify_timeout: float = Field(
         default=12.0, ge=3.0, le=30.0, description="Hard wall-clock timeout per Spotify API call (s)"
