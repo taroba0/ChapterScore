@@ -67,31 +67,37 @@ class Settings(BaseSettings):
     # Soft floor: aim for at least this many tracks / hours when possible
     chapterscore_min_tracks: int = Field(default=12, ge=1, le=100)
     chapterscore_min_hours: float = Field(default=1.5, ge=0.0, le=6.0)
-    # Hard-ish catalogue quality floor (Spotify popularity 0–100). Prefer fewer better tracks.
+    # Hard catalogue quality floor (Spotify popularity 0–100). Prefer fewer better tracks.
     chapterscore_min_popularity: int = Field(
-        default=30,
+        default=40,
         ge=0,
         le=100,
         description="Reject tracks below this Spotify popularity when popularity is known",
     )
     # Reading companion: keep music focus-friendly (not trailer-loud)
     chapterscore_reading_energy_ceiling: float = Field(
-        default=0.68,
-        ge=0.4,
+        default=0.58,
+        ge=0.35,
         le=0.9,
         description="Hard-ish max Spotify energy for reading-safe tracks",
     )
     chapterscore_reading_energy_target_max: float = Field(
-        default=0.56,
-        ge=0.3,
+        default=0.48,
+        ge=0.25,
         le=0.75,
         description="Max mapped reading-safe energy target even for high-energy books",
     )
     chapterscore_max_adjacent_energy_jump: float = Field(
-        default=0.20,
-        ge=0.08,
+        default=0.14,
+        ge=0.06,
         le=0.45,
         description="Preferred max energy delta between adjacent playlist tracks",
+    )
+    chapterscore_reading_energy_band: float = Field(
+        default=0.14,
+        ge=0.06,
+        le=0.35,
+        description="Max |track_energy - reading_target| before a track is dropped as a mood outlier",
     )
     # Spotify resilience — longer budget for thorough cinematic searches
     chapterscore_spotify_timeout: float = Field(

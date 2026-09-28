@@ -102,6 +102,33 @@ def test_keeps_real_soundtrack_cue():
     assert passes_lyrics_filter(t, LyricsPreference.INSTRUMENTAL_ONLY) is True
 
 
+def test_unknown_popularity_rejected_without_strong_signal():
+    from chapterscore.spotify.ranking import passes_popularity_filter
+
+    obscure = _t("u1", "Random Untitled Cue", ["Unknown Bedroom Producer"], popularity=0)
+    known_score = _t("u2", "Cornfield Chase", ["Hans Zimmer"], popularity=0)
+    assert passes_popularity_filter(obscure, 40) is False
+    assert passes_popularity_filter(known_score, 40) is True
+
+
+def test_instrumental_only_rejects_when_features_missing_and_no_cues():
+    from chapterscore.spotify.ranking import InstrumentalStrictness, passes_lyrics_filter
+
+    bare = _t("v1", "Love Song", ["Pop Vocalist"], popularity=60, features={})
+    assert (
+        passes_lyrics_filter(
+            bare, LyricsPreference.INSTRUMENTAL_ONLY, strictness=InstrumentalStrictness.STRICT
+        )
+        is False
+    )
+    assert (
+        passes_lyrics_filter(
+            bare, LyricsPreference.INSTRUMENTAL_ONLY, strictness=InstrumentalStrictness.PERMISSIVE
+        )
+        is False
+    )
+
+
 def test_select_diverse_no_duplicate_compositions():
     tracks = [
         _t("1", "Arrival", ["Max Richter"], popularity=80, score=90),

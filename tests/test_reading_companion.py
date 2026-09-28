@@ -40,15 +40,15 @@ def test_reading_safe_energy_compresses_high_book_energy():
     high = reading_safe_energy_target(0.95, intimacy_vs_epic=0.2)
     assert low < mid <= high
     # Even a very high-energy book stays in a readable band
-    assert high <= 0.56
-    assert high < 0.7
+    assert high <= 0.48
+    assert high < 0.6
 
 
 def test_intimate_book_caps_target_lower():
     high_intimate = reading_safe_energy_target(0.9, intimacy_vs_epic=0.85)
     high_epic_scale = reading_safe_energy_target(0.9, intimacy_vs_epic=0.2)
     assert high_intimate <= high_epic_scale
-    assert high_intimate <= 0.46
+    assert high_intimate <= 0.40
 
 
 def test_rejects_trailer_intensity_for_reading():
@@ -135,13 +135,11 @@ def test_smooth_order_limits_adjacent_jumps():
         _t("d", "Mid D", ["D"], energy=0.42, score=75),
         _t("e", "Soft E", ["E"], energy=0.25, score=65),
     ]
-    # Mark blast as intense so content filter would drop it; smoothing also drops big jumps
-    ordered = smooth_playlist_order(tracks, max_jump=0.20, drop_jarring=True)
+    ordered = smooth_playlist_order(tracks, max_jump=0.14, drop_jarring=True)
     energies = [track_energy_estimate(t) for t in ordered]
-    # No adjacent jump larger than ~0.33 (1.65 * 0.20)
+    # No adjacent jump larger than ~0.19 (1.35 * 0.14)
     for i in range(1, len(energies)):
-        assert abs(energies[i] - energies[i - 1]) <= 0.34
-    # Soft cluster should dominate; blast likely dropped
+        assert abs(energies[i] - energies[i - 1]) <= 0.20
     assert all(e < 0.7 for e in energies) or len(ordered) < len(tracks)
 
 

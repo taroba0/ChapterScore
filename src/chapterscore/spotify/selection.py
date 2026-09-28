@@ -59,6 +59,7 @@ from chapterscore.spotify.ranking import (
     InstrumentalStrictness,
     apply_overall_cohesion,
     dedupe_tracks,
+    drop_reading_band_outliers,
     filter_music_only,
     is_likely_instrumental,
     is_too_intense_for_reading,
@@ -114,15 +115,12 @@ def _rank_raw(
     ranked: list[RankedTrack] = []
     exploration = taste.prefs.exploration if taste else 40
     settings = get_settings()
-    # Quality floor: at least config default (~30); prefs may raise it further
+    # Quality floor: at least config default (~40); prefs may raise it further
     cfg_floor = settings.chapterscore_min_popularity
     pref_floor = taste.prefs.min_popularity if taste else cfg_floor
     min_pop = max(cfg_floor, pref_floor)
     suitable = analysis.style_keywords_good() if analysis else []
     avoid = analysis.style_keywords_bad() if analysis else []
-    # Hard popularity when known; unknown (0) only allowed if the batch is mostly unknown
-    pop_known = sum(1 for t in raw_tracks if (t.get("popularity") or 0) > 0)
-    strict_pop = pop_known >= max(2, len(raw_tracks) // 3)
 
     for t in raw_tracks:
         base = track_dict_to_base(t)
@@ -140,13 +138,11 @@ def _rank_raw(
             continue
         if is_too_intense_for_reading(track):
             continue
-        # Priority 1: hard lyrics / instrumental constraint
+        # Priority 1: hard lyrics / instrumental constraint (outranks taste/recs/fallback)
         if not passes_lyrics_filter(track, lyrics, strictness=strictness):
             continue
-        # Priority 1b: catalogue quality floor (popularity when known)
-        if min_pop > 0 and not passes_popularity_filter(
-            track, min_pop, strict=strict_pop
-        ):
+        # Priority 1b: hard popularity floor — unknown pop needs strong catalogue signal
+        if min_pop > 0 and not passes_popularity_filter(track, min_pop, strict=True):
             continue
         # Soft taste — never overrides content / lyrics / reading continuity / vibe
         affinity = taste.affinity_for_artists(track.artists) if taste else 0.0
@@ -319,8 +315,8 @@ def _target_count(
 def _quality_floor(lyrics: LyricsPreference) -> float:
     """Minimum score to include when quality-first soft targets apply."""
     if lyrics.normalized().is_instrumental_only:
-        return 28.0
-    return 18.0
+        return 32.0
+    return 22.0
 
 
 def _should_search_more(
@@ -376,21 +372,33 @@ def _pick_quality(
             book_energy=book_energy,
             intimacy_vs_epic=intimacy_vs_epic,
         )
+        # Hard-drop mood/energy outliers — shorter cohesive > longer uneven
+        candidates = drop_reading_band_outliers(
+            candidates,
+            book_energy=book_energy,
+            intimacy_vs_epic=intimacy_vs_epic,
+        )
 
     candidates = filter_music_only(candidates)
     floor = _quality_floor(lyrics)
     chosen = select_diverse(
         candidates, target, max_per_artist=max_per_artist, min_score=floor
     )
-    # Only lower the floor if the playlist is still very thin (still no weak padding)
-    if len(chosen) < max(5, int(target * 0.35)):
+    # Only lower the score floor slightly if very thin — never reintroduce outliers
+    if len(chosen) < max(4, int(target * 0.30)):
         chosen = select_diverse(
             candidates,
             target,
             max_per_artist=max_per_artist,
-            min_score=floor * 0.55,
+            min_score=floor * 0.65,
         )
     chosen = filter_music_only(dedupe_tracks(chosen))
+    if cohesive:
+        chosen = drop_reading_band_outliers(
+            chosen,
+            book_energy=book_energy,
+            intimacy_vs_epic=intimacy_vs_epic,
+        )
     if smooth and chosen:
         chosen = smooth_playlist_order(chosen, drop_jarring=True)
     return chosen

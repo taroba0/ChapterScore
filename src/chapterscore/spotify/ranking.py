@@ -40,7 +40,10 @@ _VOCAL_HARD = re.compile(
     r"karaoke|radio\s*edit|official\s*video|music\s*video|"
     r"vocal\s*version|sung\s*version| sing\b|sings\b|singer\b|"
     r"rap\b|rapping|hip[\s-]?hop|r&b|rnb\b|pop\s*hit|"
-    r"feat\.|ft\.|featuring"
+    r"feat\.|ft\.|featuring|"
+    r"spoken\s*word|talk\s*over|voice\s*over|narrat(?:ed|ion|or)|"
+    r"podcast|interview|commentary|"
+    r"duet\b|choir\s*vocals?|gospel\s*vocals?"
     r")\b",
     re.IGNORECASE,
 )
@@ -148,18 +151,18 @@ _KEY_ONLY_TITLE = re.compile(
 # Applies in ALL lyrics modes — prefer false negatives (reject music-adjacent talk).
 _SPEECH_NON_MUSIC = re.compile(
     r"\b("
-    r"podcast|pod\s*cast|"
-    r"interview|interviews|"
-    r"commentary|comment\s*track|audio\s*comment|"
+    r"podcast|pod\s*cast|podcasters?|"
+    r"interview|interviews|interviewed|"
+    r"commentary|comment\s*track|audio\s*comment|comments?\b|"
     r"spoken[\s-]?word|spoken[\s-]?word\s*poetry|"
     r"audiobook|audio[\s-]?book|book\s*on\s*tape|"
-    r"narrat(?:ed|ion|or)|as\s*read\s*by|read\s*by\b|"
-    r"monologue|soliloquy|"
-    r"lecture|sermon|speech\b|keynote|"
+    r"narrat(?:ed|ion|or)|as\s*read\s*by|read\s*by\b|reading\s*of\b|"
+    r"monologue|soliloquy|recitation|"
+    r"lecture|sermon|speech\b|keynote|ted\s*talk|"
     r"talk\s*show|radio\s*show|radio\s*play|radio\s*drama|"
     r"full\s*episode|episode\s*#?\s*\d+|ep\.?\s*#?\s*\d+|"
     r"q\s*&\s*a|q\s*and\s*a|\bama\b|"
-    r"book\s*club|author\s*talk|panel\s*discussion|"
+    r"book\s*club|author\s*talk|panel\s*discussion|roundtable|"
     r"director'?s?\s*commentary|cast\s*commentary|"
     r"behind\s*the\s*scenes\s*interview|"
     r"true\s*crime\s*(podcast|episode)|"
@@ -168,7 +171,8 @@ _SPEECH_NON_MUSIC = re.compile(
     r"affirmations?\b|"
     r"sleep\s*story|bedtime\s*story\b|"
     r"teaser\s*trailer\s*(voice|narration)|"
-    r"voice[\s-]?over\s*only|vo\s*only"
+    r"voice[\s-]?over\s*only|vo\s*only|with\s*spoken\s*word|"
+    r"lyrics?\s*only|acapella\s*spoken"
     r")\b",
     re.IGNORECASE,
 )
@@ -327,13 +331,51 @@ def has_track_level_instrumental_signal(track: RankedTrack) -> bool:
     inst = track.features.get("instrumentalness")
     speech = track.features.get("speechiness")
 
-    if inst is not None and inst >= 0.70 and (speech is None or speech < 0.12):
+    # Any credible vocal/speech cue kills "positive instrumental evidence"
+    if _VOCAL_HARD.search(blob) or _VOCAL_GENRE_BLOCK.search(blob):
+        return False
+    if _SPEECH_NON_MUSIC.search(f"{blob} {artists}"):
+        return False
+    if speech is not None and speech >= 0.10:
+        return False
+
+    if inst is not None and inst >= 0.75 and (speech is None or speech < 0.08):
         return True
-    if _INSTRUMENTAL_CUES.search(blob):
+    # Title/album cues alone are weaker when features are absent — still allowed
+    # only if no vocal markers (already checked) and cue is clear.
+    if _INSTRUMENTAL_CUES.search(name):
         return True
-    if _CINEMATIC_ALBUM.search(album) or _CINEMATIC_ALBUM.search(name):
+    if _INSTRUMENTAL_CUES.search(album) and not _VOCAL_SOFT.search(name):
         return True
+    if _CINEMATIC_ALBUM.search(album) and (
+        _INSTRUMENTAL_CUES.search(blob) or _SCORE_ARTISTS.search(artists)
+    ):
+        return True
+    if _SCORE_ARTISTS.search(artists) and not _VOCAL_HARD.search(name):
+        return True
+    return False
+
+
+def has_strong_catalogue_signal(track: RankedTrack) -> bool:
+    """
+    Strong quality signal used when Spotify popularity is missing/unknown.
+
+    Prefer reject when unsure — obscure empty catalogue should not pad playlists.
+    """
+    artists = _artist_blob(track)
+    name = track.name or ""
+    album = track.album or ""
     if _SCORE_ARTISTS.search(artists):
+        return True
+    # Soundtrack album + clear instrumental title cue + reasonable duration
+    dur = track.duration_ms or 0
+    if (
+        _CINEMATIC_ALBUM.search(album)
+        and _INSTRUMENTAL_CUES.search(name)
+        and 90_000 <= dur <= 480_000
+        and not is_speech_or_non_music(track)
+        and not is_dead_or_exercise_track(track)
+    ):
         return True
     return False
 
@@ -529,13 +571,13 @@ def is_speech_or_non_music(track: RankedTrack) -> bool:
     speech = track.features.get("speechiness")
     inst = track.features.get("instrumentalness")
     # Spotify: >0.66 ≈ entirely spoken; 0.33–0.66 mixed speech/music
+    # Prefer reject: lower thresholds than Spotify's "entirely spoken" docs.
     if speech is not None:
-        if speech >= 0.55:
+        if speech >= 0.45:
             return True  # primarily talking
-        if speech >= 0.40 and (inst is None or inst < 0.35):
+        if speech >= 0.28 and (inst is None or inst < 0.45):
             return True
-        if speech >= 0.33 and (inst is not None and inst < 0.15):
-            # High speech + almost no instrumental content
+        if speech >= 0.22 and (inst is not None and inst < 0.25):
             if not _INSTRUMENTAL_CUES.search(blob) and not _SCORE_ARTISTS.search(artists):
                 return True
 
@@ -627,51 +669,53 @@ def passes_lyrics_filter(
             return False
         return True
 
-    # ── INSTRUMENTAL_ONLY (very strict hard filter) ───────────────────────
-    # Hard negatives — never admit these at any strictness level
+    # ── INSTRUMENTAL_ONLY (airtight hard filter) ──────────────────────────
+    # Hard negatives — never admit at ANY strictness / fallback stage.
+    # matched_query is intentionally ignored here.
     if _VOCAL_HARD.search(blob) or _VOCAL_GENRE_BLOCK.search(blob):
         return False
-    if speech is not None and speech > 0.18:
+    if _SPEECH_NON_MUSIC.search(blob) or _SPEECH_ALBUM_SHOW.search(album):
+        return False
+    if speech is not None and speech > 0.08:
         return False
     if likely is False:
         return False
-    if inst is not None and inst < 0.50:
+    if inst is not None and inst < 0.65:
         return False
     if _VOCAL_SOFT.search(name) and not has_track_level_instrumental_signal(track):
         return False
 
-    # Thresholds by progressive strictness (only relax uncertainty, not vocals)
+    # Progressive stages may relax *uncertainty* only — never admit vocals.
+    # When audio features are missing, be MORE conservative: require positive
+    # track-level instrumental evidence. When unsure → reject.
     if strictness == InstrumentalStrictness.STRICT:
-        if speech is not None and speech > 0.10:
+        if speech is not None and speech > 0.06:
             return False
         if inst is not None:
-            return inst >= 0.75 and (speech is None or speech < 0.10)
-        # No features: require strong track-level cinematic/instrumental evidence
-        return has_track_level_instrumental_signal(track) and likely is not False
+            return inst >= 0.80 and (speech is None or speech < 0.06)
+        return has_track_level_instrumental_signal(track) and likely is True
 
     if strictness == InstrumentalStrictness.MODERATE:
-        if speech is not None and speech > 0.14:
+        if speech is not None and speech > 0.08:
             return False
         if inst is not None:
-            return inst >= 0.62
-        return has_track_level_instrumental_signal(track)
+            return inst >= 0.72 and (speech is None or speech < 0.08)
+        # No features: still require positive instrumental evidence
+        return has_track_level_instrumental_signal(track) and likely is not False
 
     if strictness == InstrumentalStrictness.RELAXED:
-        if speech is not None and speech > 0.16:
+        if speech is not None and speech > 0.08:
             return False
-        if inst is not None and inst < 0.55:
-            return False
-        # Still need positive track-level signal
-        return has_track_level_instrumental_signal(track) or (
-            likely is True and _SCORE_ARTISTS.search(artists)
-        )
+        if inst is not None:
+            return inst >= 0.68 and (speech is None or speech < 0.08)
+        return has_track_level_instrumental_signal(track)
 
-    # PERMISSIVE last resort — still quality-first, still no clear vocals
-    if inst is not None and inst < 0.50:
+    # PERMISSIVE last resort — still no vocals; still need positive evidence
+    if inst is not None and inst < 0.65:
         return False
     if likely is False:
         return False
-    return has_track_level_instrumental_signal(track) or likely is True
+    return has_track_level_instrumental_signal(track)
 
 
 # Genre / style clash tokens (normalized lowercase substrings)
@@ -806,18 +850,22 @@ def reading_safe_energy_target(
     """
     e = 0.5 if book_energy is None else max(0.0, min(1.0, float(book_energy)))
     intimacy = 0.5 if intimacy_vs_epic is None else max(0.0, min(1.0, float(intimacy_vs_epic)))
-    # Soft curve: compress the high end into a readable band
-    compressed = 0.16 + 0.42 * (e**0.9)
+    # Soft curve: compress the high end into a narrow reading band
+    compressed = 0.16 + 0.34 * (e**0.9)
     try:
         from chapterscore.config import get_settings
 
-        tmax = target_max if target_max is not None else get_settings().chapterscore_reading_energy_target_max
+        tmax = (
+            target_max
+            if target_max is not None
+            else get_settings().chapterscore_reading_energy_target_max
+        )
     except Exception:
-        tmax = target_max if target_max is not None else 0.56
+        tmax = target_max if target_max is not None else 0.48
     if intimacy >= 0.7:
-        compressed = min(compressed, 0.46)
+        compressed = min(compressed, 0.40)
     elif intimacy >= 0.55:
-        compressed = min(compressed, 0.52)
+        compressed = min(compressed, 0.44)
     return float(min(tmax, max(0.14, compressed)))
 
 
@@ -1347,14 +1395,22 @@ def passes_popularity_filter(
     strict: bool = True,
 ) -> bool:
     """
-    Popularity gate. When popularity is unknown (0/null from API), allow through
-    so we don't empty the pool on restricted Spotify apps.
+    Hard-ish catalogue quality gate.
+
+    - Known popularity must be ≥ min_popularity (default ~40).
+    - Missing/zero popularity is NOT acceptable by default: require a strong
+      catalogue signal (known score artist / soundtrack+instrumental cue) or reject.
+    - ``strict=False`` still rejects unknown pop unless that strong signal exists
+      (quality over length — never pad with obscure empties).
     """
     if min_popularity <= 0:
         return True
-    if track.popularity <= 0:
-        return not strict  # unknown: keep in soft mode
-    return track.popularity >= min_popularity
+    if track.popularity > 0:
+        return track.popularity >= min_popularity
+    # Unknown popularity
+    if has_strong_catalogue_signal(track):
+        return True
+    return False  # prefer reject when unsure
 
 
 def _norm_title(name: str) -> str:
@@ -1499,7 +1555,7 @@ def apply_overall_cohesion(
     *,
     book_energy: float | None,
     intimacy_vs_epic: float | None = None,
-    max_energy_gap: float = 0.28,
+    max_energy_gap: float | None = None,
 ) -> list[RankedTrack]:
     """
     Soft-penalize tracks far from the *reading-safe* energy target so overall
@@ -1507,20 +1563,70 @@ def apply_overall_cohesion(
     """
     target = reading_safe_energy_target(book_energy, intimacy_vs_epic=intimacy_vs_epic)
     ceiling = reading_energy_ceiling()
+    try:
+        from chapterscore.config import get_settings
+
+        gap_lim = (
+            max_energy_gap
+            if max_energy_gap is not None
+            else float(get_settings().chapterscore_reading_energy_band)
+        )
+    except Exception:
+        gap_lim = max_energy_gap if max_energy_gap is not None else 0.14
     adjusted: list[RankedTrack] = []
     for t in tracks:
         te = track_energy_estimate(t)
         if te > ceiling:
-            t.score = round(t.score * 0.2, 3)
+            t.score = round(t.score * 0.15, 3)
         else:
             fit = reading_energy_fit(te, target, ceiling=ceiling)
-            # Pull scores toward reading-safe center
-            t.score = round(t.score * (0.55 + 0.55 * fit), 3)
+            t.score = round(t.score * (0.5 + 0.55 * fit), 3)
             gap = abs(te - target)
-            if gap > max_energy_gap:
-                t.score = round(t.score * max(0.35, 1.0 - 1.3 * (gap - max_energy_gap)), 3)
+            if gap > gap_lim:
+                t.score = round(t.score * max(0.25, 1.0 - 1.8 * (gap - gap_lim)), 3)
         adjusted.append(t)
     return adjusted
+
+
+def drop_reading_band_outliers(
+    tracks: list[RankedTrack],
+    *,
+    book_energy: float | None = None,
+    intimacy_vs_epic: float | None = None,
+    max_dev: float | None = None,
+) -> list[RankedTrack]:
+    """
+    Hard-drop tracks outside the narrow reading energy band around the target.
+
+    Prefer a shorter cohesive playlist over keeping a scene-matched intensity spike.
+    """
+    if not tracks:
+        return []
+    target = reading_safe_energy_target(book_energy, intimacy_vs_epic=intimacy_vs_epic)
+    try:
+        from chapterscore.config import get_settings
+
+        band = (
+            max_dev
+            if max_dev is not None
+            else float(get_settings().chapterscore_reading_energy_band)
+        )
+    except Exception:
+        band = max_dev if max_dev is not None else 0.14
+    ceiling = reading_energy_ceiling()
+    kept: list[RankedTrack] = []
+    for t in tracks:
+        te = track_energy_estimate(t)
+        if te > ceiling:
+            continue
+        if abs(te - target) > band:
+            continue
+        kept.append(t)
+    # If the band was too tight and wiped the list, keep the closest half by |e-target|
+    if not kept and tracks:
+        ranked = sorted(tracks, key=lambda t: abs(track_energy_estimate(t) - target))
+        kept = [t for t in ranked[: max(3, len(ranked) // 2)] if track_energy_estimate(t) <= ceiling]
+    return kept
 
 
 def smooth_playlist_order(
@@ -1546,7 +1652,7 @@ def smooth_playlist_order(
             else float(get_settings().chapterscore_max_adjacent_energy_jump)
         )
     except Exception:
-        jump = max_jump if max_jump is not None else 0.20
+        jump = max_jump if max_jump is not None else 0.14
 
     remaining = list(tracks)
     remaining.sort(key=track_energy_estimate)
@@ -1579,8 +1685,8 @@ def smooth_playlist_order(
             key=lambda it: abs(track_energy_estimate(it[1]) - last_e),
         )
         delta = abs(track_energy_estimate(closest) - last_e)
-        if drop_jarring and delta > jump * 1.65:
-            # Prefer fewer continuous tracks over a focus-breaking jump
+        # Tighter than before: drop sooner (1.35× jump ≈ 0.19 with default 0.14)
+        if drop_jarring and delta > jump * 1.35:
             remaining.pop(i)
             continue
         ordered.append(remaining.pop(i))

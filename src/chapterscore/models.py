@@ -100,7 +100,7 @@ class PersonalizationPrefs(BaseModel):
     # Default leans comfort (user wants familiarity); 0=comfort, 100=explore
     exploration: int = Field(default=25, ge=0, le=100)
     # Spotify popularity floor (0–100). Tracks below this are rejected when pop is known.
-    min_popularity: int = Field(default=30, ge=0, le=100)
+    min_popularity: int = Field(default=40, ge=0, le=100)
 
     @property
     def comfort(self) -> float:

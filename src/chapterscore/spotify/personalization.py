@@ -175,10 +175,12 @@ def _target_features(
     if atmospheres & {"melancholic", "dark"} and atmospheres & {"hopeful"}:
         valence = 0.4
 
+    from chapterscore.spotify.ranking import reading_energy_ceiling
+
     targets: dict[str, float] = {
-        "target_energy": max(0.05, min(0.75, energy)),
+        "target_energy": max(0.05, min(0.55, energy)),
         "target_valence": max(0.05, min(0.95, valence)),
-        "max_energy": 0.72,  # reading companion ceiling hint for Recommendations API
+        "max_energy": reading_energy_ceiling(),
     }
     mode = lyrics.normalized()
     if mode is LyricsPreference.INSTRUMENTAL_ONLY:
@@ -249,7 +251,8 @@ def recommendations_for_vibe(
 
     targets = _target_features(analysis, lyrics)
     # Popularity floor from prefs
-    min_pop = max(0, profile.prefs.min_popularity - 5)
+    # Keep Recommendations near the hard quality floor (do not undercut it much)
+    min_pop = max(0, max(profile.prefs.min_popularity, 40) - 5)
 
     kwargs: dict[str, Any] = {
         "limit": min(limit, 100),

@@ -27,7 +27,6 @@ import streamlit as st
 
 from chapterscore import __version__
 from chapterscore.books.aggregator import search_book_candidates
-from chapterscore.books.wikipedia import quick_chapter_list_available
 from chapterscore.config import get_settings, reload_settings
 from chapterscore.exceptions import ChapterScoreError
 from chapterscore.models import (
@@ -59,7 +58,6 @@ SS_CANDIDATES = "cs_candidates"  # list[BookMetadata dumps] from multi-search
 SS_CANDIDATE_IDX = "cs_candidate_idx"  # selected radio index
 SS_LOOKUP_TITLE = "cs_lookup_title"
 SS_LOOKUP_AUTHOR = "cs_lookup_author"
-SS_HAS_CHAPTERS = "cs_has_real_chapters"  # cheap chapter-list hint
 SS_READING_HOURS = "cs_reading_hours"  # float, user-editable estimate
 SS_RESULT = "cs_last_result"  # last generation snapshot for display
 
@@ -202,29 +200,17 @@ def recommend_playlist_hours(reading_hours: float) -> float:
     return round(min(3.0, max(0.5, rh * 0.4)), 1)
 
 
-def has_chapter_data_hint(book: BookMetadata) -> bool:
-    """
-    Cheap Step 1 signal for enabling Chapter mode later.
-
-    Uses either a real chapter list (if present) or the quick Wikipedia
-    section-index hint from ``lookup_book_quick`` — never requires full plot download.
-    """
-    if book.chapters and len(book.chapters) >= 3 and not (book.raw or {}).get("synthetic_chapters"):
-        return True
-    return bool((book.raw or {}).get("quick_chapter_hint"))
-
-
 def _reset_step1_state() -> None:
     for k in (
         SS_STEP1_DONE,
         SS_BOOK,
         SS_CANDIDATES,
         SS_CANDIDATE_IDX,
-        SS_HAS_CHAPTERS,
         SS_READING_HOURS,
         SS_RESULT,
         "step1_reading_hours",
         "step1_pick_radio",
+        "cs_has_real_chapters",  # legacy key cleanup
     ):
         st.session_state.pop(k, None)
 
@@ -493,22 +479,7 @@ def _render_step1(settings) -> None:
             use_container_width=True,
             key="btn_confirm_book",
         ):
-            # Optional cheap chapter hint only for the confirmed pick
-            has_ch = has_chapter_data_hint(book)
-            if not has_ch:
-                try:
-                    has_ch = bool(
-                        quick_chapter_list_available(
-                            book.title,
-                            book.authors[0] if book.authors else None,
-                        )
-                    )
-                except Exception:
-                    has_ch = False
-            book.raw = {**(book.raw or {}), "quick_chapter_hint": has_ch}
-
             st.session_state[SS_BOOK] = book.model_dump(mode="json")
-            st.session_state[SS_HAS_CHAPTERS] = has_ch
             st.session_state[SS_READING_HOURS] = float(reading_hours)
             st.session_state["step1_reading_hours"] = float(reading_hours)
             st.session_state[SS_STEP1_DONE] = True
@@ -517,7 +488,6 @@ def _render_step1(settings) -> None:
     # ── Confirmed summary (after Continue) ───────────────────────────────
     if confirmed and st.session_state.get(SS_BOOK):
         book = BookMetadata.model_validate(st.session_state[SS_BOOK])
-        has_ch = bool(st.session_state.get(SS_HAS_CHAPTERS))
         rh = float(st.session_state.get(SS_READING_HOURS) or estimate_reading_hours(book.page_count))
         st.success(
             f"Confirmed: **{book.display_name}**"
@@ -526,8 +496,7 @@ def _render_step1(settings) -> None:
             + f" · ~{rh:g} h reading estimate"
         )
         st.caption(
-            ("Chapter mode available. " if has_ch else "Chapter mode disabled (no chapter-list signal). ")
-            + "Step 2 is unlocked — full vibe analysis runs when you generate."
+            "Step 2 is unlocked — generate builds one cohesive overall reading playlist."
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
@@ -547,17 +516,10 @@ def _render_step2(settings) -> None:
 
     if not unlocked:
         st.caption(
-            "🔒 Complete Step 1 and confirm the book to unlock mode, length, "
+            "🔒 Complete Step 1 and confirm the book to unlock length, "
             "lyrics, and personalization controls."
         )
         # Greyed-out preview of controls (disabled)
-        st.selectbox(
-            "Mode",
-            options=["Overall", "Chapter"],
-            index=0,
-            disabled=True,
-            key="locked_mode",
-        )
         st.number_input(
             "Playlist length (hours, soft target)",
             min_value=0.0,
@@ -597,9 +559,8 @@ def _render_step2(settings) -> None:
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    # ── Unlocked controls ────────────────────────────────────────────────
+    # ── Unlocked controls (always overall / reading-companion playlist) ──
     book = BookMetadata.model_validate(st.session_state[SS_BOOK])
-    has_ch = bool(st.session_state.get(SS_HAS_CHAPTERS))
     reading_h = float(st.session_state.get(SS_READING_HOURS) or 6.0)
     rec_hours = recommend_playlist_hours(reading_h)
 
@@ -609,43 +570,15 @@ def _render_step2(settings) -> None:
         f"recommended playlist **~{rec_hours:g} h** (soft)"
     )
     st.caption(
-        "Generating runs the full literary vibe analysis + Spotify search "
-        "(deferred from Step 1 so lookup stays fast)."
+        "Builds one cohesive overall reading playlist (literary vibe analysis + Spotify). "
+        "Chapter-by-chapter mode is not offered in the web UI."
     )
 
-    # 1. Mode
-    if has_ch:
-        mode_label = st.radio(
-            "1. Mode",
-            options=["Overall", "Chapter"],
-            index=0,
-            horizontal=True,
-            help=(
-                "Overall = one cohesive emotional world (shuffle-friendly). "
-                "Chapter = ordered by narrative sections."
-            ),
-            key="step2_mode",
-        )
-    else:
-        mode_label = "Overall"
-        st.radio(
-            "1. Mode",
-            options=["Overall"],
-            index=0,
-            horizontal=True,
-            help="Only Overall is available for this book.",
-            key="step2_mode_overall_only",
-        )
-        st.info(
-            "Chapter mode is disabled because no usable chapter-by-chapter synopsis "
-            "was found for this book in public sources."
-        )
-
-    # 2. Playlist length (soft)
-    st.markdown("**2. Playlist length**")
+    # 1. Playlist length (soft)
+    st.markdown("**1. Playlist length**")
     st.caption(
         f"Recommended **~{rec_hours:g} hours** from your reading-time estimate "
-        f"({reading_h:g} h). This is a soft preference — quality matching wins over padding."
+        f"({reading_h:g} h). Soft preference — quality and continuity win over padding."
     )
     length_choice = st.radio(
         "Length preference",
@@ -686,23 +619,24 @@ def _render_step2(settings) -> None:
     else:
         min_hours = 0.0
 
-    # 3. Lyrics
+    # 2. Lyrics
     lyrics_label = st.selectbox(
-        "3. Lyrics preference",
+        "2. Lyrics preference",
         options=["Allow lyrics", "Prefer instrumental", "Instrumental only"],
         index=0,
         help=(
             "Allow lyrics = vocals OK · Prefer instrumental = soft bias · "
-            "Instrumental only = hard no-vocals filter (Top Artists still allowed)"
+            "Instrumental only = hard reject for any credible vocals/speech "
+            "(Top Artists still allowed as a soft seed)"
         ),
         key="step2_lyrics",
     )
 
-    # 4. Taste / exploration / recommendations
-    st.markdown("**4. Personalization**")
+    # 3. Taste / exploration / recommendations
+    st.markdown("**3. Personalization**")
     st.caption(
-        "Priority: **(1)** vocals policy → **(2)** book style → "
-        "**(3)** exploration → **(4)** Top Artists (soft)."
+        "Priority: **(1)** vocals / content safety → **(2)** book atmosphere → "
+        "**(3)** quality floor → **(4)** exploration → **(5)** Top Artists (soft)."
     )
     taste_label = st.selectbox(
         "Personal taste (Top Artists)",
@@ -756,8 +690,8 @@ def _render_step2(settings) -> None:
         key="step2_dry_run",
     )
 
-    # 5. Generate
-    st.markdown("**5. Generate**")
+    # 4. Generate
+    st.markdown("**4. Generate**")
     gen_clicked = st.button(
         "Generate Playlist",
         type="primary",
@@ -770,8 +704,8 @@ def _render_step2(settings) -> None:
     if not gen_clicked:
         return
 
-    # ── Generate using existing pipeline ─────────────────────────────────
-    mode = Mode.CHAPTER if mode_label == "Chapter" and has_ch else Mode.OVERALL
+    # ── Generate using existing pipeline (web = overall only) ────────────
+    mode = Mode.OVERALL
     lyrics = _map_lyrics(lyrics_label)
     taste_map = {
         "disable": TasteStrength.DISABLE,
@@ -783,6 +717,7 @@ def _render_step2(settings) -> None:
         taste_strength=taste_map[taste_label],
         use_recommendations=bool(use_recs),
         exploration=int(exploration),
+        min_popularity=max(40, get_settings().chapterscore_min_popularity),
     )
 
     need_spotify = not dry_run
