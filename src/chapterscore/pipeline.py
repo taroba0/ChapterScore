@@ -20,7 +20,8 @@ from chapterscore.models import (
 )
 from chapterscore.spotify.auth import get_spotify
 from chapterscore.spotify.playlist import build_playlist_description, create_playlist_from_tracks
-from chapterscore.spotify.selection import select_tracks_for_analysis
+from chapterscore.spotify.ranking import total_duration_ms
+from chapterscore.spotify.selection import format_duration_report, select_tracks_for_analysis
 
 if TYPE_CHECKING:
     import spotipy
@@ -38,6 +39,9 @@ class GenerateResult:
     analysis: BookVibeAnalysis
     tracks: list[RankedTrack] = field(default_factory=list)
     playlist: PlaylistResult | None = None
+    requested_hours: float | None = None
+    actual_hours: float = 0.0
+    duration_report: str = ""
 
 
 def generate_playlist(
@@ -144,6 +148,15 @@ def generate_playlist(
             ),
         )
 
+    actual_hours = total_duration_ms(selected) / 3_600_000
+    duration_report = format_duration_report(selected, min_hours)
+    progress(duration_report)
+    if min_hours and min_hours > 0 and actual_hours < float(min_hours) * 0.88:
+        progress(
+            "Note: playlist is under the requested duration because the in-style "
+            "pool was exhausted — quality/setting fit was preserved (no mismatched padding)."
+        )
+
     lyrics_label = {
         LyricsPreference.ALLOW_LYRICS: "allow lyrics",
         LyricsPreference.PREFER_INSTRUMENTAL: "prefer instrumental",
@@ -178,6 +191,9 @@ def generate_playlist(
 
     return GenerateResult(
         book=book,
+        requested_hours=float(min_hours) if min_hours and min_hours > 0 else None,
+        actual_hours=actual_hours,
+        duration_report=duration_report,
         analysis=analysis,
         tracks=selected,
         playlist=playlist,

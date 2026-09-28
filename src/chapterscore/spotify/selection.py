@@ -7,7 +7,9 @@ Design principles:
   - Hard lyrics / instrumental constraint when selected
   - Composition-level de-dupe (one best version of each work)
   - Popularity quality floor (prefer fewer better tracks)
-  - Soft length targets (quality over padding to hours/count)
+  - Duration (min_hours) is a serious target: keep searching in-style until
+    ~88% of requested hours (or the in-style pool is exhausted)
+  - Never pad with mismatched generic cinema to hit hours
   - Overall mode: cohesive, shuffle-friendly emotional world
   - Chapter mode: section progression, not minute-by-minute reading sync
 
@@ -15,11 +17,12 @@ Fallback stages (overall mode):
   1. Expanded vibe queries + STRICT instrumental filter
   2. Same candidate pool + MODERATE filter
   3. Broadened queries + RELAXED filter
-  4. Cinematic/soundtrack fallback bank + RELAXED filter
-  5. Same bank + PERMISSIVE filter (quality floor still applies)
+  4. World-gated cinematic / pastoral bank
+  5. In-style deep fill rounds (same style universe; duration-aware)
+  6. Pastoral emergency only for realist worlds (never spectacle pad)
 
-Chapter mode runs a lighter ladder per chapter, then a soft global fill
-only when still thin.
+Chapter mode runs a lighter ladder per chapter, then in-style global fill
+when still under the duration target.
 """
 
 from __future__ import annotations
@@ -54,6 +57,7 @@ from chapterscore.spotify.queries import (
     cinematic_fallback_queries,
     expand_chapter_queries,
     expand_queries_from_analysis,
+    in_style_deep_fill_queries,
     is_realist_literary_world,
     vibe_instrumental_queries,
     world_locked_queries,
@@ -320,19 +324,32 @@ def _merge_unique(*pools: list[RankedTrack]) -> list[RankedTrack]:
     return list(best.values())
 
 
+# When the user sets min_hours, keep searching until we reach this fraction.
+_DURATION_FILL_RATIO = 0.88
+# Count fill when hours are requested (serious, not 60% soft).
+_COUNT_FILL_RATIO_WITH_HOURS = 0.85
+# Count-only mode (no min_hours): slightly soft.
+_COUNT_FILL_RATIO_COUNT_ONLY = 0.70
+
+
+def _playlist_hours(tracks: list[RankedTrack]) -> float:
+    return total_duration_ms(tracks) / 3_600_000
+
+
 def _target_count(
     *,
     tracks_requested: int,
     min_tracks: int | None,
     min_hours: float | None,
 ) -> int:
-    """Soft upper aim for track count (quality may stop earlier)."""
+    """Upper aim for track count derived from request + duration."""
     n = max(tracks_requested, min_tracks or 0)
-    # Duration → rough track estimate (~3.5 min/track); still a soft aim only
+    # Duration → track estimate (~3.5 min/track). Serious when hours are set.
     if min_hours and min_hours > 0:
-        est = int((min_hours * 60) / 3.5) + 1
+        est = int((min_hours * 60) / 3.5) + 2
         n = max(n, est)
-    return min(n, 100)
+    # Allow long listening sessions (e.g. 3–6h) without an artificial 100 cap
+    return min(n, 160)
 
 
 def _quality_floor(lyrics: LyricsPreference) -> float:
@@ -350,23 +367,57 @@ def _should_search_more(
     quality_floor: float = 0.0,
 ) -> bool:
     """
-    Whether to keep searching for more candidates.
+    Whether to keep searching for more in-style candidates.
 
-    Soft: stop once we have a solid quality set near ~60% of the target
-    (or a reasonable duration). Never treat length as a hard requirement.
+    When ``min_hours`` is set it is a **serious** duration target: keep
+    searching until ~88% of requested hours (or the pool is exhausted by
+    the caller). Never pad with out-of-style / generic cinema tracks —
+    that gate lives in query selection, not here.
     """
     if not tracks:
         return True
     good = [t for t in tracks if t.score >= quality_floor] if quality_floor > 0 else tracks
-    soft_n = max(6, int(target * 0.6)) if target else 6
-    if len(good) < soft_n:
+    if not good:
         return True
+
+    hours = _playlist_hours(good)
+
     if min_hours and min_hours > 0:
-        hours = total_duration_ms(good) / 3_600_000
-        # Only keep searching if substantially under the soft duration aim
-        if hours < min_hours * 0.55:
+        # Duration is the primary stop condition
+        if hours < min_hours * _DURATION_FILL_RATIO:
             return True
-    return False
+        # Still thin on count vs hour-derived target → keep going a bit
+        need_n = max(8, int(target * _COUNT_FILL_RATIO_WITH_HOURS)) if target else 8
+        if len(good) < need_n and hours < min_hours * 0.95:
+            return True
+        return False
+
+    # Count-only mode
+    soft_n = max(6, int(target * _COUNT_FILL_RATIO_COUNT_ONLY)) if target else 6
+    return len(good) < soft_n
+
+
+def format_duration_report(
+    tracks: list[RankedTrack],
+    min_hours: float | None,
+) -> str:
+    """Human-readable requested vs actual duration (for CLI/UI)."""
+    actual = _playlist_hours(tracks)
+    actual_min = total_duration_ms(tracks) / 60_000
+    if min_hours and min_hours > 0:
+        req_min = min_hours * 60.0
+        pct = (actual / min_hours) * 100.0 if min_hours else 0.0
+        if actual + 1e-9 < min_hours * _DURATION_FILL_RATIO:
+            status = "under target — in-style pool may be exhausted"
+        elif actual + 1e-9 < min_hours * 0.95:
+            status = "near target"
+        else:
+            status = "on target"
+        return (
+            f"Requested ~{min_hours:g} h ({req_min:.0f} min) · "
+            f"Actual {actual:.2f} h ({actual_min:.0f} min, {pct:.0f}%) · {status}"
+        )
+    return f"Actual duration {actual:.2f} h ({actual_min:.0f} min) · {len(tracks)} tracks"
 
 
 def _pick_quality(
@@ -463,13 +514,22 @@ def select_tracks_for_analysis(
     prefs = personalization or PersonalizationPrefs()
     lyrics = lyrics.normalized()
 
+    # Longer listening requests need more search wall-clock (still capped)
+    base_budget = settings.chapterscore_spotify_collection_budget
+    if min_hours and min_hours >= 2.0:
+        budget_seconds = min(600.0, base_budget * max(1.0, float(min_hours) / 1.5))
+    elif min_hours and min_hours >= 1.0:
+        budget_seconds = min(420.0, base_budget * 1.25)
+    else:
+        budget_seconds = base_budget
     session = start_search_session(
-        budget_seconds=settings.chapterscore_spotify_collection_budget,
+        budget_seconds=budget_seconds,
         hard_timeout=settings.chapterscore_spotify_timeout,
     )
     progress(
         f"Spotify search session: {session.hard_timeout:.0f}s/call, "
         f"{session.budget_seconds:.0f}s total budget"
+        + (f" (scaled for min_hours={min_hours:g})" if min_hours and min_hours >= 1.0 else "")
     )
     progress(f"Lyrics policy: {lyrics.display_label} (hard filter when instrumental-only)")
 
@@ -565,14 +625,21 @@ def _select_overall(
     )
     q_floor = _quality_floor(lyrics)
     progress(
-        f"Selecting up to ~{target} tracks (soft target; quality first"
+        f"Selecting up to ~{target} tracks (quality + style first"
         f"; requested={tracks_requested}"
-        + (f", min_hours={min_hours}" if min_hours else "")
+        + (
+            f", min_hours={min_hours:g} — serious duration target"
+            if min_hours and min_hours > 0
+            else ""
+        )
         + ")…"
     )
 
     session = get_search_session()
     max_art = _max_per_artist(taste.prefs.exploration)
+    # Long sessions need slightly higher per-artist allowance inside the same style
+    if min_hours and min_hours >= 2.0:
+        max_art = max(max_art, 3)
 
     def _stage_ok() -> bool:
         return not session.budget_exhausted()
@@ -589,10 +656,16 @@ def _select_overall(
             smooth=True,
         )
         if chosen:
+            hrs = _playlist_hours(chosen)
             progress(
                 f"✓ {label}: {len(chosen)} tracks "
-                f"(duration ≈ {total_duration_ms(chosen) / 60000:.0f} min; "
-                f"soft aim was ~{target}; reading-smoothed)"
+                f"(≈ {hrs * 60:.0f} min / {hrs:.2f} h"
+                + (
+                    f"; aim {min_hours:g} h"
+                    if min_hours and min_hours > 0
+                    else f"; aim ~{target} tracks"
+                )
+                + "; reading-smoothed)"
             )
         return chosen
 
@@ -650,26 +723,29 @@ def _select_overall(
             )
 
     # ── Stage 1: book-vibe first (always) ──────────────────────────────────
+    long_session = bool(min_hours and min_hours >= 2.0)
     if lyrics.is_instrumental_only:
         progress(
             "Stage 1 — Book-vibe instrumental search "
             f"(mood={analysis.overall_mood!r}, energy={analysis.overall_energy:.2f}; "
             "strict no-vocals; cohesive overall world)"
+            + (f"; filling toward {min_hours:g} h" if min_hours else "")
         )
-        primary_specs = vibe_instrumental_queries(analysis, max_queries=20)
+        primary_specs = vibe_instrumental_queries(analysis, max_queries=24 if long_session else 20)
         for sq in expand_queries_from_analysis(
-            analysis, lyrics, max_queries=10, cohesive_overall=True
+            analysis, lyrics, max_queries=14 if long_session else 10, cohesive_overall=True
         ):
             primary_specs.append(sq)
         if personal_specs:
             # Soft personal seeds after book vibe (instrumental-flavored)
             primary_specs = primary_specs + personal_specs[:4]
         strict1 = InstrumentalStrictness.STRICT
-        early1 = max(140, target * 9)
-        limit_q = 30
+        # Larger raw pools when aiming for multi-hour playlists
+        early1 = max(200 if long_session else 140, target * (10 if long_session else 9))
+        limit_q = 40 if long_session else 30
     else:
         primary_specs = expand_queries_from_analysis(
-            analysis, lyrics, max_queries=14, cohesive_overall=True
+            analysis, lyrics, max_queries=18 if long_session else 14, cohesive_overall=True
         )
         if personal_specs and taste.prefs.exploration <= 55:
             primary_specs = personal_specs[:6] + primary_specs
@@ -677,8 +753,8 @@ def _select_overall(
             primary_specs = personal_specs[:3] + primary_specs
         progress(f"Stage 1 — {len(primary_specs)} book-vibe + taste queries (cohesive overall)")
         strict1 = InstrumentalStrictness.PERMISSIVE
-        early1 = max(100, target * 6)
-        limit_q = None
+        early1 = max(160 if long_session else 100, target * (8 if long_session else 6))
+        limit_q = 30 if long_session else None
 
     pool1 = _search_pool(
         sp,
@@ -757,12 +833,12 @@ def _select_overall(
         if patience_world:
             progress(
                 f"Stage 4 — pastoral / world-locked expansion only "
-                f"(skipping generic cinema; {len(chosen)}/~{target} so far)"
+                f"(skipping generic cinema; {len(chosen)}/~{target} so far, "
+                f"≈ {_playlist_hours(chosen) * 60:.0f} min)"
             )
-            cinema = cinematic_fallback_queries(analysis, lyrics, max_queries=8)
-            # cinematic_fallback already redirects to pastoral for this world;
-            # also prepend explicit world-locked queries.
-            cinema = list(world_locked_queries(analysis, lyrics, max_queries=8)) + list(cinema)
+            cinema = list(world_locked_queries(analysis, lyrics, max_queries=10)) + list(
+                cinematic_fallback_queries(analysis, lyrics, max_queries=10)
+            )
         else:
             progress(
                 f"Stage 4 — cinematic fallback bank ({len(chosen)}/~{target} so far)"
@@ -771,12 +847,13 @@ def _select_overall(
         if cinema:
             pool4 = _search_pool(
                 sp,
-                cinema[:10],
+                cinema[:14],
                 lyrics,
                 strictness=strictness3,
                 progress=progress,
                 label="4/pastoral" if patience_world else "4/cinematic",
-                early_stop_raw=60,
+                early_stop_raw=120 if (min_hours and min_hours >= 2) else 80,
+                limit_per_query=30 if (min_hours and min_hours >= 2) else None,
                 taste=taste,
                 analysis=analysis,
             )
@@ -785,52 +862,78 @@ def _select_overall(
             if chosen and not _should_search_more(
                 chosen, target, min_hours, quality_floor=q_floor
             ):
+                progress(format_duration_report(chosen, min_hours))
                 return chosen
 
-    # ── Stage 5: last resort (instrumental-only still hard-blocks vocals) ──
-    # Patience: for realist worlds, prefer returning fewer tracks over spectacle fill.
-    if patience_world and chosen and len(chosen) >= max(8, int(target * 0.35)):
+    # ── Stage 5: in-style deep fill (same universe; no spectacle pad) ──────
+    # Keep searching adjacent pastoral / era-correct artists until duration
+    # is near min_hours or the in-style pool stops growing.
+    max_fill_rounds = 4 if (min_hours and min_hours >= 2.0) else 2
+    prev_n = len(chosen)
+    for fill_round in range(1, max_fill_rounds + 1):
+        if not _should_search_more(chosen, target, min_hours, quality_floor=q_floor):
+            break
+        if not _stage_ok() or session.rate_limited:
+            progress("Stage 5 — stopping deep fill (search budget / rate limit)")
+            break
         progress(
-            f"Stage 5 — skipped (patience over fill; {len(chosen)} cohesive tracks "
-            "beats generic cinema padding)"
+            f"Stage 5 — in-style deep fill round {fill_round}/{max_fill_rounds} "
+            f"({len(chosen)}/~{target}, ≈ {_playlist_hours(chosen) * 60:.0f} min"
+            + (f" / aim {min_hours:g} h" if min_hours else "")
+            + "; same style band only)"
         )
-        return chosen
-
-    progress(
-        f"Stage 5 — last-resort quality pick ({len(chosen)}/~{target} so far; no weak padding)"
-    )
-    if lyrics.is_instrumental_only and _stage_ok() and not session.rate_limited:
-        stage5_specs = (cinema or cinematic_fallback_queries(analysis, lyrics, max_queries=4))[:4]
-        if stage5_specs:
-            pool5 = _search_pool(
-                sp,
-                stage5_specs,
-                lyrics,
-                strictness=InstrumentalStrictness.PERMISSIVE,
-                progress=progress,
-                label="5/permissive",
-                early_stop_raw=40,
-                taste=taste,
-                analysis=analysis,
-            )
-            pool = _merge_unique(pool, pool5)
-
-    chosen = _finalize(pool, label="Stage 5")
-    if chosen:
-        if patience_world:
+        fill_specs = in_style_deep_fill_queries(
+            analysis,
+            lyrics,
+            fill_round=fill_round,
+            max_queries=14,
+        )
+        if not fill_specs and cinema:
+            fill_specs = cinema[:8]
+        if not fill_specs:
+            break
+        pool5 = _search_pool(
+            sp,
+            fill_specs,
+            lyrics,
+            strictness=InstrumentalStrictness.RELAXED
+            if lyrics.is_instrumental_only
+            else InstrumentalStrictness.PERMISSIVE,
+            progress=progress,
+            label=f"5/in-style-r{fill_round}",
+            early_stop_raw=140 if (min_hours and min_hours >= 2) else 80,
+            limit_per_query=30,
+            taste=taste,
+            analysis=analysis,
+        )
+        pool = _merge_unique(pool, pool5)
+        chosen = _finalize(pool, label=f"Stage 5r{fill_round}")
+        # Stop if the in-style pool is exhausted (no new keepers)
+        if len(chosen) <= prev_n:
             progress(
-                f"✓ Returning {len(chosen)} world-fit tracks "
-                "(quality + setting fit > hours target)"
+                "Stage 5 — in-style pool not growing; stopping deep fill "
+                "(will not pad with mismatched cinema)"
             )
+            break
+        prev_n = len(chosen)
+
+    if chosen and not _should_search_more(chosen, target, min_hours, quality_floor=q_floor):
+        progress(format_duration_report(chosen, min_hours))
         return chosen
 
-    # Absolute last ditch — NEVER generic cinema for realist / intimate literary worlds
+    # ── Stage 6: last ditch inside style universe (never generic cinema for realist)
+    if chosen and not _should_search_more(chosen, target, min_hours, quality_floor=q_floor):
+        progress(format_duration_report(chosen, min_hours))
+        return chosen
+
     if patience_world:
         progress(
             "Stage 6 — pastoral emergency only "
             "(generic cinematic orchestral soundtrack blocked for this world)"
         )
-        emergency_specs = world_locked_queries(analysis, lyrics, max_queries=4)
+        emergency_specs = in_style_deep_fill_queries(
+            analysis, lyrics, fill_round=3, max_queries=8
+        ) or world_locked_queries(analysis, lyrics, max_queries=6)
         if not emergency_specs:
             emergency_q = (
                 "pastoral americana instrumental"
@@ -847,22 +950,31 @@ def _select_overall(
         )
         emergency_specs = [SearchQuerySpec(query=emergency_q, reason="emergency")]
 
-    pool6 = _search_pool(
-        sp,
-        emergency_specs,
-        lyrics,
-        strictness=InstrumentalStrictness.RELAXED
-        if lyrics.is_instrumental_only
-        else InstrumentalStrictness.PERMISSIVE,
-        progress=progress,
-        label="6/pastoral-emergency" if patience_world else "6/emergency",
-        limit_per_query=50,
-        taste=taste,
-        analysis=analysis,
-    )
-    chosen = _finalize(pool6, label="Emergency")
+    if _stage_ok() and not session.rate_limited:
+        pool6 = _search_pool(
+            sp,
+            emergency_specs,
+            lyrics,
+            strictness=InstrumentalStrictness.RELAXED
+            if lyrics.is_instrumental_only
+            else InstrumentalStrictness.PERMISSIVE,
+            progress=progress,
+            label="6/pastoral-emergency" if patience_world else "6/emergency",
+            limit_per_query=50,
+            early_stop_raw=100,
+            taste=taste,
+            analysis=analysis,
+        )
+        pool = _merge_unique(pool, pool6)
+        chosen = _finalize(pool, label="Emergency")
+
     if chosen:
-        progress(f"✓ Emergency net returned {len(chosen)} tracks")
+        progress(format_duration_report(chosen, min_hours))
+        if min_hours and min_hours > 0 and _playlist_hours(chosen) < min_hours * _DURATION_FILL_RATIO:
+            progress(
+                "⚠ Shortfall: in-style catalogue exhausted before reaching requested duration. "
+                "Quality + setting fit preserved (no mismatched cinema padding)."
+            )
     else:
         progress("✗ No tracks found even with emergency fallback")
     return chosen
@@ -956,14 +1068,15 @@ def _select_chapter(
     q_floor = _quality_floor(lyrics)
     if _should_search_more(final, target, min_hours, quality_floor=q_floor):
         progress(
-            f"Global fill — playlist has {len(final)} tracks, soft aim ~{target} "
-            "(quality first)"
+            f"Global fill — playlist has {len(final)} tracks, aim ~{target}"
+            + (f" / {min_hours:g} h" if min_hours else "")
+            + " (quality + style first)"
         )
         unused = [t for t in global_pool if t.id not in seen_ids]
         extra = select_diverse(
             unused,
             max(0, target - len(final)),
-            max_per_artist=2,
+            max_per_artist=max(max_art, 3) if (min_hours and min_hours >= 2) else 2,
             min_score=q_floor * 0.7,
         )
         for t in extra:
@@ -978,12 +1091,12 @@ def _select_chapter(
         )
         if patience_world:
             progress(
-                "Global fill — pastoral / world-locked only "
-                "(generic cinema blocked; patience over fill)"
+                "Global fill — in-style deep fill only "
+                "(generic cinema blocked)"
             )
-            cinema = list(world_locked_queries(analysis, lyrics, max_queries=8)) + list(
-                cinematic_fallback_queries(analysis, lyrics, max_queries=8)
-            )
+            cinema = list(world_locked_queries(analysis, lyrics, max_queries=10))
+            cinema += in_style_deep_fill_queries(analysis, lyrics, fill_round=1, max_queries=10)
+            cinema += in_style_deep_fill_queries(analysis, lyrics, fill_round=2, max_queries=10)
             fill_label = "global/pastoral"
         else:
             progress("Global fill — cinematic bank (only if still thin)")
@@ -1000,13 +1113,15 @@ def _select_chapter(
                 seen_ids=seen_ids,
                 progress=progress,
                 label=fill_label,
+                early_stop_raw=140 if (min_hours and min_hours >= 2) else 80,
+                limit_per_query=30,
                 taste=taste,
                 analysis=analysis,
             )
             extra = select_diverse(
                 [t for t in pool_c if t.id not in seen_ids],
                 max(0, target - len(final)),
-                max_per_artist=max(max_art, 2),
+                max_per_artist=max(max_art, 3),
                 min_score=q_floor * 0.55,
             )
             for t in extra:
@@ -1018,6 +1133,7 @@ def _select_chapter(
     final = filter_music_only(dedupe_tracks(final))
     progress(
         f"Chapter mode assembled {len(final)} tracks "
-        f"(soft aim ~{target}; progression by section, not minute-sync)"
+        f"(aim ~{target}; progression by section, not minute-sync)"
     )
+    progress(format_duration_report(final, min_hours))
     return final

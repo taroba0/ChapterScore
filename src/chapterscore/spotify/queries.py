@@ -239,6 +239,115 @@ _PASTORAL_REALIST_SEEDS = [
     "1900s rural america score",
 ]
 
+# Adjacent artists / textures inside the same pastoral-realist family (deep fill)
+_PASTORAL_ADJACENT_EXPAND = [
+    "philip glass solo piano",
+    "arvo part spiegel",
+    "george winston",
+    "bill frisell instrumental",
+    "pat metheny quiet",
+    "keith jarrett koln quiet",
+    "erik satie gymnopedie",
+    "debussy clair de lune instrumental",
+    "michael nyman piano",
+    "craig armstrong quiet",
+    "dino saluzzi",
+    "quiet americana score",
+    "midwest rural instrumental",
+    "orchard acoustic instrumental",
+    "farmland ambient piano",
+    "slow acoustic folk instrumental",
+    "melancholy banjo instrumental",
+    "cello solo melancholic",
+    "viola chamber quiet",
+    "harmonium ambient folk",
+    "wistful harmonica instrumental",
+    "dust bowl piano score",
+    "california farmland score",
+    "family saga quiet score",
+    "moral drama piano instrumental",
+    "small town documentary music",
+    "ken burns style score",
+    "ry cooder paris texas instrumental",
+    "daniel lanois ambient",
+]
+
+
+def in_style_deep_fill_queries(
+    analysis: BookVibeAnalysis,
+    lyrics: LyricsPreference,
+    *,
+    fill_round: int = 1,
+    max_queries: int = 14,
+) -> list[SearchQuerySpec]:
+    """
+    Extra queries inside the book's locked style universe for duration fill.
+
+    Never injects spectacle / Potter / racing / sci-fi banks. Used when the
+    playlist is still under the requested min_hours.
+    """
+    out: list[SearchQuerySpec] = []
+    seen: set[str] = set()
+    energy = analysis.overall_energy if analysis.overall_energy is not None else 0.45
+    energy = min(energy, 0.5)
+    realist = is_realist_literary_world(analysis)
+    allow_cinema = allows_generic_cinematic_fallback(analysis)
+
+    def add(q: str, reason: str) -> None:
+        key = " ".join(q.lower().split())
+        if not key or key in seen:
+            return
+        if (realist or not allow_cinema) and _query_is_spectacle(key):
+            return
+        seen.add(key)
+        if lyrics.normalized().is_instrumental_only and not any(
+            k in key for k in ("instrumental", "score", "soundtrack", "piano", "ambient", "strings")
+        ):
+            q = f"{q} instrumental"
+        out.append(
+            SearchQuerySpec(
+                query=q,
+                energy=energy,
+                instrumentalness_min=0.75 if lyrics.normalized().is_instrumental_only else None,
+                mood_keywords=list(analysis.atmospheres or [])[:3],
+                reason=reason,
+            )
+        )
+
+    # Round 1: world-lock + pastoral core; Round 2+: adjacent artists/textures
+    if fill_round <= 1:
+        for sq in world_locked_queries(analysis, lyrics, max_queries=8):
+            add(sq.query, reason=f"fill-world:{sq.reason or 'lock'}")
+        for q in _PASTORAL_REALIST_SEEDS:
+            add(q, reason="fill-pastoral")
+            if len(out) >= max_queries:
+                break
+    else:
+        offset = (fill_round - 2) * max_queries
+        chunk = _PASTORAL_ADJACENT_EXPAND[offset : offset + max_queries]
+        if not chunk:
+            chunk = list(_PASTORAL_ADJACENT_EXPAND)
+        for q in chunk:
+            add(q, reason=f"fill-adjacent:r{fill_round}")
+        for style in (analysis.suitable_styles or [])[:6]:
+            s = style.strip()
+            if s:
+                add(f"{s} instrumental", reason="fill-style")
+        if analysis.era_feel:
+            add(f"{analysis.era_feel} quiet instrumental", reason="fill-era")
+        if analysis.setting_texture:
+            words = " ".join(analysis.setting_texture.split()[:5])
+            add(f"{words} score", reason="fill-setting")
+
+    # Intimate neoclassical always safe as adjacent for literary realism
+    if realist or not allow_cinema:
+        for q in _INTIMATE_INSTRUMENTAL[:8]:
+            add(q, reason="fill-intimate")
+            if len(out) >= max_queries:
+                break
+
+    return out[:max_queries]
+
 # Intimate / emotional instrumental (bittersweet novels, character drama)
 _INTIMATE_INSTRUMENTAL = [
     "max richter",

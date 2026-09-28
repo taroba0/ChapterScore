@@ -521,7 +521,7 @@ def _render_step2(settings) -> None:
         )
         # Greyed-out preview of controls (disabled)
         st.number_input(
-            "Playlist length (hours, soft target)",
+            "Playlist length (hours)",
             min_value=0.0,
             max_value=6.0,
             value=1.5,
@@ -567,18 +567,19 @@ def _render_step2(settings) -> None:
     st.caption(
         f"Book: **{book.display_name}** · "
         f"reading estimate **{reading_h:g} h** · "
-        f"recommended playlist **~{rec_hours:g} h** (soft)"
+        f"recommended playlist **~{rec_hours:g} h**"
     )
     st.caption(
         "Builds one cohesive overall reading playlist (literary vibe analysis + Spotify). "
         "Chapter-by-chapter mode is not offered in the web UI."
     )
 
-    # 1. Playlist length (soft)
+    # 1. Playlist length (serious duration aim; never pad with mismatched cinema)
     st.markdown("**1. Playlist length**")
     st.caption(
         f"Recommended **~{rec_hours:g} hours** from your reading-time estimate "
-        f"({reading_h:g} h). Soft preference — quality and continuity win over padding."
+        f"({reading_h:g} h). Treated as a serious target — fills longer inside the "
+        "book’s style universe; will not pad with loud/mismatched cinema."
     )
     length_choice = st.radio(
         "Length preference",
@@ -599,17 +600,18 @@ def _render_step2(settings) -> None:
         min_hours = rec_hours
     elif length_choice == "Custom hours":
         min_hours = st.number_input(
-            "Target hours (soft)",
+            "Target hours",
             min_value=0.5,
             max_value=6.0,
             value=float(rec_hours),
             step=0.25,
+            help="Serious duration aim — fills in-style until close.",
             key="step2_custom_hours",
         )
     elif length_choice == "Track count instead":
         min_hours = 0.0
         tracks_overall = st.number_input(
-            "Target tracks (soft)",
+            "Target tracks",
             min_value=8,
             max_value=80,
             value=20,
@@ -808,6 +810,9 @@ def _render_step2(settings) -> None:
         "playlist_title": result.analysis.playlist_title_suggestion or "",
         "styles": list(result.analysis.suitable_styles or [])[:8],
         "avoid": list(result.analysis.avoid_styles or [])[:8],
+        "requested_hours": result.requested_hours,
+        "actual_hours": result.actual_hours,
+        "duration_report": result.duration_report,
         "tracks": [
             {
                 "name": t.name,
@@ -855,6 +860,36 @@ def _render_results() -> None:
             c2.markdown("**Avoid:** " + ", ".join(snap["avoid"]))
     st.caption(f"**{snap.get('book_title', '—')}**")
 
+    # Requested vs actual duration
+    req_h = snap.get("requested_hours")
+    act_h = snap.get("actual_hours")
+    if req_h or act_h or snap.get("duration_report"):
+        st.markdown("##### Duration")
+        d1, d2, d3 = st.columns(3)
+        d1.metric(
+            "Requested",
+            f"{req_h:g} h" if isinstance(req_h, (int, float)) and req_h else "—",
+        )
+        d2.metric(
+            "Actual",
+            f"{act_h:.2f} h" if isinstance(act_h, (int, float)) and act_h else "—",
+        )
+        if isinstance(req_h, (int, float)) and req_h and isinstance(act_h, (int, float)):
+            pct = (act_h / req_h) * 100.0
+            d3.metric("Fill", f"{pct:.0f}%")
+        if snap.get("duration_report"):
+            st.caption(snap["duration_report"])
+        if (
+            isinstance(req_h, (int, float))
+            and req_h
+            and isinstance(act_h, (int, float))
+            and act_h < req_h * 0.88
+        ):
+            st.warning(
+                "Under the requested duration — in-style pool exhausted. "
+                "Quality and setting fit were preserved (no mismatched cinema padding)."
+            )
+
     if dry:
         st.markdown("##### Would create")
         st.write(f"**{snap.get('playlist_title') or 'ChapterScore playlist'}**")
@@ -866,6 +901,9 @@ def _render_results() -> None:
     pl = snap.get("playlist")
     if pl:
         st.markdown("##### Your playlist")
+        dur_bits = f"{pl.get('track_count', 0)} tracks"
+        if isinstance(act_h, (int, float)) and act_h:
+            dur_bits += f" · {act_h:.2f} h"
         st.markdown(
             f"""
             <div class="result-card">
@@ -873,7 +911,7 @@ def _render_results() -> None:
                 {pl.get("name", "Playlist")}
               </div>
               <div style="color:#64748b;margin-bottom:0.75rem;">
-                {pl.get("track_count", 0)} tracks
+                {dur_bits}
               </div>
             </div>
             """,

@@ -186,7 +186,11 @@ def generate_cmd(
     min_hours: Optional[float] = typer.Option(
         None,
         "--min-hours",
-        help="Soft length aim in hours (default: 1.5). 0 disables. Quality preferred over padding.",
+        help=(
+            "Requested playlist length in hours (default: 1.5). 0 disables. "
+            "Treated as a serious target — fills in-style until close; "
+            "will not pad with mismatched cinema."
+        ),
         min=0.0,
         max=6.0,
     ),
@@ -517,13 +521,31 @@ def generate_cmd(
             t_table.add_row(*row)
         console.print(t_table)
 
+    if result.tracks and (result.duration_report or result.requested_hours is not None):
+        console.print()
+        console.print(
+            Panel(
+                result.duration_report
+                or f"{len(result.tracks)} tracks · {result.actual_hours:.2f} h",
+                border_style="cyan",
+                box=box.ROUNDED,
+                title="Duration",
+            )
+        )
+
     if result.playlist:
         console.print()
         console.print(
             Panel(
                 f"[bold green]Playlist created[/bold green]\n\n"
                 f"[bold]{result.playlist.name}[/bold]\n"
-                f"{result.playlist.track_count} tracks\n\n"
+                f"{result.playlist.track_count} tracks"
+                + (
+                    f" · {result.actual_hours:.2f} h"
+                    if result.actual_hours
+                    else ""
+                )
+                + "\n\n"
                 f"[link={result.playlist.url}]{result.playlist.url}[/link]",
                 border_style="green",
                 box=box.ROUNDED,
