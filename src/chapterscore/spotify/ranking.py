@@ -729,7 +729,60 @@ _STYLE_ALIASES: dict[str, tuple[str, ...]] = {
     "comedy": ("comedy", "parody", "novelty"),
     "children": ("kids ", "children", "nursery"),
     "gospel": ("gospel choir vocal", "worship vocal"),
+    # Spectacle / wrong-world banks (hard-ish for realist literary books)
+    "magical": ("magical", "magic", "wizard", "witch", "hogwarts", "harry potter", "spell"),
+    "magic": ("magical", "magic", "wizard", "witch", "hogwarts", "harry potter"),
+    "fantasy adventure": ("harry potter", "hogwarts", "lord of the rings", "hobbit", "dragon quest"),
+    "epic trailer": (
+        "two steps from hell",
+        "thomas bergersen",
+        "audiomachine",
+        "trailer music",
+        "hybrid trailer",
+        "epic orchestral",
+        "war drums",
+        "brass fanfare",
+    ),
+    "epic": ("epic battle", "epic orchestral", "trailer music", "two steps from hell"),
+    "modern spectacle": ("formula 1", "f1 theme", "racing", "sports anthem", "stadium rock"),
+    "racing": ("formula 1", "f1 ", "grand prix", "racing theme", "motorsport"),
+    "sci-fi": ("sci-fi", "scifi", "space opera", "star wars", "blade runner", "interstellar main"),
+    "science fiction": ("sci-fi", "scifi", "space opera", "star wars", "cyberpunk"),
+    "futuristic": ("futuristic", "cyber", "synthwave neon", "space opera"),
+    "trailer": ("trailer music", "hybrid trailer", "two steps from hell", "audiomachine"),
+    "battle": ("battle theme", "war drums", "epic battle", "combat orchestral"),
 }
+
+
+# Tracks that clash hard with realist / historical / rural literary worlds
+_SPECTACLE_WORLD_MISMATCH = re.compile(
+    r"("
+    r"harry\s*potter|hogwarts|hedwig|wizard(?:ing)?|witchcraft|"
+    r"lord\s*of\s*the\s*rings|the\s*hobbit|game\s*of\s*thrones|"
+    r"star\s*wars|star\s*trek|blade\s*runner|interstellar\s*main|"
+    r"formula\s*1|f1\s*(theme|anthem|soundtrack|music)|grand\s*prix|"
+    r"racing\s*(theme|anthem|soundtrack)|motorsport|"
+    r"two\s*steps\s*from\s*hell|thomas\s*bergersen|audiomachine|"
+    r"immediate\s*music|hybrid\s*trailer|trailer\s*music|"
+    r"avengers|transformers|man\s*of\s*steel|superhero|"
+    r"pirates\s*of\s*the\s*caribbean|gladiator\s*main|"
+    r"john\s*williams.*(?:force|jedi|potter|indiana)|"
+    r"space\s*opera|sci[- ]?fi\s*(epic|battle|trailer)"
+    r")",
+    re.IGNORECASE,
+)
+
+_PASTORAL_FIT_MARKERS = re.compile(
+    r"("
+    r"pastoral|americana|folk|acoustic|chamber|documentary|"
+    r"countryside|rural|dusty|sparse|melanchol|quiet|"
+    r"thomas\s*newman|rachel\s*portman|mark\s*isham|"
+    r"gustavo\s*santaolalla|aaron\s*copland|nick\s*cave|"
+    r"warren\s*ellis|max\s*richter|nils\s*frahm|"
+    r"piano|strings|guitar"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def style_clash_score(
@@ -739,22 +792,58 @@ def style_clash_score(
     avoid: list[str] | None = None,
 ) -> float:
     """
-    Return a multiplier in ~[0.15, 1.25] for book-style fit.
+    Return a multiplier in ~[0.05, 1.25] for book-style fit.
 
     Priority 2 after lyrics: heavily penalize avoid_styles, boost suitable.
+    Avoid matches are hard-ish (near-kill) so popular instrumental mismatches
+    (Potter, racing, trailer-epic) cannot dominate realist books.
     """
     blob = f"{track.name} {track.album} {' '.join(track.artists)} {track.matched_query}".lower()
     mult = 1.0
+    hard_clash = False
 
     for style in avoid or []:
         s = style.lower().strip()
         if not s:
             continue
-        aliases = _STYLE_ALIASES.get(s, ())
+        # Resolve aliases by exact key or substring key match
+        aliases: tuple[str, ...] = ()
+        if s in _STYLE_ALIASES:
+            aliases = _STYLE_ALIASES[s]
+        else:
+            for key, vals in _STYLE_ALIASES.items():
+                if key in s or s in key:
+                    aliases = vals
+                    break
         tokens = (s,) + aliases
         if any(tok in blob for tok in tokens if len(tok) >= 3):
-            mult *= 0.2  # hard stylistic clash
+            hard_clash = True
+            # Near-kill: setting/style mismatch outweighs popularity
+            mult *= 0.08
             break
+
+    # Explicit spectacle markers vs avoid language about magic/epic/modern
+    avoid_blob = " ".join(avoid or []).lower()
+    if any(
+        k in avoid_blob
+        for k in (
+            "magic",
+            "magical",
+            "fantasy",
+            "epic",
+            "trailer",
+            "spectacle",
+            "racing",
+            "sci-fi",
+            "scifi",
+            "modern",
+            "battle",
+            "loud",
+        )
+    ):
+        if _SPECTACLE_WORLD_MISMATCH.search(blob):
+            hard_clash = True
+            mult *= 0.06
 
     hits = 0
     for style in suitable or []:
@@ -767,23 +856,140 @@ def style_clash_score(
         mult *= min(1.25, 1.0 + 0.08 * hits)
 
     # Soft boost for score artists only when suitable styles invite them
-    suitable_l = " ".join(suitable or []).lower()
-    if any(
-        k in suitable_l
-        for k in (
-            "orchestral",
-            "soundtrack",
-            "ambient",
-            "cinematic",
-            "score",
-            "neoclassical",
-            "piano",
-        )
-    ):
-        if _SCORE_ARTISTS.search(" ".join(track.artists or "")):
-            mult *= 1.08
+    # (and not when we already hard-clashed)
+    if not hard_clash:
+        suitable_l = " ".join(suitable or []).lower()
+        if any(
+            k in suitable_l
+            for k in (
+                "orchestral",
+                "soundtrack",
+                "ambient",
+                "cinematic",
+                "score",
+                "neoclassical",
+                "piano",
+                "pastoral",
+                "folk",
+                "americana",
+            )
+        ):
+            if _SCORE_ARTISTS.search(" ".join(track.artists or "")):
+                mult *= 1.08
 
-    return max(0.15, min(1.35, mult))
+    return max(0.05, min(1.35, mult))
+
+
+def style_clash_near_kill(
+    track: RankedTrack,
+    *,
+    suitable: list[str] | None = None,
+    avoid: list[str] | None = None,
+    threshold: float = 0.12,
+) -> bool:
+    """True when avoid_styles clash is severe enough to drop the track."""
+    if not avoid:
+        return False
+    return style_clash_score(track, suitable=suitable, avoid=avoid) <= threshold
+
+
+def is_world_style_mismatch(
+    track: RankedTrack,
+    *,
+    intimacy_vs_epic: float | None = None,
+    realism_vs_dreaminess: float | None = None,
+    era_feel: str | None = None,
+    setting_texture: str | None = None,
+    avoid_styles: list[str] | None = None,
+    anti_generic_notes: list[str] | None = None,
+    overall_mood: str | None = None,
+    suitable_styles: list[str] | None = None,
+    book_title: str | None = None,
+    authors: list[str] | None = None,
+) -> bool:
+    """
+    Hard-ish gate: reject tracks whose world clashes with the book's setting/era.
+
+    Example kills: F1 / racing vs 1900s farm valley; Harry Potter / magical
+    adventure vs classic realist literature; sci-fi trailer vs rural California.
+    """
+    blob = f"{track.name} {track.album} {' '.join(track.artists)} {track.matched_query}".lower()
+    world = " ".join(
+        [
+            era_feel or "",
+            setting_texture or "",
+            overall_mood or "",
+            " ".join(avoid_styles or []),
+            " ".join(anti_generic_notes or []),
+            " ".join(suitable_styles or []),
+            book_title or "",
+            " ".join(authors or []),
+        ]
+    ).lower()
+    intimacy = 0.5 if intimacy_vs_epic is None else float(intimacy_vs_epic)
+    dream = 0.4 if realism_vs_dreaminess is None else float(realism_vs_dreaminess)
+
+    realist_keys = (
+        "realist",
+        "realism",
+        "pastoral",
+        "rural",
+        "farm",
+        "valley",
+        "small-town",
+        "small town",
+        "dusty",
+        "earthy",
+        "americana",
+        "salinas",
+        "historical",
+        "19th",
+        "victorian",
+        "edwardian",
+        "depression",
+        "dust bowl",
+        "domestic",
+        "literary",
+        "steinbeck",
+        "melanchol",
+        "moral",
+    )
+    is_realist = sum(1 for k in realist_keys if k in world) >= 2 or (
+        intimacy >= 0.55 and dream <= 0.45 and any(k in world for k in realist_keys)
+    )
+    blocks_spectacle = any(
+        k in world
+        for k in (
+            "not epic",
+            "no epic",
+            "not magical",
+            "not fantasy",
+            "not sci-fi",
+            "not trailer",
+            "not spectacle",
+            "not battle",
+            "not racing",
+            "avoid magical",
+            "avoid epic",
+        )
+    ) or any(
+        k in " ".join(avoid_styles or []).lower()
+        for k in ("magic", "magical", "epic", "trailer", "racing", "sci-fi", "spectacle", "fantasy")
+    )
+
+    if not (is_realist or blocks_spectacle or intimacy >= 0.6):
+        return False
+
+    if _SPECTACLE_WORLD_MISMATCH.search(blob):
+        # Allow if track is clearly pastoral-fit (rare false positive protection)
+        if _PASTORAL_FIT_MARKERS.search(blob) and not re.search(
+            r"harry\s*potter|hogwarts|formula\s*1|f1\s|racing|two\s*steps",
+            blob,
+            re.I,
+        ):
+            return False
+        return True
+    return False
 
 
 _EPIC_TRAILER_MARKERS = re.compile(
@@ -1115,11 +1321,40 @@ def book_vibe_multiplier(
             mult *= 1.12
         if _EPIC_TRAILER_MARKERS.search(blob):
             mult *= 0.55
-    if any(k in world_blob for k in ("realist", "contemporary", "domestic", "everyday")):
-        if _EPIC_TRAILER_MARKERS.search(blob):
-            mult *= 0.4
-        if any(k in blob for k in ("indie", "piano", "acoustic", "chamber", "neoclassical")):
-            mult *= 1.08
+    if any(
+        k in world_blob
+        for k in (
+            "realist",
+            "contemporary",
+            "domestic",
+            "everyday",
+            "pastoral",
+            "rural",
+            "farm",
+            "valley",
+            "americana",
+            "historical",
+            "small-town",
+            "small town",
+        )
+    ):
+        if _EPIC_TRAILER_MARKERS.search(blob) or _SPECTACLE_WORLD_MISMATCH.search(blob):
+            mult *= 0.12  # near-kill: Potter / F1 / trailer vs realist world
+        if any(
+            k in blob
+            for k in (
+                "indie",
+                "piano",
+                "acoustic",
+                "chamber",
+                "neoclassical",
+                "pastoral",
+                "folk",
+                "americana",
+                "documentary",
+            )
+        ):
+            mult *= 1.12
 
     # Even "epic world" books: modest lift for adventurous texture, not trailer banks
     if epic_world and not intimate_book:

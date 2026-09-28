@@ -9,28 +9,234 @@ from chapterscore.models import (
     SearchQuerySpec,
 )
 
+
+def literary_world_blob(analysis: BookVibeAnalysis) -> str:
+    """Concatenate literary world signals for world-type detection."""
+    parts = [
+        analysis.era_feel or "",
+        analysis.setting_texture or "",
+        analysis.sensory_atmosphere or "",
+        analysis.overall_mood or "",
+        analysis.tone or "",
+        analysis.distinctive_signature or "",
+        analysis.genre_peers_contrast or "",
+        analysis.writing_style or "",
+        analysis.narrative_voice or "",
+        analysis.pacing_profile or "",
+        analysis.pacing or "",
+        " ".join(analysis.atmospheres or []),
+        " ".join(analysis.dominant_tones or []),
+        " ".join(analysis.secondary_tones or []),
+        " ".join(analysis.key_themes or []),
+        " ".join(analysis.suitable_styles or []),
+        " ".join(analysis.anti_generic_notes or []),
+        " ".join(analysis.avoid_styles or []),
+        analysis.book_title or "",
+    ]
+    return " ".join(parts).lower()
+
+
+def is_realist_literary_world(analysis: BookVibeAnalysis) -> bool:
+    """
+    Classic realist / historical / rural / small-town literary fiction.
+
+    These books must NOT fall into generic Williams/Potter/Zimmer/racing banks.
+    """
+    blob = literary_world_blob(analysis)
+    intimacy = analysis.intimacy_vs_epic if analysis.intimacy_vs_epic is not None else 0.5
+    dream = analysis.realism_vs_dreaminess if analysis.realism_vs_dreaminess is not None else 0.4
+
+    realist_keys = (
+        "realist",
+        "realism",
+        "literary",
+        "pastoral",
+        "rural",
+        "farm",
+        "valley",
+        "small-town",
+        "small town",
+        "dusty",
+        "earthy",
+        "americana",
+        "salinas",
+        "california",
+        "midwest",
+        "frontier",
+        "homestead",
+        "historical",
+        "19th",
+        "victorian",
+        "edwardian",
+        "depression-era",
+        "dust bowl",
+        "moral",
+        "melanchol",
+        "domestic",
+        "everyday",
+        "quiet life",
+        "steinbeck",
+        "family saga",
+        "coming-of-age",
+    )
+    spectacle_keys = (
+        "space opera",
+        "sci-fi",
+        "science fiction",
+        "cyber",
+        "magic",
+        "wizard",
+        "hogwarts",
+        "mythic epic",
+        "superhero",
+        "galactic",
+        "dystopian war",
+        "dragon",
+        "quest fantasy",
+    )
+    hits = sum(1 for k in realist_keys if k in blob)
+    spectacle = any(k in blob for k in spectacle_keys)
+    # High intimacy + low dreaminess strongly implies grounded literary world
+    if intimacy >= 0.55 and dream <= 0.45 and hits >= 1:
+        return True
+    if hits >= 2 and not spectacle:
+        return True
+    if hits >= 1 and intimacy >= 0.6 and not spectacle:
+        return True
+    return False
+
+
+def allows_generic_cinematic_fallback(analysis: BookVibeAnalysis) -> bool:
+    """
+    Whether Stage 4–6 generic cinema/composer banks are allowed.
+
+    Blocked for intimate books and realist/historical/rural/literary worlds.
+    """
+    intimacy = analysis.intimacy_vs_epic if analysis.intimacy_vs_epic is not None else 0.5
+    if intimacy >= 0.55:
+        return False
+    if is_realist_literary_world(analysis):
+        return False
+    anti = " ".join(analysis.anti_generic_notes or []).lower()
+    avoid = " ".join(analysis.avoid_styles or []).lower()
+    if any(
+        k in anti or k in avoid
+        for k in (
+            "not epic",
+            "no epic",
+            "not trailer",
+            "not cinematic",
+            "not battle",
+            "not magical",
+            "not fantasy",
+            "not sci-fi",
+            "not spectacle",
+        )
+    ):
+        return False
+    return True
+
+
+def world_locked_queries(
+    analysis: BookVibeAnalysis,
+    lyrics: LyricsPreference,
+    *,
+    max_queries: int = 14,
+) -> list[SearchQuerySpec]:
+    """
+    Genre-narrow-first queries: lock a small style universe from setting/era/emotion
+    before any generic cinema expansion.
+    """
+    out: list[SearchQuerySpec] = []
+    seen: set[str] = set()
+    energy = analysis.overall_energy if analysis.overall_energy is not None else 0.45
+    inst = lyrics.normalized().is_instrumental_only or lyrics.prefers_instrumental
+
+    def add(q: str, reason: str) -> None:
+        key = " ".join(q.lower().split())
+        if not key or key in seen:
+            return
+        seen.add(key)
+        if inst and not any(
+            k in key for k in ("instrumental", "score", "soundtrack", "piano", "ambient", "strings")
+        ):
+            q = f"{q} instrumental"
+        out.append(
+            SearchQuerySpec(
+                query=q,
+                energy=energy,
+                instrumentalness_min=0.75 if lyrics.normalized().is_instrumental_only else None,
+                mood_keywords=list(analysis.atmospheres or [])[:3],
+                reason=reason,
+            )
+        )
+
+    # Setting / era lock
+    if analysis.era_feel:
+        words = " ".join(analysis.era_feel.split()[:6])
+        add(f"{words} pastoral instrumental", reason="world-era")
+        add(f"{words} chamber strings", reason="world-era2")
+    if analysis.setting_texture:
+        words = " ".join(analysis.setting_texture.split()[:6])
+        add(f"{words} instrumental", reason="world-setting")
+    for tone in (analysis.dominant_tones or [])[:4]:
+        add(f"{tone} acoustic instrumental", reason=f"world-tone:{tone}")
+    if analysis.overall_mood:
+        add(f"{analysis.overall_mood} sparse piano", reason="world-mood")
+
+    for style in (analysis.suitable_styles or [])[:8]:
+        s = style.strip()
+        if s:
+            add(s if "instrumental" in s.lower() else f"{s} instrumental", reason="world-style")
+
+    # Realist / rural family — explicit positive universe
+    if is_realist_literary_world(analysis):
+        for q in _PASTORAL_REALIST_SEEDS:
+            add(q, reason="world-pastoral")
+            if len(out) >= max_queries:
+                break
+
+    return out[:max_queries]
+
+
 # Seed banks used when LLM queries are sparse or need broadening.
+# Prefer book-world banks; generic cinema is gated separately.
 _INSTRUMENTAL_SEEDS = [
-    "cinematic orchestral soundtrack",
-    "epic film score instrumental",
+    "melancholic piano instrumental",
+    "neoclassical piano strings",
+    "intimate acoustic instrumental",
+    "quiet reflective guitar instrumental",
     "dark ambient atmosphere",
     "tense thriller underscore",
-    "melancholic piano instrumental",
     "post rock instrumental build",
-    "neoclassical piano strings",
-    "desert ambient soundscape",
-    "adventure orchestral theme",
-    "mysterious ambient drone",
-    "triumphant brass fanfare instrumental",
-    "intimate acoustic instrumental",
-    "hybrid orchestral trailer music",
-    "space ambient atmospheric",
-    "ethnic world fusion instrumental",
-    "choir ethereal ambient no vocals",
-    "war drums epic percussion instrumental",
     "hopeful cinematic piano",
     "ominous low brass score",
-    "quiet reflective guitar instrumental",
+    "mysterious ambient drone",
+    "desert ambient soundscape",
+    # Kept but low priority / gated for realist books:
+    "cinematic orchestral soundtrack",
+    "adventure orchestral theme",
+]
+
+_PASTORAL_REALIST_SEEDS = [
+    "pastoral americana instrumental",
+    "rural folk instrumental melancholic",
+    "dusty acoustic guitar instrumental",
+    "sparse piano countryside",
+    "chamber folk strings quiet",
+    "documentary score pastoral",
+    "small town melancholy instrumental",
+    "earthy acoustic instrumental",
+    "thomas newman quiet piano",
+    "mark isham pastoral",
+    "rachel portman",
+    "james newton howard quiet",
+    "gustavo santaolalla",
+    "nick cave warren ellis instrumental",
+    "aaron copland quiet americana",
+    "appalachian ambient instrumental",
+    "salinas valley mood instrumental",
+    "1900s rural america score",
 ]
 
 # Intimate / emotional instrumental (bittersweet novels, character drama)
@@ -192,13 +398,20 @@ def vibe_instrumental_queries(
         if len(t) > 2:
             add(f"{t} instrumental piano", reason="theme")
 
+    # 0) World-locked universe FIRST (setting/era/emotion family)
+    for sq in world_locked_queries(
+        analysis,
+        LyricsPreference.INSTRUMENTAL_ONLY,
+        max_queries=10,
+    ):
+        add(sq.query, reason=sq.reason or "world-lock")
+
     # Literary multi-dimensional cues (anti-generic differentiation)
     for tone in (analysis.dominant_tones or [])[:4]:
         add(f"{tone} instrumental", reason=f"tone:{tone}")
     if analysis.narrative_voice:
         add(f"{analysis.narrative_voice} instrumental piano", reason="voice")
     if analysis.setting_texture:
-        # First few distinctive words of setting
         words = " ".join(analysis.setting_texture.split()[:5])
         if len(words) > 4:
             add(f"{words} instrumental", reason="setting")
@@ -220,15 +433,19 @@ def vibe_instrumental_queries(
         add("dreamy ambient soundscape", reason="dreamy")
         add("surreal ethereal instrumental", reason="dreamy")
 
-    # 2) Band-appropriate artist/style seeds (not always epic)
-    if band == "intimate":
+    realist = is_realist_literary_world(analysis)
+    # 2) Band-appropriate seeds — NEVER epic/trailer banks for realist literary worlds
+    if realist:
+        seeds = _PASTORAL_REALIST_SEEDS + _INTIMATE_INSTRUMENTAL[:10]
+        progress_label = "pastoral"
+    elif band == "intimate":
         seeds = _INTIMATE_INSTRUMENTAL
         progress_label = "intimate"
-    elif band == "epic":
+    elif band == "epic" and allows_generic_cinematic_fallback(analysis):
         seeds = _EPIC_CINEMATIC + _DRAMA_CINEMATIC[:4]
         progress_label = "epic"
     else:
-        seeds = _DRAMA_CINEMATIC + _INTIMATE_INSTRUMENTAL[:8]
+        seeds = _DRAMA_CINEMATIC[:4] + _INTIMATE_INSTRUMENTAL[:10]
         progress_label = "drama"
 
     for q in seeds:
@@ -239,13 +456,14 @@ def vibe_instrumental_queries(
     if analysis.era_feel:
         add(f"{analysis.era_feel} instrumental", reason="era")
 
-    # Light cinematic only when it fits the band (not forced for intimate books)
-    if band == "intimate":
+    # Soft cinema only inside the book's family — never epic spectacle for realist
+    if realist or band == "intimate":
         add("delicate film score piano", reason="soft-cine")
         add("nostalgic neoclassical score", reason="soft-cine")
+        add("quiet documentary score", reason="soft-cine")
     elif band == "drama":
         add("emotional film score strings", reason="soft-cine")
-    else:
+    elif allows_generic_cinematic_fallback(analysis):
         add("epic film score instrumental", reason="soft-cine")
 
     return out[:max_queries]
@@ -363,6 +581,30 @@ def _spec(
     )
 
 
+_SPECTACLE_QUERY_BLOCK = (
+    "harry potter",
+    "hogwarts",
+    "john williams",
+    "two steps from hell",
+    "formula 1",
+    "f1 ",
+    " racing",
+    "sci-fi",
+    "scifi",
+    "space opera",
+    "hybrid trailer",
+    "epic battle",
+    "triumphant brass",
+    "war drums",
+    "hans zimmer",
+)
+
+
+def _query_is_spectacle(text: str) -> bool:
+    low = f" {text.lower()} "
+    return any(k in low for k in _SPECTACLE_QUERY_BLOCK)
+
+
 def expand_queries_from_analysis(
     analysis: BookVibeAnalysis,
     lyrics: LyricsPreference,
@@ -373,7 +615,9 @@ def expand_queries_from_analysis(
     """
     Build a diverse query list from LLM output + atmosphere/genre seeds.
 
-    Dedupes by normalized query text while preserving order (LLM first).
+    Genre-narrow-then-expand: world-locked setting/era/emotion queries come
+    first. Spectacle / sci-fi / epic banks are skipped for realist literary
+    worlds. Dedupes by normalized query text.
 
     When ``cohesive_overall`` is True (overall mode), skip emotional-act
     extremes far from the book's overall energy so the playlist stays one
@@ -384,13 +628,22 @@ def expand_queries_from_analysis(
     overall_e = (
         analysis.overall_energy if analysis.overall_energy is not None else 0.5
     )
+    realist = is_realist_literary_world(analysis)
+    allow_cinema = allows_generic_cinematic_fallback(analysis)
 
     def add(spec: SearchQuerySpec) -> None:
         key = " ".join(spec.query.lower().split())
         if not key or key in seen:
             return
+        # Hard block spectacle language for realist / intimate literary worlds
+        if (realist or not allow_cinema) and _query_is_spectacle(key):
+            return
         seen.add(key)
         out.append(spec)
+
+    # 0) World-locked universe FIRST (setting + era + emotion family)
+    for sq in world_locked_queries(analysis, lyrics, max_queries=12):
+        add(sq)
 
     # 1) LLM-provided queries (primary)
     for q in analysis.overall_search_queries:
@@ -546,11 +799,17 @@ def expand_queries_from_analysis(
             )
         )
     if analysis.tone:
+        if lyrics.normalized().is_instrumental_only:
+            tone_q = (
+                f"{analysis.tone} pastoral instrumental"
+                if realist or not allow_cinema
+                else f"{analysis.tone} cinematic instrumental"
+            )
+        else:
+            tone_q = f"{analysis.tone} atmosphere music"
         add(
             _spec(
-                f"{analysis.tone} cinematic instrumental"
-                if lyrics.normalized().is_instrumental_only
-                else f"{analysis.tone} atmosphere music",
+                tone_q,
                 lyrics=lyrics,
                 energy=analysis.overall_energy,
                 reason="tone",
@@ -606,52 +865,54 @@ def expand_queries_from_analysis(
             )
 
     # 5) Worldbuilding / genre detection from full literary blob (anti-generic:
-    #    dystopian alone no longer forces dune-style desert scores)
+    #    dystopian alone no longer forces dune-style desert scores;
+    #    realist / historical / rural books NEVER get sci-fi or epic banks)
     blob = " ".join(analysis.vibe_keyword_pool() + [analysis.book_title or ""]).lower()
     intimacy = getattr(analysis, "intimacy_vs_epic", 0.5) or 0.5
-    is_scifi_space = any(
-        k in blob
-        for k in (
-            "space opera",
-            "arrakis",
-            "desert planet",
-            "interstellar",
-            "spaceship",
-            "galactic",
+    if not realist and allow_cinema:
+        is_scifi_space = any(
+            k in blob
+            for k in (
+                "space opera",
+                "arrakis",
+                "desert planet",
+                "interstellar",
+                "spaceship",
+                "galactic",
+            )
+        ) or "dune" in (analysis.book_title or "").lower()
+        is_scifi_broad = any(
+            k in blob
+            for k in ("sci-fi", "scifi", "science fiction", "cyber", "futur", "dystop")
         )
-    ) or "dune" in (analysis.book_title or "").lower()
-    is_scifi_broad = any(
-        k in blob
-        for k in ("sci-fi", "scifi", "science fiction", "cyber", "futur", "dystop")
-    )
-    # Epic space scores only when scale is not intimate
-    if is_scifi_space or (is_scifi_broad and intimacy < 0.45):
-        for phrase in _SCIFI_EXTRA:
-            add(
-                _spec(
-                    phrase,
-                    lyrics=lyrics,
-                    energy=analysis.overall_energy,
-                    reason="scifi-expand",
+        # Epic space scores only when scale is not intimate
+        if is_scifi_space or (is_scifi_broad and intimacy < 0.45):
+            for phrase in _SCIFI_EXTRA:
+                add(
+                    _spec(
+                        phrase,
+                        lyrics=lyrics,
+                        energy=analysis.overall_energy,
+                        reason="scifi-expand",
+                    )
                 )
-            )
-    elif is_scifi_broad and intimacy >= 0.55:
-        # Intimate dystopia / literary SF → quieter, not trailer-space
-        for phrase in (
-            "dystopian ambient instrumental",
-            "cold electronic ambient",
-            "melancholic synth atmosphere",
-            "surveillance tension underscore",
-            "bleak piano electronic",
-        ):
-            add(
-                _spec(
-                    phrase,
-                    lyrics=lyrics,
-                    energy=analysis.overall_energy,
-                    reason="intimate-scifi",
+        elif is_scifi_broad and intimacy >= 0.55:
+            # Intimate dystopia / literary SF → quieter, not trailer-space
+            for phrase in (
+                "dystopian ambient instrumental",
+                "cold electronic ambient",
+                "melancholic synth atmosphere",
+                "surveillance tension underscore",
+                "bleak piano electronic",
+            ):
+                add(
+                    _spec(
+                        phrase,
+                        lyrics=lyrics,
+                        energy=analysis.overall_energy,
+                        reason="intimate-scifi",
+                    )
                 )
-            )
 
     # Humor / dreaminess axes
     humor = getattr(analysis, "humor_level", 0.3) or 0.3
@@ -679,49 +940,64 @@ def expand_queries_from_analysis(
             )
         )
 
-    # 6) Energy + intimacy tier seeds (no forced epic for intimate books)
+    # 6) Energy + intimacy tier seeds (no forced epic for intimate/realist books)
     energy = analysis.overall_energy if analysis.overall_energy is not None else 0.5
     band = _book_energy_band(analysis)
     if lyrics.normalized().is_instrumental_only or lyrics.prefers_instrumental:
-        if band == "intimate" or energy < 0.45:
+        if realist or band == "intimate" or energy < 0.45 or not allow_cinema:
             add(_spec("quiet ambient drone instrumental", lyrics=lyrics, energy=0.2, reason="energy-low"))
             add(_spec("intimate piano instrumental", lyrics=lyrics, energy=0.3, reason="energy-low2"))
             add(_spec("melancholic strings score", lyrics=lyrics, energy=0.35, reason="energy-low3"))
-        elif band == "epic" or energy >= 0.72:
+            if realist:
+                add(_spec("pastoral americana instrumental", lyrics=lyrics, energy=0.35, reason="energy-pastoral"))
+                add(_spec("sparse piano countryside", lyrics=lyrics, energy=0.3, reason="energy-pastoral2"))
+        elif (band == "epic" or energy >= 0.72) and allow_cinema:
             add(_spec("epic battle orchestral score", lyrics=lyrics, energy=0.85, reason="energy-high"))
             add(_spec("triumphant orchestral fanfare instrumental", lyrics=lyrics, energy=0.9, reason="energy-high2"))
         else:
             add(_spec("emotional film score piano", lyrics=lyrics, energy=0.5, reason="energy-mid"))
             add(_spec("building tension hybrid score", lyrics=lyrics, energy=0.55, reason="energy-mid2"))
     else:
-        if band == "intimate" or energy < 0.45:
+        if realist or band == "intimate" or energy < 0.45:
             add(_spec("quiet intimate ballad", lyrics=lyrics, energy=0.25, reason="energy-low"))
-        elif band == "epic" or energy >= 0.72:
+            if realist:
+                add(_spec("americana folk ballad", lyrics=lyrics, energy=0.35, reason="energy-pastoral"))
+        elif (band == "epic" or energy >= 0.72) and allow_cinema:
             add(_spec("high energy anthem", lyrics=lyrics, energy=0.85, reason="energy-high"))
         else:
             add(_spec("mid tempo atmospheric indie", lyrics=lyrics, energy=0.5, reason="energy-mid"))
 
-    # Bias seed bank by band (instrumental seeds: front = calmer)
-    seeds = (
-        _INSTRUMENTAL_SEEDS
-        if lyrics.normalized().is_instrumental_only or lyrics.prefers_instrumental
-        else _VOCAL_FRIENDLY_SEEDS
-    )
-    if band == "intimate" or energy < 0.45:
-        # Prefer calm seeds; skip war drums / triumphant brass
-        ordered_seeds = [
-            s
-            for s in seeds
-            if not any(
-                k in s.lower()
-                for k in ("war drums", "triumphant", "epic film", "hybrid orchestral trailer")
-            )
-        ]
-        ordered_seeds = ordered_seeds[:12] + ordered_seeds[12:]
-    elif band == "epic" or energy > 0.7:
-        ordered_seeds = list(reversed(seeds))
+    # Bias seed bank by band — realist stays inside pastoral family only
+    if realist or not allow_cinema:
+        if lyrics.normalized().is_instrumental_only or lyrics.prefers_instrumental:
+            ordered_seeds = list(_PASTORAL_REALIST_SEEDS) + list(_INTIMATE_INSTRUMENTAL[:8])
+        else:
+            ordered_seeds = [
+                "melancholic indie folk",
+                "americana acoustic ballad",
+                "quiet pastoral songs",
+                "dusty folk ballad",
+            ]
     else:
-        ordered_seeds = seeds[5:] + seeds[:5]
+        seeds = (
+            _INSTRUMENTAL_SEEDS
+            if lyrics.normalized().is_instrumental_only or lyrics.prefers_instrumental
+            else _VOCAL_FRIENDLY_SEEDS
+        )
+        if band == "intimate" or energy < 0.45:
+            ordered_seeds = [
+                s
+                for s in seeds
+                if not any(
+                    k in s.lower()
+                    for k in ("war drums", "triumphant", "epic film", "hybrid orchestral trailer")
+                )
+            ]
+            ordered_seeds = ordered_seeds[:12] + ordered_seeds[12:]
+        elif band == "epic" or energy > 0.7:
+            ordered_seeds = list(reversed(seeds))
+        else:
+            ordered_seeds = seeds[5:] + seeds[:5]
 
     for phrase in ordered_seeds:
         add(_spec(phrase, lyrics=lyrics, energy=energy, reason="seed-bank"))
@@ -785,14 +1061,28 @@ def expand_chapter_queries(
             )
 
     if lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
-        add(
-            _spec(
-                "cinematic orchestral score",
-                lyrics=lyrics,
-                energy=chapter.energy_level,
-                reason="chapter-cinematic",
+        # Never inject generic cinema for realist / intimate literary worlds
+        if analysis is not None and (
+            is_realist_literary_world(analysis)
+            or not allows_generic_cinematic_fallback(analysis)
+        ):
+            add(
+                _spec(
+                    "pastoral chamber instrumental",
+                    lyrics=lyrics,
+                    energy=chapter.energy_level,
+                    reason="chapter-pastoral",
+                )
             )
-        )
+        else:
+            add(
+                _spec(
+                    "cinematic orchestral score",
+                    lyrics=lyrics,
+                    energy=chapter.energy_level,
+                    reason="chapter-cinematic",
+                )
+            )
 
     return out[:max_queries]
 
@@ -804,49 +1094,79 @@ def cinematic_fallback_queries(
     max_queries: int = 16,
 ) -> list[SearchQuerySpec]:
     """
-    Last-resort high-recall queries: popular film/game score language that
-    still tilts toward the book's mood/energy.
+    Last-resort queries — world-gated.
+
+    Realist / historical / rural / intimate literary books get pastoral
+    expansion only (never Williams / Potter / Zimmer / racing / sci-fi banks).
+    Returns [] when even that would fight the book; patience > fill.
     """
     energy = analysis.overall_energy if analysis.overall_energy is not None else 0.5
-    mood = (analysis.overall_mood or "cinematic").lower()
-    base: list[str]
+    mood = (analysis.overall_mood or "reflective").lower()
+    title = (analysis.book_title or "").lower()
+
+    # Hard block generic spectacle cinema for the wrong world
+    if not allows_generic_cinematic_fallback(analysis) or is_realist_literary_world(analysis):
+        # Stay inside pastoral / quiet documentary family only
+        if lyrics.normalized().is_instrumental_only or lyrics.prefers_instrumental:
+            base = list(_PASTORAL_REALIST_SEEDS)
+            if energy < 0.45:
+                base = ["nils frahm", "max richter", "peaceful piano soundtrack"] + base
+            # Book-specific gentle hooks (never spectacle)
+            if "eden" in title or "steinbeck" in " ".join(analysis.authors or []).lower():
+                base = [
+                    "pastoral california instrumental",
+                    "salinas valley score",
+                    "dust bowl acoustic instrumental",
+                ] + base
+            if "gatsby" in title:
+                base = ["jazz age instrumental", "1920s jazz instrumental"] + base
+        else:
+            base = [
+                "melancholic indie folk",
+                "americana acoustic ballad",
+                "quiet pastoral songs",
+                f"{mood} folk",
+            ]
+        return [
+            _spec(q, lyrics=lyrics, energy=min(energy, 0.5), reason="pastoral-fallback")
+            for q in base[:max_queries]
+        ]
+
+    # Spectacle-allowed worlds only (mythic / high-adventure / some SF)
     if lyrics == LyricsPreference.INSTRUMENTAL_ONLY:
         base = [
-            "hans zimmer",
-            "howard shore",
-            "john williams",
             "ludovico einaudi",
             "max richter",
-            "ramin djawadi",
-            "cinematic orchestra",
-            "movie soundtrack instrumental",
+            "thomas newman",
             "ambient cinematic",
-            "dark cinematic score",
-            "adventure film score",
             "emotional orchestral",
-            "game soundtrack orchestral",
             "post rock instrumental",
             f"{mood} film score",
             f"{mood} orchestral instrumental",
         ]
-        if energy > 0.65:
+        # Zimmer / Williams / trailer only when world truly warrants epic scale
+        intimacy = analysis.intimacy_vs_epic if analysis.intimacy_vs_epic is not None else 0.5
+        if intimacy <= 0.35 and energy >= 0.55:
+            base.extend(
+                [
+                    "hans zimmer",
+                    "howard shore",
+                    "adventure film score",
+                ]
+            )
+        if energy > 0.72 and intimacy <= 0.3:
             base.extend(["two steps from hell", "epic orchestral soundtrack"])
         elif energy < 0.4:
             base.extend(["nils frahm", "peaceful piano soundtrack"])
-        title = (analysis.book_title or "").lower()
         if "dune" in title:
             base = ["hans zimmer dune", "dune soundtrack", "dune part two score"] + base
-        if "gatsby" in title:
-            base = ["jazz age instrumental", "1920s jazz instrumental", "art deco jazz"] + base
+        # Never auto-inject Harry Potter / racing / generic Williams magic
     else:
         base = [
-            "cinematic indie soundtrack",
-            f"{mood} songs",
             "atmospheric alternative",
-            "epic soundtrack songs",
-            "emotional film songs",
             "indie folk atmospheric",
-            "dark pop cinematic",
+            f"{mood} songs",
+            "emotional film songs",
             "dreamy alternative rock",
         ]
 

@@ -49,11 +49,14 @@ from chapterscore.spotify.personalization import (
     search_queries_for_personal_artists,
 )
 from chapterscore.spotify.queries import (
+    allows_generic_cinematic_fallback,
     broaden_specs,
     cinematic_fallback_queries,
     expand_chapter_queries,
     expand_queries_from_analysis,
+    is_realist_literary_world,
     vibe_instrumental_queries,
+    world_locked_queries,
 )
 from chapterscore.spotify.ranking import (
     InstrumentalStrictness,
@@ -63,9 +66,11 @@ from chapterscore.spotify.ranking import (
     filter_music_only,
     is_likely_instrumental,
     is_too_intense_for_reading,
+    is_world_style_mismatch,
     passes_content_filter,
     passes_lyrics_filter,
     passes_popularity_filter,
+    style_clash_near_kill,
     reading_safe_energy_target,
     score_track,
     select_diverse,
@@ -138,6 +143,21 @@ def _rank_raw(
             continue
         if is_too_intense_for_reading(track):
             continue
+        # Priority 0b: setting/era/world mismatch (F1 vs 1900s farm; Potter vs realist)
+        if analysis and is_world_style_mismatch(
+            track,
+            intimacy_vs_epic=analysis.intimacy_vs_epic,
+            realism_vs_dreaminess=analysis.realism_vs_dreaminess,
+            era_feel=analysis.era_feel,
+            setting_texture=analysis.setting_texture,
+            avoid_styles=avoid,
+            anti_generic_notes=list(analysis.anti_generic_notes or []),
+            overall_mood=analysis.overall_mood,
+            suitable_styles=suitable,
+            book_title=analysis.book_title,
+            authors=list(analysis.authors or []),
+        ):
+            continue
         # Priority 1: hard lyrics / instrumental constraint (outranks taste/recs/fallback)
         if not passes_lyrics_filter(track, lyrics, strictness=strictness):
             continue
@@ -175,6 +195,9 @@ def _rank_raw(
             era_feel=analysis.era_feel if analysis else None,
             pacing=analysis.pacing_profile or analysis.pacing if analysis else None,
         )
+        # Hard-ish: avoid_styles clash near-kill — drop rather than pad playlist
+        if track.score >= 0 and style_clash_near_kill(track, suitable=suitable, avoid=avoid):
+            continue
         if track.score < 0:
             continue
         ranked.append(track)
@@ -723,67 +746,116 @@ def _select_overall(
         if chosen and not _should_search_more(chosen, target, min_hours, quality_floor=q_floor):
             return chosen
 
-    # ── Stage 4: cinematic / soundtrack fallback bank ─────────────────────
+    # World gate: realist / intimate literary books must not use generic cinema
+    allow_cinema = allows_generic_cinematic_fallback(analysis)
+    realist = is_realist_literary_world(analysis)
+    patience_world = realist or not allow_cinema
+
+    # ── Stage 4: cinematic / soundtrack fallback bank (world-gated) ───────
     cinema: list[SearchQuerySpec] = []
     if _stage_ok() and not session.rate_limited:
-        progress(
-            f"Stage 4 — cinematic fallback bank ({len(chosen)}/~{target} so far)"
-        )
-        cinema = cinematic_fallback_queries(analysis, lyrics, max_queries=8)
-        pool4 = _search_pool(
-            sp,
-            cinema,
-            lyrics,
-            strictness=strictness3,
-            progress=progress,
-            label="4/cinematic",
-            early_stop_raw=60,
-            taste=taste,
-            analysis=analysis,
-        )
-        pool = _merge_unique(pool, pool4)
-        chosen = _finalize(pool, label="Stage 4")
-        if chosen and not _should_search_more(chosen, target, min_hours, quality_floor=q_floor):
-            return chosen
+        if patience_world:
+            progress(
+                f"Stage 4 — pastoral / world-locked expansion only "
+                f"(skipping generic cinema; {len(chosen)}/~{target} so far)"
+            )
+            cinema = cinematic_fallback_queries(analysis, lyrics, max_queries=8)
+            # cinematic_fallback already redirects to pastoral for this world;
+            # also prepend explicit world-locked queries.
+            cinema = list(world_locked_queries(analysis, lyrics, max_queries=8)) + list(cinema)
+        else:
+            progress(
+                f"Stage 4 — cinematic fallback bank ({len(chosen)}/~{target} so far)"
+            )
+            cinema = cinematic_fallback_queries(analysis, lyrics, max_queries=8)
+        if cinema:
+            pool4 = _search_pool(
+                sp,
+                cinema[:10],
+                lyrics,
+                strictness=strictness3,
+                progress=progress,
+                label="4/pastoral" if patience_world else "4/cinematic",
+                early_stop_raw=60,
+                taste=taste,
+                analysis=analysis,
+            )
+            pool = _merge_unique(pool, pool4)
+            chosen = _finalize(pool, label="Stage 4")
+            if chosen and not _should_search_more(
+                chosen, target, min_hours, quality_floor=q_floor
+            ):
+                return chosen
 
     # ── Stage 5: last resort (instrumental-only still hard-blocks vocals) ──
+    # Patience: for realist worlds, prefer returning fewer tracks over spectacle fill.
+    if patience_world and chosen and len(chosen) >= max(8, int(target * 0.35)):
+        progress(
+            f"Stage 5 — skipped (patience over fill; {len(chosen)} cohesive tracks "
+            "beats generic cinema padding)"
+        )
+        return chosen
+
     progress(
         f"Stage 5 — last-resort quality pick ({len(chosen)}/~{target} so far; no weak padding)"
     )
     if lyrics.is_instrumental_only and _stage_ok() and not session.rate_limited:
-        pool5 = _search_pool(
-            sp,
-            (cinema or cinematic_fallback_queries(analysis, lyrics, max_queries=4))[:4],
-            lyrics,
-            strictness=InstrumentalStrictness.PERMISSIVE,
-            progress=progress,
-            label="5/permissive",
-            early_stop_raw=40,
-            taste=taste,
-            analysis=analysis,
-        )
-        pool = _merge_unique(pool, pool5)
+        stage5_specs = (cinema or cinematic_fallback_queries(analysis, lyrics, max_queries=4))[:4]
+        if stage5_specs:
+            pool5 = _search_pool(
+                sp,
+                stage5_specs,
+                lyrics,
+                strictness=InstrumentalStrictness.PERMISSIVE,
+                progress=progress,
+                label="5/permissive",
+                early_stop_raw=40,
+                taste=taste,
+                analysis=analysis,
+            )
+            pool = _merge_unique(pool, pool5)
 
     chosen = _finalize(pool, label="Stage 5")
     if chosen:
+        if patience_world:
+            progress(
+                f"✓ Returning {len(chosen)} world-fit tracks "
+                "(quality + setting fit > hours target)"
+            )
         return chosen
 
-    # Absolute last ditch: one ultra-generic search (only if still empty)
-    progress("Stage 6 — ultra-generic safety net")
-    emergency_q = (
-        "cinematic orchestral soundtrack"
-        if lyrics.is_instrumental_only or lyrics.prefers_instrumental
-        else "cinematic soundtrack"
-    )
+    # Absolute last ditch — NEVER generic cinema for realist / intimate literary worlds
+    if patience_world:
+        progress(
+            "Stage 6 — pastoral emergency only "
+            "(generic cinematic orchestral soundtrack blocked for this world)"
+        )
+        emergency_specs = world_locked_queries(analysis, lyrics, max_queries=4)
+        if not emergency_specs:
+            emergency_q = (
+                "pastoral americana instrumental"
+                if lyrics.is_instrumental_only or lyrics.prefers_instrumental
+                else "americana folk ballad"
+            )
+            emergency_specs = [SearchQuerySpec(query=emergency_q, reason="pastoral-emergency")]
+    else:
+        progress("Stage 6 — ultra-generic safety net")
+        emergency_q = (
+            "cinematic orchestral soundtrack"
+            if lyrics.is_instrumental_only or lyrics.prefers_instrumental
+            else "cinematic soundtrack"
+        )
+        emergency_specs = [SearchQuerySpec(query=emergency_q, reason="emergency")]
+
     pool6 = _search_pool(
         sp,
-        [SearchQuerySpec(query=emergency_q, reason="emergency")],
+        emergency_specs,
         lyrics,
         strictness=InstrumentalStrictness.RELAXED
         if lyrics.is_instrumental_only
         else InstrumentalStrictness.PERMISSIVE,
         progress=progress,
-        label="6/emergency",
+        label="6/pastoral-emergency" if patience_world else "6/emergency",
         limit_per_query=50,
         taste=taste,
         analysis=analysis,
@@ -901,32 +973,47 @@ def _select_chapter(
             final.append(t)
 
     if _should_search_more(final, target, min_hours, quality_floor=q_floor):
-        progress("Global fill — cinematic bank (only if still thin)")
-        cinema = cinematic_fallback_queries(analysis, lyrics, max_queries=12)
-        pool_c = _search_pool(
-            sp,
-            cinema,
-            lyrics,
-            strictness=InstrumentalStrictness.RELAXED
-            if lyrics.is_instrumental_only
-            else InstrumentalStrictness.PERMISSIVE,
-            seen_ids=seen_ids,
-            progress=progress,
-            label="global/cinematic",
-            taste=taste,
-            analysis=analysis,
+        patience_world = is_realist_literary_world(analysis) or (
+            not allows_generic_cinematic_fallback(analysis)
         )
-        extra = select_diverse(
-            [t for t in pool_c if t.id not in seen_ids],
-            max(0, target - len(final)),
-            max_per_artist=max(max_art, 2),
-            min_score=q_floor * 0.55,
-        )
-        for t in extra:
-            if t.id in seen_ids:
-                continue
-            seen_ids.add(t.id)
-            final.append(t)
+        if patience_world:
+            progress(
+                "Global fill — pastoral / world-locked only "
+                "(generic cinema blocked; patience over fill)"
+            )
+            cinema = list(world_locked_queries(analysis, lyrics, max_queries=8)) + list(
+                cinematic_fallback_queries(analysis, lyrics, max_queries=8)
+            )
+            fill_label = "global/pastoral"
+        else:
+            progress("Global fill — cinematic bank (only if still thin)")
+            cinema = cinematic_fallback_queries(analysis, lyrics, max_queries=12)
+            fill_label = "global/cinematic"
+        if cinema:
+            pool_c = _search_pool(
+                sp,
+                cinema,
+                lyrics,
+                strictness=InstrumentalStrictness.RELAXED
+                if lyrics.is_instrumental_only
+                else InstrumentalStrictness.PERMISSIVE,
+                seen_ids=seen_ids,
+                progress=progress,
+                label=fill_label,
+                taste=taste,
+                analysis=analysis,
+            )
+            extra = select_diverse(
+                [t for t in pool_c if t.id not in seen_ids],
+                max(0, target - len(final)),
+                max_per_artist=max(max_art, 2),
+                min_score=q_floor * 0.55,
+            )
+            for t in extra:
+                if t.id in seen_ids:
+                    continue
+                seen_ids.add(t.id)
+                final.append(t)
 
     final = filter_music_only(dedupe_tracks(final))
     progress(
