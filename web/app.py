@@ -5,6 +5,9 @@ ChapterScore — Streamlit web UI with a guided 2-step flow.
   Step 2 — Personalize & generate (locked until Step 1 is confirmed;
             full literary vibe analysis runs here via generate_playlist)
 
+After a playlist is generated, Copy feedback prefills an editable template
+from that result. Copying it does not send anything to the model.
+
 Launch locally:
     streamlit run web/app.py
 
@@ -14,6 +17,7 @@ Deployed (Streamlit Community Cloud): set secrets + Redirect URIs (see README).
 from __future__ import annotations
 
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +26,12 @@ _ROOT = Path(__file__).resolve().parents[1]
 _SRC = _ROOT / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+_WEB = Path(__file__).resolve().parent
+if str(_WEB) not in sys.path:
+    sys.path.insert(0, str(_WEB))
 
 import streamlit as st
+from feedback import build_feedback_template
 
 from chapterscore import __version__
 from chapterscore.books.aggregator import search_book_candidates
@@ -60,6 +68,8 @@ SS_LOOKUP_TITLE = "cs_lookup_title"
 SS_LOOKUP_AUTHOR = "cs_lookup_author"
 SS_READING_HOURS = "cs_reading_hours"  # float, user-editable estimate
 SS_RESULT = "cs_last_result"  # last generation snapshot for display
+SS_FEEDBACK = "cs_feedback_text"  # editable copy-feedback draft
+SS_FEEDBACK_FOR = "cs_feedback_for"  # result id the draft was built from
 
 
 # ── Page setup ───────────────────────────────────────────────────────────────
@@ -208,6 +218,8 @@ def _reset_step1_state() -> None:
         SS_CANDIDATE_IDX,
         SS_READING_HOURS,
         SS_RESULT,
+        SS_FEEDBACK,
+        SS_FEEDBACK_FOR,
         "step1_reading_hours",
         "step1_pick_radio",
         "cs_has_real_chapters",  # legacy key cleanup
@@ -366,6 +378,8 @@ def _render_step1(settings) -> None:
         else:
             st.session_state[SS_STEP1_DONE] = False
             st.session_state.pop(SS_RESULT, None)
+            st.session_state.pop(SS_FEEDBACK, None)
+            st.session_state.pop(SS_FEEDBACK_FOR, None)
             st.session_state.pop(SS_BOOK, None)
             st.session_state.pop(SS_CANDIDATES, None)
             st.session_state.pop("step1_pick_radio", None)
@@ -798,19 +812,34 @@ def _render_step2(settings) -> None:
             st.exception(exc)
         return
 
-    # Snapshot for result panel (session-safe primitives)
+    # Snapshot for result panel (session-safe primitives).
+    # Extra vibe/settings fields feed the copy-feedback template only.
+    requested_hours = result.requested_hours
+    if not requested_hours and min_hours and float(min_hours) > 0:
+        requested_hours = float(min_hours)
     snap: dict[str, Any] = {
+        "result_id": uuid.uuid4().hex,
         "dry_run": dry_run,
         "mode": mode.value,
         "book_title": result.book.display_name,
+        "title": result.book.title,
+        "author": result.book.author_str,
+        "lyrics": lyrics.display_label,
+        "exploration": int(exploration),
+        "top_artists": taste_label,
+        "recommendations": bool(use_recs),
+        "target_tracks": int(tracks_overall) if tracks_overall else None,
         "mood": result.analysis.overall_mood,
         "energy": result.analysis.overall_energy,
+        "intimacy": result.analysis.intimacy_vs_epic,
+        "atmospheres": list(result.analysis.atmospheres or []),
+        "era": result.analysis.era_feel or "",
         "signature": result.analysis.distinctive_signature or "",
         "description": result.analysis.playlist_description or "",
         "playlist_title": result.analysis.playlist_title_suggestion or "",
         "styles": list(result.analysis.suitable_styles or [])[:8],
         "avoid": list(result.analysis.avoid_styles or [])[:8],
-        "requested_hours": result.requested_hours,
+        "requested_hours": requested_hours,
         "actual_hours": result.actual_hours,
         "duration_report": result.duration_report,
         "tracks": [
@@ -896,36 +925,175 @@ def _render_results() -> None:
         if snap.get("description"):
             st.write(snap["description"])
         st.caption("Uncheck **Dry run** and generate again to create a real playlist.")
-        return
+    else:
+        pl = snap.get("playlist")
+        if pl:
+            st.markdown("##### Your playlist")
+            dur_bits = f"{pl.get('track_count', 0)} tracks"
+            if isinstance(act_h, (int, float)) and act_h:
+                dur_bits += f" · {act_h:.2f} h"
+            st.markdown(
+                f"""
+                <div class="result-card">
+                  <div style="font-size:1.25rem;font-weight:700;margin-bottom:0.35rem;">
+                    {pl.get("name", "Playlist")}
+                  </div>
+                  <div style="color:#64748b;margin-bottom:0.75rem;">
+                    {dur_bits}
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if pl.get("url"):
+                st.link_button("Open Spotify playlist", pl["url"], use_container_width=True)
 
-    pl = snap.get("playlist")
-    if pl:
-        st.markdown("##### Your playlist")
-        dur_bits = f"{pl.get('track_count', 0)} tracks"
-        if isinstance(act_h, (int, float)) and act_h:
-            dur_bits += f" · {act_h:.2f} h"
-        st.markdown(
-            f"""
-            <div class="result-card">
-              <div style="font-size:1.25rem;font-weight:700;margin-bottom:0.35rem;">
-                {pl.get("name", "Playlist")}
-              </div>
-              <div style="color:#64748b;margin-bottom:0.75rem;">
-                {dur_bits}
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if pl.get("url"):
-            st.link_button("Open Spotify playlist", pl["url"], use_container_width=True)
+        tracks = snap.get("tracks") or []
+        if tracks:
+            with st.expander(f"Track list ({len(tracks)})", expanded=False):
+                for i, t in enumerate(tracks, 1):
+                    ch = f" · ch {t['chapter']}" if t.get("chapter") is not None else ""
+                    st.write(f"{i}. **{t.get('name', '?')}** — {t.get('artists', '')}{ch}")
 
+    _render_copy_feedback(snap)
+
+
+# Clipboard writes have to happen in the browser click, not on a Streamlit rerun.
+_COPY_FEEDBACK_HTML = """
+<div>
+  <button type="button" id="cs-copy-feedback"
+          style="width:100%;font-weight:600;padding:0.65rem 1rem;">
+    Copy feedback
+  </button>
+  <p id="cs-copy-feedback-status" role="status" style="min-height:1.25rem;margin:0.35rem 0 0;"></p>
+</div>
+<script>
+(function () {
+  const btn = document.getElementById("cs-copy-feedback");
+  const status = document.getElementById("cs-copy-feedback-status");
+  if (!btn || btn.dataset.bound === "1") return;
+  btn.dataset.bound = "1";
+
+  const sample = document.querySelector('[data-testid="stBaseButton-primary"]');
+  if (sample) {
+    const cs = window.getComputedStyle(sample);
+    btn.style.background = cs.backgroundColor;
+    btn.style.color = cs.color;
+    btn.style.border = cs.border;
+    btn.style.borderRadius = cs.borderRadius;
+    btn.style.font = cs.font;
+    btn.style.fontWeight = cs.fontWeight;
+    btn.style.padding = cs.padding;
+  }
+  btn.style.width = "100%";
+  btn.style.cursor = "pointer";
+  btn.style.boxSizing = "border-box";
+
+  function findArea() {
+    const blocks = document.querySelectorAll('[data-testid="stTextArea"]');
+    for (const block of blocks) {
+      const label = block.querySelector("label");
+      const text = label ? label.textContent || "" : "";
+      if (text.indexOf("Feedback template") !== -1) {
+        const area = block.querySelector("textarea");
+        if (area) return area;
+      }
+    }
+    return document.querySelector('textarea[aria-label="Feedback template"]');
+  }
+
+  function show(msg) {
+    if (status) status.textContent = msg;
+  }
+
+  function fallback(area) {
+    try {
+      if (!area) return false;
+      const start = area.selectionStart;
+      const end = area.selectionEnd;
+      area.focus();
+      area.select();
+      const ok = document.execCommand("copy");
+      if (typeof start === "number" && typeof end === "number") {
+        area.setSelectionRange(start, end);
+      }
+      return ok;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  let copiedAt = 0;
+  function copyNow() {
+    const now = Date.now();
+    if (copiedAt && now - copiedAt < 400) return;
+    copiedAt = now;
+    const area = findArea();
+    const text = area ? area.value : "";
+    const fail = "Could not copy. Select the text and copy it manually.";
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () { show("Copied"); },
+        function () { show(fallback(area) ? "Copied" : fail); }
+      );
+      return;
+    }
+    show(fallback(area) ? "Copied" : fail);
+  }
+
+  // Keep the textarea focused so editing does not rerun the app before copy.
+  btn.addEventListener("mousedown", function (event) {
+    event.preventDefault();
+    copyNow();
+  });
+  btn.addEventListener("click", copyNow);
+})();
+</script>
+"""
+
+
+def _feedback_source_id(snap: dict[str, Any]) -> str:
+    result_id = snap.get("result_id")
+    if result_id:
+        return str(result_id)
     tracks = snap.get("tracks") or []
-    if tracks:
-        with st.expander(f"Track list ({len(tracks)})", expanded=False):
-            for i, t in enumerate(tracks, 1):
-                ch = f" · ch {t['chapter']}" if t.get("chapter") is not None else ""
-                st.write(f"{i}. **{t.get('name', '?')}** — {t.get('artists', '')}{ch}")
+    names = "|".join(
+        f"{t.get('name', '')}\t{t.get('artists', '')}"
+        for t in tracks
+        if isinstance(t, dict)
+    )
+    return "|".join(
+        [
+            str(snap.get("title") or snap.get("book_title") or ""),
+            str(snap.get("requested_hours")),
+            str(snap.get("actual_hours")),
+            str(len(tracks) if isinstance(tracks, list) else 0),
+            names,
+        ]
+    )
+
+
+@st.fragment
+def _render_copy_feedback(snap: dict[str, Any]) -> None:
+    """Editable feedback template plus a button that copies the current text."""
+    source_id = _feedback_source_id(snap)
+    if st.session_state.get(SS_FEEDBACK_FOR) != source_id:
+        st.session_state[SS_FEEDBACK] = build_feedback_template(snap)
+        st.session_state[SS_FEEDBACK_FOR] = source_id
+
+    with st.container(border=True):
+        st.markdown("##### Copy feedback")
+        st.caption(
+            "Edit the template, then copy it. "
+            "Nothing here is sent to the model."
+        )
+        st.text_area(
+            "Feedback template",
+            key=SS_FEEDBACK,
+            height=420,
+            help="Replace each ? with KEEP or REJECT and add a short reason.",
+        )
+        st.html(_COPY_FEEDBACK_HTML, unsafe_allow_javascript=True)
 
 
 def main() -> None:
