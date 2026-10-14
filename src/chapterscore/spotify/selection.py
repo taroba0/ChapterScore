@@ -84,6 +84,8 @@ from chapterscore.spotify.ranking import (
     total_duration_ms,
 )
 from chapterscore.spotify.search import (
+    _CONSECUTIVE_FAIL_ABORT,
+    _CONSECUTIVE_TIMEOUT_ABORT,
     build_search_string,
     end_search_session,
     get_audio_features,
@@ -270,15 +272,39 @@ def _search_pool(
                 f"continuing with {total_hits} hits"
             )
             break
+        if session.search_unreliable:
+            progress("✗ Spotify search unreliable — aborting this stage")
+            break
         if session.rate_limited:
             progress(f"⚠ Rate-limited — using {total_hits} hits gathered so far")
             break
-        # Bail if many consecutive failures (network down)
-        if session.consecutive_failures >= 5 and total_hits == 0:
+        # Fail-fast: consecutive timeouts with 0 hits (don't burn budget on long queries)
+        if (
+            total_hits == 0
+            and session.queries_timed_out >= _CONSECUTIVE_TIMEOUT_ABORT
+            and session.consecutive_failures >= _CONSECUTIVE_TIMEOUT_ABORT
+        ):
+            progress(
+                f"✗ {session.queries_timed_out} search timeouts with 0 hits — "
+                "aborting this stage (fail-fast)"
+            )
+            session.mark_search_unreliable("consecutive timeouts with 0 hits")
+            break
+        # Bail if many consecutive failures (network down / API errors)
+        if session.consecutive_failures >= _CONSECUTIVE_FAIL_ABORT and total_hits == 0:
             progress("✗ Multiple consecutive search failures — aborting this stage")
+            session.mark_search_unreliable("consecutive search failures with 0 hits")
             break
 
         q = build_search_string(spec, lyrics, use_genre_operator=False)
+        # After timeouts, shorten long vibe phrases before searching
+        if session.queries_timed_out > 0:
+            words = q.split()
+            if len(words) > 3:
+                short = " ".join(words[:3])
+                if "instrumental" in q.lower() and "instrumental" not in short.lower():
+                    short = f"{short} instrumental"
+                q = short
         progress(f"Searching Spotify [{idx}/{len(specs)}]: {q}")
         # Never raises — failures are logged + skipped inside resilient search
         results = search_tracks_resilient(
@@ -690,7 +716,7 @@ def _select_overall(
         max_art = max(max_art, 3)
 
     def _stage_ok() -> bool:
-        return not session.budget_exhausted()
+        return not session.budget_exhausted() and not session.search_unreliable
 
     def _finalize(pool: list[RankedTrack], *, label: str) -> list[RankedTrack]:
         # Probe without duration relax first; if hours still short, re-pick with fill mode
@@ -807,7 +833,23 @@ def _select_overall(
             "strict no-vocals; cohesive overall world)"
             + (f"; filling toward {min_hours:g} h" if min_hours else "")
         )
-        primary_specs = vibe_instrumental_queries(analysis, max_queries=24 if long_session else 20)
+        # Smoke probes first: short high-recall queries before long vibe phrases
+        smoke_specs = [
+            SearchQuerySpec(
+                query="piano instrumental",
+                energy=analysis.overall_energy,
+                reason="smoke",
+            ),
+            SearchQuerySpec(
+                query="ambient instrumental",
+                energy=analysis.overall_energy,
+                reason="smoke",
+            ),
+        ]
+        primary_specs = list(smoke_specs)
+        primary_specs.extend(
+            vibe_instrumental_queries(analysis, max_queries=24 if long_session else 20)
+        )
         for sq in expand_queries_from_analysis(
             analysis, lyrics, max_queries=14 if long_session else 10, cohesive_overall=True
         ):
@@ -849,6 +891,15 @@ def _select_overall(
     chosen = _finalize(pool, label="Stage 1")
     if chosen and not _should_search_more(chosen, target, min_hours, quality_floor=q_floor):
         return chosen
+
+    # Stage 1 timed out / failed with 0 raw hits — do not thrash Stages 2–6
+    if session.search_unreliable and not pool1 and not chosen:
+        progress(
+            "✗ Stage 1 got 0 hits after search timeouts/failures — "
+            "skipping remaining stages (incl. deep fill). "
+            "Retry when Spotify responds, or use the CLI."
+        )
+        return []
 
     # ── Stage 1b: harvest tracks from diverse Spotify reference playlists ──
     # Widens the candidate universe beyond keyword track-search (cafe / piano /
@@ -1042,6 +1093,9 @@ def _select_overall(
     prev_n = len(chosen)
     for fill_round in range(1, max_fill_rounds + 1):
         if not _should_search_more(chosen, target, min_hours, quality_floor=q_floor):
+            break
+        if session.search_unreliable:
+            progress("Stage 5 — skipping deep fill (search unreliable / prior timeouts)")
             break
         if not _stage_ok() or session.rate_limited:
             progress("Stage 5 — stopping deep fill (search budget / rate limit)")

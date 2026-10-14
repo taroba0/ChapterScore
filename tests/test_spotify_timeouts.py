@@ -144,3 +144,106 @@ def test_search_string_variants_capped():
     v = search_string_variants("one two three four five six")
     assert len(v) <= 2
     assert v[0].startswith("one")
+
+
+def test_search_string_variants_prefer_short():
+    from chapterscore.spotify.search import search_string_variants
+
+    v = search_string_variants(
+        "locker-room bravado piano soft instrumental", prefer_short=True
+    )
+    assert len(v) == 2
+    assert len(v[0].split()) <= len(v[1].split())
+    assert "instrumental" in v[0].lower()
+
+
+def test_resilient_tries_short_after_long_timeout():
+    """Long phrase times out once; shorter variant is still attempted."""
+    session = start_search_session(budget_seconds=30, hard_timeout=0.35)
+    sp = MagicMock()
+    calls: list[str] = []
+
+    def hang_or_hit(**kwargs):
+        q = kwargs.get("q") or ""
+        calls.append(q)
+        # Full query includes "soft"; shortened form drops it
+        if "soft" in q.lower():
+            time.sleep(2)
+            return {"tracks": {"items": []}}
+        return {
+            "tracks": {
+                "items": [
+                    {
+                        "id": "short1",
+                        "name": "Piano Theme",
+                        "artists": [{"name": "Anon"}],
+                        "uri": "spotify:track:short1",
+                        "popularity": 40,
+                        "duration_ms": 180000,
+                        "explicit": False,
+                        "album": {"name": "A"},
+                        "external_urls": {},
+                    }
+                ]
+            }
+        }
+
+    sp.search.side_effect = hang_or_hit
+    logs: list[str] = []
+    results = search_tracks_resilient(
+        sp,
+        "locker-room bravado piano soft instrumental",
+        session=session,
+        progress=logs.append,
+    )
+    assert len(results) == 1
+    assert results[0]["id"] == "short1"
+    assert session.queries_timed_out >= 1
+    assert any("soft" not in c.lower() for c in calls)
+
+
+def test_consecutive_timeouts_mark_search_unreliable_in_pool():
+    """Stage search aborts after consecutive timeouts with 0 hits and marks session."""
+    from chapterscore.models import LyricsPreference, SearchQuerySpec
+    from chapterscore.spotify.ranking import InstrumentalStrictness
+    from chapterscore.spotify.selection import _search_pool
+
+    session = start_search_session(budget_seconds=60, hard_timeout=0.3)
+    sp = MagicMock()
+
+    def hang(**_kwargs):
+        time.sleep(2)
+        return {"tracks": {"items": []}}
+
+    sp.search.side_effect = hang
+    specs = [
+        SearchQuerySpec(query=f"long vibe phrase number {i} instrumental", reason="t")
+        for i in range(10)
+    ]
+    logs: list[str] = []
+    pool = _search_pool(
+        sp,
+        specs,
+        LyricsPreference.INSTRUMENTAL_ONLY,
+        strictness=InstrumentalStrictness.STRICT,
+        progress=logs.append,
+        label="test",
+        early_stop_raw=200,
+        limit_per_query=10,
+    )
+    assert pool == []
+    assert session.search_unreliable is True
+    assert session.queries_timed_out >= 3
+    # Must not have attempted all 10 long queries
+    assert sp.search.call_count < 10
+    assert any("fail-fast" in m.lower() or "timeout" in m.lower() for m in logs)
+
+
+def test_search_unreliable_short_circuits_resilient():
+    session = start_search_session(budget_seconds=20, hard_timeout=2.0)
+    session.search_unreliable = True
+    sp = MagicMock()
+    logs: list[str] = []
+    assert search_tracks_resilient(sp, "anything", session=session, progress=logs.append) == []
+    assert sp.search.call_count == 0
+    assert any("unreliable" in m.lower() for m in logs)

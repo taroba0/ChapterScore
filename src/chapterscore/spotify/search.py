@@ -35,10 +35,13 @@ _SEARCH_PAGE_SIZE = 10
 _MAX_PAGES_DEFAULT = 3  # quality over speed: up to 30 hits per query
 
 # Timeouts (seconds) — overridable via settings
-_DEFAULT_REQUEST_TIMEOUT = 10.0  # requests connect+read
-_DEFAULT_HARD_TIMEOUT = 12.0  # wall-clock per API call
+_DEFAULT_REQUEST_TIMEOUT = 12.0  # requests connect+read
+_DEFAULT_HARD_TIMEOUT = 15.0  # wall-clock per API call (web sessions often need a bit more)
 _DEFAULT_MAX_429_SLEEP = 3.0  # never sleep longer than this on 429
 _DEFAULT_COLLECTION_BUDGET = 90.0  # whole track-collection phase
+# Abort a search stage after this many consecutive soft failures / timeouts
+_CONSECUTIVE_FAIL_ABORT = 5
+_CONSECUTIVE_TIMEOUT_ABORT = 3  # fail-fast when only timeouts and 0 hits
 
 
 class SpotifyTimeoutError(SpotifyAPIError):
@@ -63,6 +66,9 @@ class SearchSession:
     queries_failed: int = 0
     queries_timed_out: int = 0
     queries_rate_limited: int = 0
+    # True after a stage aborts on consecutive timeouts/failures with 0 hits.
+    # Later stages / deep-fill / playlist harvest should skip rather than thrash.
+    search_unreliable: bool = False
     # Spotify search/playlist responses sometimes omit popularity or forbid
     # playlist_items (403). Soft-pass unknown pop / abort harvest when set.
     popularity_unavailable: bool = False
@@ -77,6 +83,12 @@ class SearchSession:
     def call_timeout(self) -> float:
         """Per-call timeout: min of hard timeout and remaining budget."""
         return max(1.0, min(self.hard_timeout, self.remaining()))
+
+    def mark_search_unreliable(self, reason: str = "") -> None:
+        """Stop burning budget on further track/playlist searches this run."""
+        self.search_unreliable = True
+        if reason:
+            logger.info("Search marked unreliable: %s", reason)
 
 
 _SESSION: SearchSession | None = None
@@ -276,15 +288,23 @@ def build_search_string(
     return " ".join(p for p in parts if p)
 
 
-def search_string_variants(query: str) -> list[str]:
-    """At most 2 variants: full query + shortened form."""
+def search_string_variants(query: str, *, prefer_short: bool = False) -> list[str]:
+    """At most 2 variants: full query + shortened form.
+
+    When ``prefer_short`` is True (e.g. after timeouts), put the high-recall
+    shortened form first so we burn less wall-clock on doomed long phrases.
+    """
     q = query.strip()
     if not q:
         return []
     variants = [q]
     words = q.split()
     if len(words) > 3:
-        variants.append(" ".join(words[:3]))
+        short = " ".join(words[:3])
+        # Keep instrumental cue on the short form when the full query had it
+        if "instrumental" in q.lower() and "instrumental" not in short.lower():
+            short = f"{short} instrumental"
+        variants.append(short)
     if "genre:" in q.lower():
         variants.append(q.replace("genre:", "").replace("  ", " ").strip())
     # Dedupe, cap at 2 to avoid request storms
@@ -297,6 +317,8 @@ def search_string_variants(query: str) -> list[str]:
             out.append(v)
         if len(out) >= 2:
             break
+    if prefer_short and len(out) == 2:
+        out.sort(key=lambda v: (len(v.split()), len(v)))
     return out
 
 
@@ -404,6 +426,9 @@ def search_tracks_resilient(
     session = session or get_search_session()
     log = progress or (lambda _m: None)
 
+    if session.search_unreliable:
+        log("✗ Spotify search unreliable — skipping remaining queries")
+        return []
     if session.budget_exhausted():
         log("⏱ Search budget exhausted — skipping remaining queries")
         return []
@@ -411,11 +436,13 @@ def search_tracks_resilient(
         log("⚠ Spotify rate-limited — skipping remaining queries")
         return []
 
-    variants = search_string_variants(query)
+    # After timeouts, prefer shorter high-recall variants first
+    prefer_short = session.queries_timed_out > 0 or session.consecutive_failures >= 2
+    variants = search_string_variants(query, prefer_short=prefer_short)
     last_err: str | None = None
 
     for i, variant in enumerate(variants):
-        if session.budget_exhausted() or session.rate_limited:
+        if session.budget_exhausted() or session.rate_limited or session.search_unreliable:
             break
         try:
             results = search_tracks(
@@ -434,7 +461,13 @@ def search_tracks_resilient(
             last_err = str(exc.message)
             log(f"⏱ Timeout: {variant[:60]} — skipping")
             logger.warning("Search timeout for %r: %s", variant, exc)
-            # Don't try more variants of a timed-out query — network is slow
+            # Long query timed out: try one shorter variant before giving up
+            if (
+                i + 1 < len(variants)
+                and len(variant.split()) > 3
+                and len(variants[i + 1].split()) < len(variant.split())
+            ):
+                continue
             break
         except SpotifyRateLimitError as exc:
             session.queries_rate_limited += 1

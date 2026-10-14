@@ -702,6 +702,9 @@ def harvest_reference_playlist_tracks(
     for pool, query in pairs:
         if session.playlist_items_unavailable:
             break
+        if session.search_unreliable:
+            log("Reference playlists — skipping (track search unreliable)")
+            break
         if session.budget_exhausted() or session.rate_limited:
             log("Reference playlists — stopping (budget / rate limit)")
             break

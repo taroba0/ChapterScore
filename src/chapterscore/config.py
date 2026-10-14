@@ -101,10 +101,10 @@ class Settings(BaseSettings):
     )
     # Spotify resilience — longer budget for thorough cinematic searches
     chapterscore_spotify_timeout: float = Field(
-        default=12.0, ge=3.0, le=30.0, description="Hard wall-clock timeout per Spotify API call (s)"
+        default=15.0, ge=3.0, le=30.0, description="Hard wall-clock timeout per Spotify API call (s)"
     )
     chapterscore_spotify_requests_timeout: float = Field(
-        default=10.0, ge=2.0, le=30.0, description="requests library timeout for spotipy (s)"
+        default=12.0, ge=2.0, le=30.0, description="requests library timeout for spotipy (s)"
     )
     chapterscore_spotify_max_429_sleep: float = Field(
         default=3.0, ge=0.0, le=15.0, description="Max seconds to sleep on HTTP 429"
