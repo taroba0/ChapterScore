@@ -70,6 +70,7 @@ SS_READING_HOURS = "cs_reading_hours"  # float, user-editable estimate
 SS_RESULT = "cs_last_result"  # last generation snapshot for display
 SS_FEEDBACK = "cs_feedback_text"  # editable copy-feedback draft
 SS_FEEDBACK_FOR = "cs_feedback_for"  # result id the draft was built from
+SS_DARK_MODE = "cs_dark_mode"  # bool — B&W dark theme toggle
 
 
 # ── Page setup ───────────────────────────────────────────────────────────────
@@ -81,144 +82,315 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.markdown(
-    """
+
+def _inject_theme_css(*, dark: bool) -> None:
+    """B&W theme: light = white ground / dark text; dark = inverted. CSS locks beat Dark menu."""
+    theme = "dark" if dark else "light"
+    if dark:
+        # Near-black ground, light cards/text, inverted buttons (B&W only)
+        vars_block = """
+      :root, html, body, [data-testid="stAppViewContainer"], .stApp {
+        --cs-bg: #0a0a0a;
+        --cs-fg: #f5f5f5;
+        --cs-muted: #b0b0b0;
+        --cs-caption: #c8c8c8;
+        --cs-border: #333333;
+        --cs-card: #141414;
+        --cs-card-muted: #1a1a1a;
+        --cs-heading: #ffffff;
+        --cs-primary-bg: #ffffff;
+        --cs-primary-fg: #000000;
+        --cs-secondary-bg: #141414;
+        --cs-secondary-fg: #ffffff;
+        --cs-secondary-hover: #1f1f1f;
+        --cs-sidebar: #111111;
+        --cs-locked-bg: #161616;
+        --cs-locked-fg: #9a9a9a;
+        --cs-locked-border: #2a2a2a;
+        --cs-disabled-bg: #2a2a2a;
+        --cs-disabled-fg: #ffffff;
+        --cs-confirm: #1a1a1a;
+        --cs-result-muted: #a3a3a3;
+      }
+"""
+    else:
+        # White ground, readable dark text (fixes white-on-white with Streamlit Dark menu)
+        vars_block = """
+      :root, html, body, [data-testid="stAppViewContainer"], .stApp {
+        --cs-bg: #ffffff;
+        --cs-fg: #111111;
+        --cs-muted: #6b6b6b;
+        --cs-caption: #444444;
+        --cs-border: #e5e5e5;
+        --cs-card: #ffffff;
+        --cs-card-muted: #fafafa;
+        --cs-heading: #000000;
+        --cs-primary-bg: #000000;
+        --cs-primary-fg: #ffffff;
+        --cs-secondary-bg: #ffffff;
+        --cs-secondary-fg: #000000;
+        --cs-secondary-hover: #f5f5f5;
+        --cs-sidebar: #fafafa;
+        --cs-locked-bg: #f5f5f5;
+        --cs-locked-fg: #555555;
+        --cs-locked-border: #dddddd;
+        --cs-disabled-bg: #222222;
+        --cs-disabled-fg: #ffffff;
+        --cs-confirm: #fafafa;
+        --cs-result-muted: #6b6b6b;
+      }
+"""
+
+    st.markdown(
+        f"""
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,400;6..72,600;6..72,700&display=swap" rel="stylesheet">
     <style>
-      /* Direction A — B&W minimal: white ground, black/gray type, hairline borders */
-      html, body, [data-testid="stAppViewContainer"], .stApp {
-        background: #ffffff !important;
-        color: #111111;
+      /* ChapterScore B&W — data-theme={theme} */
+{vars_block}
+      html, body, [data-testid="stAppViewContainer"], .stApp {{
+        background: var(--cs-bg) !important;
+        color: var(--cs-fg) !important;
         font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
-      }
-      .block-container {
+      }}
+      .block-container {{
         padding-top: 2.5rem;
         padding-bottom: 4rem;
         max-width: 740px;
-      }
+      }}
+
+      /* Headings — Newsreader, left-aligned */
       h1, h2, h3, h4, h5, h6,
       [data-testid="stMarkdownContainer"] h1,
       [data-testid="stMarkdownContainer"] h2,
-      [data-testid="stMarkdownContainer"] h3 {
+      [data-testid="stMarkdownContainer"] h3 {{
         font-family: "Newsreader", "Times New Roman", Georgia, serif !important;
         font-weight: 600 !important;
         letter-spacing: -0.02em;
-        color: #000000 !important;
-      }
-      h1, [data-testid="stMarkdownContainer"] h1 {
+        color: var(--cs-heading) !important;
+      }}
+      h1, [data-testid="stMarkdownContainer"] h1 {{
         text-align: left !important;
         font-size: 2.35rem !important;
         margin-bottom: 0.35rem !important;
         font-weight: 700 !important;
-      }
-      .subtitle {
+      }}
+      .subtitle {{
         font-family: "Inter", sans-serif !important;
-        color: #6b6b6b;
+        color: var(--cs-muted) !important;
         font-size: 1.05rem;
-        margin: 0 0 2rem 0;
+        margin: 0 0 1.25rem 0;
         text-align: left;
         font-weight: 400;
-      }
-      /* Primary = solid black; secondary = outlined black */
+      }}
+
+      /* Pin readable text on grounds (beats Streamlit Dark menu wash) */
+      [data-testid="stMarkdownContainer"] p,
+      [data-testid="stMarkdownContainer"] span,
+      [data-testid="stMarkdownContainer"] li,
+      [data-testid="stText"],
+      .stMarkdown {{
+        color: var(--cs-fg) !important;
+      }}
+      [data-testid="stCaptionContainer"],
+      [data-testid="stCaptionContainer"] *,
+      [data-testid="stCaptionContainer"] p,
+      [data-testid="stCaptionContainer"] span {{
+        color: var(--cs-caption) !important;
+      }}
+      label,
+      [data-testid="stWidgetLabel"],
+      [data-testid="stWidgetLabel"] p,
+      [data-testid="stWidgetLabel"] span,
+      [data-testid="stWidgetLabel"] label {{
+        color: var(--cs-fg) !important;
+      }}
+      /* Radio / checkbox / select option labels */
+      [data-testid="stRadio"] label,
+      [data-testid="stCheckbox"] label,
+      [role="radiogroup"] label,
+      .stRadio label,
+      .stCheckbox label {{
+        color: var(--cs-fg) !important;
+      }}
+
+      /* Primary = solid; secondary = outlined — theme-aware */
       .stButton > button[kind="primary"],
       .stButton > button[data-testid="baseButton-primary"],
       button[data-testid="stBaseButton-primary"],
-      .stLinkButton > a[data-testid="stBaseLinkButton-primary"] {
-        background-color: #000000 !important;
-        color: #ffffff !important;
-        border: 1px solid #000000 !important;
-      }
+      .stLinkButton > a[data-testid="stBaseLinkButton-primary"] {{
+        background-color: var(--cs-primary-bg) !important;
+        color: var(--cs-primary-fg) !important;
+        border: 1px solid var(--cs-primary-bg) !important;
+        opacity: 1 !important;
+      }}
       .stButton > button[kind="primary"]:hover,
       .stButton > button[data-testid="baseButton-primary"]:hover,
       button[data-testid="stBaseButton-primary"]:hover,
-      .stLinkButton > a[data-testid="stBaseLinkButton-primary"]:hover {
-        background-color: #222222 !important;
-        border-color: #222222 !important;
-        color: #ffffff !important;
-      }
-      .stButton > button, .stLinkButton > a {
+      .stLinkButton > a[data-testid="stBaseLinkButton-primary"]:hover {{
+        filter: brightness(1.08);
+        color: var(--cs-primary-fg) !important;
+        opacity: 1 !important;
+      }}
+      .stButton > button, .stLinkButton > a {{
         width: 100%;
         font-family: "Inter", sans-serif !important;
         font-weight: 600;
         padding: 0.65rem 1rem;
         border-radius: 0.35rem;
-        border: 1px solid #000000 !important;
-        background-color: #ffffff !important;
-        color: #000000 !important;
-      }
-      .stButton > button:hover, .stLinkButton > a:hover {
-        background-color: #f5f5f5 !important;
-        border-color: #000000 !important;
-        color: #000000 !important;
-      }
+        border: 1px solid var(--cs-heading) !important;
+        background-color: var(--cs-secondary-bg) !important;
+        color: var(--cs-secondary-fg) !important;
+        opacity: 1 !important;
+      }}
+      .stButton > button:hover, .stLinkButton > a:hover {{
+        background-color: var(--cs-secondary-hover) !important;
+        border-color: var(--cs-heading) !important;
+        color: var(--cs-secondary-fg) !important;
+      }}
       /* Re-assert primary after the general rule */
       .stButton > button[kind="primary"],
       .stButton > button[data-testid="baseButton-primary"],
       button[data-testid="stBaseButton-primary"],
-      .stLinkButton > a[data-testid="stBaseLinkButton-primary"] {
-        background-color: #000000 !important;
-        color: #ffffff !important;
-        border: 1px solid #000000 !important;
-      }
-      div[data-testid="stMetricValue"] {
+      .stLinkButton > a[data-testid="stBaseLinkButton-primary"] {{
+        background-color: var(--cs-primary-bg) !important;
+        color: var(--cs-primary-fg) !important;
+        border: 1px solid var(--cs-primary-bg) !important;
+      }}
+      /* Disabled — dark fill, white text, opacity ≥ 0.7 (readable) */
+      .stButton > button:disabled,
+      .stButton > button[disabled],
+      .stButton > button[kind="primary"]:disabled,
+      .stButton > button[kind="primary"][disabled],
+      .stButton > button[data-testid="baseButton-primary"]:disabled,
+      button[data-testid="stBaseButton-primary"]:disabled {{
+        background-color: var(--cs-disabled-bg) !important;
+        color: var(--cs-disabled-fg) !important;
+        border: 1px solid var(--cs-disabled-bg) !important;
+        opacity: 0.7 !important;
+        cursor: not-allowed !important;
+      }}
+
+      /* Copy-feedback custom button — explicit B&W, never wash out */
+      #cs-copy-feedback {{
+        background-color: var(--cs-primary-bg) !important;
+        color: var(--cs-primary-fg) !important;
+        border: 1px solid var(--cs-primary-bg) !important;
+        border-radius: 0.35rem !important;
+        font-family: "Inter", sans-serif !important;
+        font-weight: 600 !important;
+        opacity: 1 !important;
+      }}
+      #cs-copy-feedback:hover {{
+        filter: brightness(1.08);
+      }}
+      #cs-copy-feedback-status {{
+        color: var(--cs-caption) !important;
+      }}
+
+      div[data-testid="stMetricValue"] {{
         font-size: 1.35rem;
         font-family: "Inter", sans-serif !important;
-        color: #111111 !important;
-      }
-      .result-card {
-        background: #ffffff;
-        border: 1px solid #e5e5e5;
+        color: var(--cs-fg) !important;
+      }}
+      div[data-testid="stMetricLabel"] {{
+        color: var(--cs-caption) !important;
+      }}
+      .result-card {{
+        background: var(--cs-card);
+        border: 1px solid var(--cs-border);
         border-radius: 0.5rem;
         padding: 1.25rem 1.5rem;
         margin-top: 0.5rem;
-      }
-      .step-card {
-        border: 1px solid #e5e5e5;
+        color: var(--cs-fg);
+      }}
+      .step-card {{
+        border: 1px solid var(--cs-border);
         border-radius: 0.5rem;
         padding: 1.25rem 1.35rem 1.35rem;
         margin-bottom: 1.25rem;
-        background: #ffffff;
-      }
-      .step-card.locked {
-        opacity: 0.55;
-        background: #fafafa;
-      }
-      .step-badge {
+        background: var(--cs-card);
+        color: var(--cs-fg);
+      }}
+      /* Locked: muted colors only — no opacity stacking (avoids washed labels) */
+      .step-card.locked {{
+        background: var(--cs-locked-bg);
+        border-color: var(--cs-locked-border);
+        color: var(--cs-locked-fg);
+        opacity: 1 !important;
+      }}
+      .step-card.locked h3,
+      .step-card.locked .step-badge {{
+        color: var(--cs-locked-fg) !important;
+      }}
+      .step-badge {{
         display: inline-block;
         font-family: "Inter", sans-serif !important;
         font-size: 0.75rem;
         font-weight: 700;
         letter-spacing: 0.04em;
         text-transform: uppercase;
-        color: #8a8a8a;
+        color: var(--cs-muted);
         margin-bottom: 0.35rem;
-      }
-      .step-badge.active { color: #000000; }
-      .step-badge.done { color: #444444; }
-      .confirm-box {
-        background: #fafafa;
-        border: 1px solid #e5e5e5;
+      }}
+      .step-badge.active {{ color: var(--cs-heading); }}
+      .step-badge.done {{ color: var(--cs-caption); }}
+      .confirm-box {{
+        background: var(--cs-confirm);
+        border: 1px solid var(--cs-border);
         border-radius: 0.5rem;
         padding: 0.9rem 1rem;
         margin: 0.75rem 0;
-      }
-      /* Soften Streamlit accents toward grayscale */
-      [data-testid="stSidebar"] {
-        background: #fafafa !important;
-        border-right: 1px solid #e5e5e5;
-      }
-      hr, [data-testid="stDivider"] {
-        border-color: #e5e5e5 !important;
-      }
-      footer { visibility: hidden; }
+        color: var(--cs-fg);
+      }}
+      [data-testid="stSidebar"] {{
+        background: var(--cs-sidebar) !important;
+        border-right: 1px solid var(--cs-border);
+        color: var(--cs-fg) !important;
+      }}
+      [data-testid="stSidebar"] p,
+      [data-testid="stSidebar"] span,
+      [data-testid="stSidebar"] label,
+      [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+      [data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+      [data-testid="stSidebar"] [data-testid="stCaptionContainer"] * {{
+        color: var(--cs-fg) !important;
+      }}
+      [data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+      [data-testid="stSidebar"] [data-testid="stCaptionContainer"] * {{
+        color: var(--cs-caption) !important;
+      }}
+      /* Expander header readable */
+      [data-testid="stExpander"] summary,
+      [data-testid="stExpander"] summary span,
+      [data-testid="stExpander"] summary p {{
+        color: var(--cs-fg) !important;
+      }}
+      /* Inputs / select readable */
+      .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] > div,
+      textarea {{
+        color: var(--cs-fg) !important;
+      }}
+      hr, [data-testid="stDivider"] {{
+        border-color: var(--cs-border) !important;
+      }}
+      footer {{ visibility: hidden; }}
     </style>
+    <script>
+    (function () {{
+      try {{
+        document.documentElement.setAttribute("data-theme", "{theme}");
+        document.body && document.body.setAttribute("data-theme", "{theme}");
+      }} catch (e) {{}}
+    }})();
+    </script>
     """,
-    unsafe_allow_html=True,
-)
+        unsafe_allow_html=True,
+    )
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -603,7 +775,7 @@ def _render_step2(settings) -> None:
             "🔒 Complete Step 1 and confirm the book to unlock length, "
             "lyrics, and personalization controls."
         )
-        # Greyed-out preview of controls (disabled)
+        # Locked preview: length + lyrics on top; personalize collapsed; generate outside
         st.number_input(
             "Playlist length (hours)",
             min_value=0.0,
@@ -618,21 +790,35 @@ def _render_step2(settings) -> None:
             disabled=True,
             key="locked_lyrics",
         )
-        st.selectbox(
-            "Personal taste (Top Artists)",
-            options=["disable", "top5", "top10", "top15"],
-            index=2,
-            disabled=True,
-            key="locked_taste",
-        )
-        st.slider(
-            "Comfort ↔ Explorative",
-            0,
-            100,
-            25,
-            disabled=True,
-            key="locked_explore",
-        )
+        with st.expander("Personalize", expanded=False):
+            st.caption("Unlock Step 1 to adjust taste, exploration, and dry-run.")
+            st.selectbox(
+                "Personal taste (Top Artists)",
+                options=["disable", "top5", "top10", "top15"],
+                index=2,
+                disabled=True,
+                key="locked_taste",
+            )
+            st.slider(
+                "Comfort ↔ Explorative",
+                0,
+                100,
+                25,
+                disabled=True,
+                key="locked_explore",
+            )
+            st.toggle(
+                "Use Spotify Recommendations API",
+                value=True,
+                disabled=True,
+                key="locked_recs",
+            )
+            st.checkbox(
+                "Dry run (analyze / search plan only — no Spotify playlist write)",
+                value=False,
+                disabled=True,
+                key="locked_dry_run",
+            )
         st.button(
             "Generate Playlist",
             type="primary",
@@ -643,7 +829,7 @@ def _render_step2(settings) -> None:
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    # ── Unlocked controls (always overall / reading-companion playlist) ──
+    # ── Unlocked: length + lyrics on top; Personalize expander; Generate outside ──
     book = BookMetadata.model_validate(st.session_state[SS_BOOK])
     reading_h = float(st.session_state.get(SS_READING_HOURS) or 6.0)
     rec_hours = recommend_playlist_hours(reading_h)
@@ -658,12 +844,11 @@ def _render_step2(settings) -> None:
         "Chapter-by-chapter mode is not offered in the web UI."
     )
 
-    # 1. Playlist length (serious duration aim; never pad with mismatched cinema)
-    st.markdown("**1. Playlist length**")
+    # Playlist length (recommended for campus / NA romance–ish vibes)
+    st.markdown("**Playlist length**")
     st.caption(
         f"Recommended **~{rec_hours:g} hours** from your reading-time estimate "
-        f"({reading_h:g} h). Treated as a serious target — fills longer inside the "
-        "book’s style universe; will not pad with loud/mismatched cinema."
+        f"({reading_h:g} h). Soft target — fills in-style; will not pad with mismatched cinema."
     )
     length_choice = st.radio(
         "Length preference",
@@ -705,9 +890,9 @@ def _render_step2(settings) -> None:
     else:
         min_hours = 0.0
 
-    # 2. Lyrics
+    # Lyrics — nudge Allow lyrics / vocals for campus·NA romance (not forced)
     lyrics_label = st.selectbox(
-        "2. Lyrics preference",
+        "Lyrics preference",
         options=["Allow lyrics", "Prefer instrumental", "Instrumental only"],
         index=0,
         help=(
@@ -717,67 +902,79 @@ def _render_step2(settings) -> None:
         ),
         key="step2_lyrics",
     )
-
-    # 3. Taste / exploration / recommendations
-    st.markdown("**3. Personalization**")
     st.caption(
-        "Priority: **(1)** vocals / content safety → **(2)** book atmosphere → "
-        "**(3)** quality floor → **(4)** exploration → **(5)** Top Artists (soft)."
+        "For campus / New Adult romance–ish vibes, **Allow lyrics** / vocals is "
+        "recommended (not required — Prefer instrumental or Instrumental only still work)."
     )
-    taste_label = st.selectbox(
-        "Personal taste (Top Artists)",
-        options=["disable", "top5", "top10", "top15"],
-        index=2,
-        format_func=lambda x: {
-            "disable": "Disable — book vibe only",
-            "top5": "Top 5 artists",
-            "top10": "Top 10 artists (recommended)",
-            "top15": "Top 15 artists",
-        }[x],
-        help="Soft seeds from your Spotify listening — never overrides book vibe or lyrics rules.",
-        key="step2_taste",
-    )
-    if lyrics_label == "Instrumental only" and taste_label != "disable":
-        st.warning(
-            "Note: many of your top artists have vocals, so results may be limited "
-            "in **Instrumental only** mode. Top Artists stays enabled."
+
+    # Taste / exploration / recommendations / dry-run inside Personalize
+    with st.expander("Personalize", expanded=False):
+        st.caption(
+            "Priority: **(1)** vocals / content safety → **(2)** book atmosphere → "
+            "**(3)** quality floor → **(4)** exploration → **(5)** Top Artists (soft)."
+        )
+        taste_label = st.selectbox(
+            "Personal taste (Top Artists)",
+            options=["disable", "top5", "top10", "top15"],
+            index=2,
+            format_func=lambda x: {
+                "disable": "Disable — book vibe only",
+                "top5": "Top 5 artists",
+                "top10": "Top 10 artists (recommended)",
+                "top15": "Top 15 artists",
+            }[x],
+            help="Soft seeds from your Spotify listening — never overrides book vibe or lyrics rules.",
+            key="step2_taste",
+        )
+        if lyrics_label == "Instrumental only" and taste_label != "disable":
+            st.warning(
+                "Note: many of your top artists have vocals, so results may be limited "
+                "in **Instrumental only** mode. Top Artists stays enabled."
+            )
+
+        exploration = st.slider(
+            "Comfort ↔ Explorative",
+            min_value=0,
+            max_value=100,
+            value=25,
+            help=(
+                "0 = stick close to artists you already love · "
+                "100 = discover more new artists (still matching the book)."
+            ),
+            key="step2_exploration",
+        )
+        st.caption(
+            f"{'← Comfort' if exploration < 50 else 'Explore →'}  "
+            f"**{exploration}** "
+            f"({'mostly familiar' if exploration <= 35 else 'balanced' if exploration <= 65 else 'mostly new'})"
         )
 
-    exploration = st.slider(
-        "Comfort ↔ Explorative",
-        min_value=0,
-        max_value=100,
-        value=25,
-        help=(
-            "0 = stick close to artists you already love · "
-            "100 = discover more new artists (still matching the book)."
-        ),
-        key="step2_exploration",
-    )
-    st.caption(
-        f"{'← Comfort' if exploration < 50 else 'Explore →'}  "
-        f"**{exploration}** "
-        f"({'mostly familiar' if exploration <= 35 else 'balanced' if exploration <= 65 else 'mostly new'})"
-    )
+        use_recs = st.toggle(
+            "Use Spotify Recommendations API",
+            value=True,
+            help=(
+                "Seed Recommendations with book vibe (+ your artists when Top Artists is on). "
+                "Falls back to search if unavailable."
+            ),
+            key="step2_recs",
+        )
 
-    use_recs = st.toggle(
-        "Use Spotify Recommendations API",
-        value=True,
-        help=(
-            "Seed Recommendations with book vibe (+ your artists when Top Artists is on). "
-            "Falls back to search if unavailable."
-        ),
-        key="step2_recs",
-    )
+        dry_run = st.checkbox(
+            "Dry run (analyze / search plan only — no Spotify playlist write)",
+            value=False,
+            key="step2_dry_run",
+        )
 
-    dry_run = st.checkbox(
-        "Dry run (analyze / search plan only — no Spotify playlist write)",
-        value=False,
-        key="step2_dry_run",
-    )
+    # Defaults when Personalize expander widgets still exist via keys after first run;
+    # on first paint inside expander Streamlit still registers them. Read session keys
+    # so generate works even if user never opens the expander (widgets still mount).
+    taste_label = st.session_state.get("step2_taste", "top10")
+    exploration = int(st.session_state.get("step2_exploration", 25))
+    use_recs = bool(st.session_state.get("step2_recs", True))
+    dry_run = bool(st.session_state.get("step2_dry_run", False))
 
-    # 4. Generate
-    st.markdown("**4. Generate**")
+    # Generate stays outside expander
+    st.markdown("**Generate**")
     gen_clicked = st.button(
         "Generate Playlist",
         type="primary",
@@ -932,6 +1129,7 @@ def _render_step2(settings) -> None:
     st.rerun()
 
 
+
 def _render_results() -> None:
     snap = st.session_state.get(SS_RESULT)
     if not snap:
@@ -1008,7 +1206,7 @@ def _render_results() -> None:
                   <div style="font-size:1.25rem;font-weight:700;margin-bottom:0.35rem;">
                     {pl.get("name", "Playlist")}
                   </div>
-                  <div style="color:#6b6b6b;margin-bottom:0.75rem;">
+                  <div class="cs-result-muted" style="color:var(--cs-result-muted,#6b6b6b);margin-bottom:0.75rem;">
                     {dur_bits}
                   </div>
                 </div>
@@ -1032,10 +1230,10 @@ def _render_results() -> None:
 _COPY_FEEDBACK_HTML = """
 <div>
   <button type="button" id="cs-copy-feedback"
-          style="width:100%;font-weight:600;padding:0.65rem 1rem;">
+          style="width:100%;font-weight:600;padding:0.65rem 1rem;background:#000;color:#fff;border:1px solid #000;border-radius:0.35rem;">
     Copy feedback
   </button>
-  <p id="cs-copy-feedback-status" role="status" style="min-height:1.25rem;margin:0.35rem 0 0;"></p>
+  <p id="cs-copy-feedback-status" role="status" style="min-height:1.25rem;margin:0.35rem 0 0;color:#444;"></p>
 </div>
 <script>
 (function () {
@@ -1044,17 +1242,8 @@ _COPY_FEEDBACK_HTML = """
   if (!btn || btn.dataset.bound === "1") return;
   btn.dataset.bound = "1";
 
-  const sample = document.querySelector('[data-testid="stBaseButton-primary"]');
-  if (sample) {
-    const cs = window.getComputedStyle(sample);
-    btn.style.background = cs.backgroundColor;
-    btn.style.color = cs.color;
-    btn.style.border = cs.border;
-    btn.style.borderRadius = cs.borderRadius;
-    btn.style.font = cs.font;
-    btn.style.fontWeight = cs.fontWeight;
-    btn.style.padding = cs.padding;
-  }
+  // Colors come from #cs-copy-feedback CSS (theme vars) — do not copy
+  // computed primary styles (Streamlit Dark menu can wash them to white-on-white).
   btn.style.width = "100%";
   btn.style.cursor = "pointer";
   btn.style.boxSizing = "border-box";
@@ -1173,13 +1362,29 @@ def main() -> None:
 
     _handle_oauth_redirect()
 
+    if SS_DARK_MODE not in st.session_state:
+        st.session_state[SS_DARK_MODE] = False
+
+    # Inject once per run from session (toggle key updates state before rerun)
+    _inject_theme_css(dark=bool(st.session_state[SS_DARK_MODE]))
+
     if st.session_state.pop("auth_flash_ok", None):
         st.toast("Spotify connected", icon="✅")
     flash_err = st.session_state.pop("auth_flash_error", None)
     if flash_err:
         st.error(flash_err)
 
-    st.markdown("# ChapterScore")
+    title_col, theme_col = st.columns([4, 1])
+    with title_col:
+        st.markdown("# ChapterScore")
+    with theme_col:
+        st.write("")  # nudge toggle toward title baseline
+        st.toggle(
+            "Dark mode",
+            key=SS_DARK_MODE,
+            help="Black / near-black ground with light cards and text (B&W only).",
+        )
+
     st.markdown(
         '<p class="subtitle">Every book deserves its own soundtrack</p>',
         unsafe_allow_html=True,
