@@ -642,7 +642,16 @@ def _playlist_tracks(
             _do, label=f"playlist-items:{playlist_id[:12]}", retries=0, session=session
         )
     except (SpotifyTimeoutError, SpotifyRateLimitError, SpotifyAPIError) as exc:
-        logger.warning("playlist_items failed for %s: %s", playlist_id, exc)
+        msg = str(exc).lower()
+        if "403" in msg or "401" in msg or "forbidden" in msg:
+            session.playlist_items_unavailable = True
+            logger.warning(
+                "playlist_items forbidden for %s (%s) — aborting further harvests",
+                playlist_id,
+                exc,
+            )
+        else:
+            logger.warning("playlist_items failed for %s: %s", playlist_id, exc)
         return []
 
 
@@ -691,6 +700,8 @@ def harvest_reference_playlist_tracks(
     per_query_playlists = 3 if max_playlists >= 14 else 2
 
     for pool, query in pairs:
+        if session.playlist_items_unavailable:
+            break
         if session.budget_exhausted() or session.rate_limited:
             log("Reference playlists — stopping (budget / rate limit)")
             break
@@ -724,6 +735,12 @@ def harvest_reference_playlist_tracks(
             tracks = _playlist_tracks(
                 sp, pid, limit=tracks_per_playlist, session=session
             )
+            if session.playlist_items_unavailable:
+                log(
+                    "Reference playlists — playlist_items returned 403; "
+                    "aborting Stage 1b harvest early"
+                )
+                break
             added = 0
             for t in tracks:
                 tid = t.get("id")

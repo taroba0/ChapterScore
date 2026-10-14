@@ -160,3 +160,55 @@ def test_romance_query_pairs_include_cafe_or_soft_pop():
     )
     pools = {p for p, _ in pairs}
     assert pools & {"cafe_reads", "soft_pop", "rnb_soul", "folk_indie"}
+
+def test_harvest_aborts_on_playlist_items_403():
+    """First playlist_items 403 must stop Stage 1b — no spam of further playlist calls."""
+    from unittest.mock import MagicMock, patch
+
+    from chapterscore.spotify.reference_playlists import harvest_reference_playlist_tracks
+    from chapterscore.spotify.search import SpotifyAPIError, start_search_session
+
+    analysis = _the_deal()
+    session = start_search_session()
+    progress_msgs: list[str] = []
+
+    fake_playlist = {
+        "id": "pl1",
+        "name": "Cafe Acoustic Vibes",
+        "tracks": {"total": 100},
+        "followers": {"total": 5000},
+    }
+
+    call_count = {"n": 0}
+
+    def _boom(*_a, **_k):
+        call_count["n"] += 1
+        raise SpotifyAPIError("Spotify API error (403): Forbidden")
+
+    sp = MagicMock()
+    with patch(
+        "chapterscore.spotify.reference_playlists._search_playlists",
+        return_value=[fake_playlist, {**fake_playlist, "id": "pl2", "name": "Soft Pop"}],
+    ), patch(
+        "chapterscore.spotify.reference_playlists._spotify_call",
+        side_effect=_boom,
+    ):
+        out = harvest_reference_playlist_tracks(
+            sp,
+            analysis,
+            LyricsPreference.ALLOW_LYRICS,
+            max_playlists=8,
+            tracks_per_playlist=20,
+            max_raw_tracks=200,
+            max_pools=4,
+            max_queries=6,
+            progress=progress_msgs.append,
+            session=session,
+        )
+
+    assert out == []
+    assert session.playlist_items_unavailable is True
+    # Only one playlist_items attempt — abort before spamming
+    assert call_count["n"] == 1
+    assert any("403" in m and "abort" in m.lower() for m in progress_msgs)
+

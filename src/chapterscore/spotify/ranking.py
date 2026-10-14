@@ -1628,6 +1628,7 @@ def passes_popularity_filter(
     min_popularity: int,
     *,
     strict: bool = True,
+    popularity_unavailable: bool = False,
 ) -> bool:
     """
     Hard-ish catalogue quality gate.
@@ -1635,14 +1636,20 @@ def passes_popularity_filter(
     - Known popularity must be ≥ min_popularity (default ~40).
     - Missing/zero popularity is NOT acceptable by default: require a strong
       catalogue signal (known score artist / soundtrack+instrumental cue) or reject.
+    - When ``popularity_unavailable`` (Spotify omits the field / enrichment
+      403), soft-pass unknown/zero popularity — ranking still applies
+      ``quality_penalty`` / lower pop_score; do not hard-reject the pool.
     - ``strict=False`` still rejects unknown pop unless that strong signal exists
-      (quality over length — never pad with obscure empties).
+      (quality over length — never pad with obscure empties), unless
+      ``popularity_unavailable`` is set.
     """
     if min_popularity <= 0:
         return True
     if track.popularity > 0:
         return track.popularity >= min_popularity
-    # Unknown popularity
+    # Unknown popularity (0 or omitted)
+    if popularity_unavailable:
+        return True  # soft-pass; quality_penalty / scoring still demote unknowns
     if has_strong_catalogue_signal(track):
         return True
     return False  # prefer reject when unsure

@@ -63,6 +63,10 @@ class SearchSession:
     queries_failed: int = 0
     queries_timed_out: int = 0
     queries_rate_limited: int = 0
+    # Spotify search/playlist responses sometimes omit popularity or forbid
+    # playlist_items (403). Soft-pass unknown pop / abort harvest when set.
+    popularity_unavailable: bool = False
+    playlist_items_unavailable: bool = False
 
     def remaining(self) -> float:
         return max(0.0, self.budget_seconds - (time.monotonic() - self.started_at))

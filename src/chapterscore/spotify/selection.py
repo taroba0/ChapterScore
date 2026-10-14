@@ -132,6 +132,23 @@ def _rank_raw(
     suitable = analysis.style_keywords_good() if analysis else []
     avoid = analysis.style_keywords_bad() if analysis else []
 
+    session = get_search_session()
+    # When Spotify search/playlist payloads omit popularity consistently,
+    # soft-pass unknown pop for this run (keep scoring / quality_penalty).
+    if raw_tracks and not session.popularity_unavailable:
+        missing = sum(
+            1 for t in raw_tracks if t.get("popularity") is None
+        )
+        if missing >= max(1, int(0.8 * len(raw_tracks))):
+            session.popularity_unavailable = True
+            logger.info(
+                "Spotify popularity field missing on %s/%s tracks — "
+                "soft-passing unknown popularity for this session",
+                missing,
+                len(raw_tracks),
+            )
+    pop_unavailable = session.popularity_unavailable
+
     for t in raw_tracks:
         base = track_dict_to_base(t)
         feats = features.get(base["id"], {})
@@ -166,8 +183,14 @@ def _rank_raw(
         # Priority 1: hard lyrics / instrumental constraint (outranks taste/recs/fallback)
         if not passes_lyrics_filter(track, lyrics, strictness=strictness):
             continue
-        # Priority 1b: hard popularity floor — unknown pop needs strong catalogue signal
-        if min_pop > 0 and not passes_popularity_filter(track, min_pop, strict=True):
+        # Priority 1b: hard popularity floor — unknown pop needs strong catalogue
+        # signal unless Spotify omitted popularity for this session (soft-pass).
+        if min_pop > 0 and not passes_popularity_filter(
+            track,
+            min_pop,
+            strict=True,
+            popularity_unavailable=pop_unavailable,
+        ):
             continue
         # Soft taste — never overrides content / lyrics / reading continuity / vibe
         affinity = taste.affinity_for_artists(track.artists) if taste else 0.0

@@ -111,6 +111,23 @@ def test_unknown_popularity_rejected_without_strong_signal():
     assert passes_popularity_filter(known_score, 40) is True
 
 
+def test_unknown_popularity_soft_pass_when_unavailable():
+    """When Spotify omits popularity, soft-pass unknown — do not empty romance/cafe pools."""
+    from chapterscore.spotify.ranking import passes_popularity_filter, quality_penalty
+
+    obscure = _t("u1", "Random Untitled Cue", ["Unknown Bedroom Producer"], popularity=0)
+    soft_pop = _t("u3", "Cafe Soft Pop", ["Indie Artist"], popularity=0)
+    known_low = _t("u4", "Chart Hit", ["Pop Star"], popularity=25)
+
+    assert passes_popularity_filter(obscure, 40, popularity_unavailable=True) is True
+    assert passes_popularity_filter(soft_pop, 40, popularity_unavailable=True) is True
+    # Known-but-below-floor still rejected even when session flag is set
+    assert passes_popularity_filter(known_low, 40, popularity_unavailable=True) is False
+    # quality_penalty still applies for unknown when popularity_known=True path
+    # (score_track uses popularity_known=False for pop<=0; penalty exists for known)
+    assert quality_penalty(obscure, popularity_known=False) > 0
+
+
 def test_instrumental_only_rejects_when_features_missing_and_no_cues():
     from chapterscore.spotify.ranking import InstrumentalStrictness, passes_lyrics_filter
 
