@@ -195,6 +195,38 @@ def world_locked_queries(
             add(q, reason="world-pastoral")
             if len(out) >= max_queries:
                 break
+    else:
+        # Romance / campus / contemporary intimate — lock cafe / soft pop / R&B early
+        blob = literary_world_blob(analysis)
+        styles_l = " ".join(analysis.suitable_styles or []).lower()
+        title_l = (analysis.book_title or "").lower()
+        romance_hit = any(
+            k in blob or k in styles_l
+            for k in (
+                "romance",
+                "campus",
+                "college",
+                "new adult",
+                "young adult",
+                "rom-com",
+                "romcom",
+                "soft pop",
+                "r&b",
+                "neo soul",
+            )
+        ) or any(k in title_l for k in ("the deal", "the mistake", "the score", "the goal"))
+        if romance_hit and not inst:
+            for q in (
+                "cafe acoustic chill",
+                "soft pop chill",
+                "chill r&b soft",
+                "indie folk acoustic soft",
+                "coffee shop indie",
+                "gentle singer songwriter",
+            ):
+                add(q, reason="world-romance")
+                if len(out) >= max_queries:
+                    break
 
     return out[:max_queries]
 
@@ -213,6 +245,13 @@ _INSTRUMENTAL_SEEDS = [
     "ominous low brass score",
     "mysterious ambient drone",
     "desert ambient soundscape",
+    # Wider textures (cafe / guitar / chamber) beyond the same piano composers
+    "cafe jazz instrumental",
+    "classical guitar instrumental calm",
+    "fingerstyle guitar instrumental",
+    "chamber strings reading",
+    "lofi instrumental study",
+    "documentary guitar score",
     # Kept but low priority / gated for realist books:
     "cinematic orchestral soundtrack",
     "adventure orchestral theme",
@@ -273,6 +312,61 @@ _PASTORAL_ADJACENT_EXPAND = [
 ]
 
 
+
+# Contemporary romance / campus / YA-NA — duration fill stays in cafe / soft pop / R&B / folk
+_ROMANCE_CAMPUS_SEEDS = [
+    "cafe acoustic chill",
+    "coffee shop indie",
+    "soft pop chill vibes",
+    "bedroom pop soft",
+    "chill r&b soft",
+    "neo soul quiet storm",
+    "gentle indie folk",
+    "soft singer songwriter",
+    "campus soft pop",
+    "romantic indie pop",
+    "feel good soft pop",
+    "acoustic love songs chill",
+    "mellow pop ballad",
+    "indie folk guitar soft",
+]
+
+_ROMANCE_ADJACENT_EXPAND = [
+    "harry styles soft",
+    "clairo soft",
+    "beabadoobee chill",
+    "girl in red soft",
+    "mxmtoon",
+    "lauv soft",
+    "jeremy zucker chill",
+    "alec benjamin soft",
+    "noah kahan soft",
+    "hozier soft acoustic",
+    "bon iver quiet",
+    "phone ring soft pop",
+    "study with me soft pop",
+    "late night drive r&b",
+    "rainy day indie pop",
+    "bookstore romance playlist vibe",
+    "slow burn romance songs",
+    "tender indie ballad",
+]
+
+# Epic / mythic fantasy fill — soundtrack + ambient, not cafe pad
+_EPIC_FANTASY_FILL = [
+    "fantasy adventure score quiet",
+    "emotional fantasy film score",
+    "orchestral fantasy ambient",
+    "quiet epic strings instrumental",
+    "mythic ambient instrumental",
+    "celtic fantasy instrumental calm",
+    "adventure score piano quiet",
+    "howard shore quiet",
+    "two steps from hell soft",
+    "fantasy soundtrack instrumental calm",
+]
+
+
 def in_style_deep_fill_queries(
     analysis: BookVibeAnalysis,
     lyrics: LyricsPreference,
@@ -283,8 +377,9 @@ def in_style_deep_fill_queries(
     """
     Extra queries inside the book's locked style universe for duration fill.
 
-    Never injects spectacle / Potter / racing / sci-fi banks. Used when the
-    playlist is still under the requested min_hours.
+    Genre-aware: romance/campus → cafe / soft pop / R&B / folk; pastoral
+    realist → pastoral banks; epic fantasy → soundtrack / ambient carefully.
+    Never injects spectacle / Potter / racing / sci-fi banks for the wrong world.
     """
     out: list[SearchQuerySpec] = []
     seen: set[str] = set()
@@ -292,12 +387,50 @@ def in_style_deep_fill_queries(
     energy = min(energy, 0.5)
     realist = is_realist_literary_world(analysis)
     allow_cinema = allows_generic_cinematic_fallback(analysis)
+    blob = literary_world_blob(analysis)
+    intimacy = analysis.intimacy_vs_epic if analysis.intimacy_vs_epic is not None else 0.5
+    inst_only = lyrics.normalized().is_instrumental_only
+
+    romance_keys = (
+        "romance",
+        "romantic",
+        "campus",
+        "college",
+        "new adult",
+        "young adult",
+        "enemies to lovers",
+        "rom-com",
+        "romcom",
+        "soft pop",
+        "r&b",
+        "neo soul",
+    )
+    title = (analysis.book_title or "").lower()
+    styles = " ".join(analysis.suitable_styles or []).lower()
+    is_romance = (
+        any(k in blob or k in styles for k in romance_keys)
+        or any(k in title for k in ("the deal", "the mistake", "the score", "the goal"))
+        or (
+            intimacy >= 0.55
+            and not realist
+            and any(k in styles for k in ("pop", "r&b", "soul", "indie"))
+        )
+    )
+    is_epic_fantasy = (not realist) and allow_cinema and any(
+        k in blob
+        for k in ("epic fantasy", "high fantasy", "quest fantasy", "dragon", "wizard", "mythic", "magic")
+    )
 
     def add(q: str, reason: str) -> None:
         key = " ".join(q.lower().split())
         if not key or key in seen:
             return
         if (realist or not allow_cinema) and _query_is_spectacle(key):
+            return
+        # Romance fill must not drift into pastoral/spectacle padding
+        if is_romance and any(
+            k in key for k in ("pastoral", "salinas", "dust bowl", "trailer", "zimmer", "potter")
+        ):
             return
         seen.add(key)
         if lyrics.normalized().is_instrumental_only and not any(
@@ -314,39 +447,87 @@ def in_style_deep_fill_queries(
             )
         )
 
-    # Round 1: world-lock + pastoral core; Round 2+: adjacent artists/textures
+    # Round 1: world-lock + genre core; Round 2+: adjacent textures in same family
     if fill_round <= 1:
         for sq in world_locked_queries(analysis, lyrics, max_queries=8):
             add(sq.query, reason=f"fill-world:{sq.reason or 'lock'}")
-        for q in _PASTORAL_REALIST_SEEDS:
-            add(q, reason="fill-pastoral")
-            if len(out) >= max_queries:
-                break
+        if is_romance and not inst_only:
+            for q in _ROMANCE_CAMPUS_SEEDS:
+                add(q, reason="fill-romance")
+                if len(out) >= max_queries:
+                    break
+        elif is_epic_fantasy:
+            for q in _EPIC_FANTASY_FILL:
+                add(q, reason="fill-fantasy")
+                if len(out) >= max_queries:
+                    break
+        elif realist or not allow_cinema:
+            for q in _PASTORAL_REALIST_SEEDS:
+                add(q, reason="fill-pastoral")
+                if len(out) >= max_queries:
+                    break
+        else:
+            for q in _PASTORAL_REALIST_SEEDS[:6]:
+                add(q, reason="fill-adjacent-safe")
+                if len(out) >= max_queries:
+                    break
     else:
-        offset = (fill_round - 2) * max_queries
-        chunk = _PASTORAL_ADJACENT_EXPAND[offset : offset + max_queries]
-        if not chunk:
-            chunk = list(_PASTORAL_ADJACENT_EXPAND)
-        for q in chunk:
-            add(q, reason=f"fill-adjacent:r{fill_round}")
+        if is_romance and not inst_only:
+            offset = (fill_round - 2) * max_queries
+            chunk = _ROMANCE_ADJACENT_EXPAND[offset : offset + max_queries]
+            if not chunk:
+                chunk = list(_ROMANCE_ADJACENT_EXPAND)
+            for q in chunk:
+                add(q, reason=f"fill-romance-adj:r{fill_round}")
+            for q in _ROMANCE_CAMPUS_SEEDS:
+                add(q, reason=f"fill-romance-core:r{fill_round}")
+        elif is_epic_fantasy:
+            for q in _EPIC_FANTASY_FILL:
+                add(q, reason=f"fill-fantasy:r{fill_round}")
+            offset = (fill_round - 2) * max_queries
+            chunk = _PASTORAL_ADJACENT_EXPAND[offset : offset + max_queries]
+            for q in chunk[:4]:
+                add(q, reason=f"fill-quiet:r{fill_round}")
+        else:
+            offset = (fill_round - 2) * max_queries
+            chunk = _PASTORAL_ADJACENT_EXPAND[offset : offset + max_queries]
+            if not chunk:
+                chunk = list(_PASTORAL_ADJACENT_EXPAND)
+            for q in chunk:
+                add(q, reason=f"fill-adjacent:r{fill_round}")
         for style in (analysis.suitable_styles or [])[:6]:
             s = style.strip()
             if s:
-                add(f"{s} instrumental", reason="fill-style")
+                if inst_only and "instrumental" not in s.lower():
+                    add(f"{s} instrumental", reason="fill-style")
+                else:
+                    add(s, reason="fill-style")
         if analysis.era_feel:
-            add(f"{analysis.era_feel} quiet instrumental", reason="fill-era")
+            add(
+                f"{analysis.era_feel} quiet instrumental"
+                if inst_only
+                else f"{analysis.era_feel} soft songs",
+                reason="fill-era",
+            )
         if analysis.setting_texture:
             words = " ".join(analysis.setting_texture.split()[:5])
-            add(f"{words} score", reason="fill-setting")
+            add(f"{words} score" if inst_only else f"{words} vibes", reason="fill-setting")
 
-    # Intimate neoclassical always safe as adjacent for literary realism
-    if realist or not allow_cinema:
+    # Intimate neoclassical always safe as adjacent for literary realism (not romance vocal fill)
+    if (realist or not allow_cinema) and not is_romance:
         for q in _INTIMATE_INSTRUMENTAL[:8]:
             add(q, reason="fill-intimate")
             if len(out) >= max_queries:
                 break
+    elif is_romance and inst_only:
+        for q in _INTIMATE_INSTRUMENTAL[:6]:
+            add(q, reason="fill-romance-inst")
+            if len(out) >= max_queries:
+                break
 
     return out[:max_queries]
+
+
 
 # Intimate / emotional instrumental (bittersweet novels, character drama)
 _INTIMATE_INSTRUMENTAL = [
@@ -602,6 +783,21 @@ _VOCAL_FRIENDLY_SEEDS = [
     "ethereal art pop",
     "brooding alternative",
     "cinematic soul",
+    # Wider pools so different book vibes diverge (cafe / R&B / country / guitar)
+    "cafe acoustic chill",
+    "coffee shop indie playlist vibe",
+    "chill r&b soft",
+    "neo soul quiet storm",
+    "americana country ballad",
+    "alt country acoustic",
+    "fingerstyle guitar songs",
+    "soft singer songwriter",
+    "film soundtrack songs vocal",
+    "indie folk guitar",
+    "campus soft pop",
+    "romantic indie pop chill",
+    "bedroom pop study",
+    "soft r&b ballad",
 ]
 
 # Map atmosphere labels → concrete search phrases

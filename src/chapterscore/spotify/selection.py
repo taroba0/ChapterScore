@@ -62,6 +62,7 @@ from chapterscore.spotify.queries import (
     vibe_instrumental_queries,
     world_locked_queries,
 )
+from chapterscore.spotify.reference_playlists import harvest_reference_playlist_tracks
 from chapterscore.spotify.ranking import (
     InstrumentalStrictness,
     apply_overall_cohesion,
@@ -430,49 +431,72 @@ def _pick_quality(
     intimacy_vs_epic: float | None = None,
     cohesive: bool = False,
     smooth: bool = True,
+    duration_fill: bool = False,
+    min_hours: float | None = None,
 ) -> list[RankedTrack]:
     """
     Quality-first selection up to a soft target.
 
     Never pads with weak/jarring tracks. Applies reading-safe cohesion and
     adjacent-energy smoothing. Always de-duplicates.
+
+    When ``duration_fill`` is True (requested hours still under target), use a
+    wider energy band and a slightly lower score floor so we can reach ~hours
+    without collapsing to a handful of tracks.
     """
     candidates = [
         t for t in pool if passes_content_filter(t) and not is_too_intense_for_reading(t)
     ]
+    # Wider band when filling toward hours (or when audio-features are sparse —
+    # handled inside drop_reading_band_outliers).
+    band_override = 0.26 if duration_fill else None
     if cohesive:
         candidates = apply_overall_cohesion(
             candidates,
             book_energy=book_energy,
             intimacy_vs_epic=intimacy_vs_epic,
+            max_energy_gap=band_override,
         )
-        # Hard-drop mood/energy outliers — shorter cohesive > longer uneven
         candidates = drop_reading_band_outliers(
             candidates,
             book_energy=book_energy,
             intimacy_vs_epic=intimacy_vs_epic,
+            max_dev=band_override,
         )
 
     candidates = filter_music_only(candidates)
     floor = _quality_floor(lyrics)
+    if duration_fill:
+        floor = floor * 0.72
     chosen = select_diverse(
         candidates, target, max_per_artist=max_per_artist, min_score=floor
     )
-    # Only lower the score floor slightly if very thin — never reintroduce outliers
-    if len(chosen) < max(4, int(target * 0.30)):
+    # Lower the score floor if still thin vs hour-derived target
+    thin_bar = max(4, int(target * (0.45 if duration_fill else 0.30)))
+    if len(chosen) < thin_bar:
         chosen = select_diverse(
             candidates,
             target,
-            max_per_artist=max_per_artist,
-            min_score=floor * 0.65,
+            max_per_artist=max(max_per_artist, 3 if duration_fill else max_per_artist),
+            min_score=floor * (0.50 if duration_fill else 0.65),
         )
     chosen = filter_music_only(dedupe_tracks(chosen))
     if cohesive:
-        chosen = drop_reading_band_outliers(
-            chosen,
-            book_energy=book_energy,
-            intimacy_vs_epic=intimacy_vs_epic,
-        )
+        # Second pass: only hard-drop when NOT duration-filling; otherwise keep
+        # the wider-band set so multi-hour requests are not re-collapsed.
+        if duration_fill:
+            chosen = drop_reading_band_outliers(
+                chosen,
+                book_energy=book_energy,
+                intimacy_vs_epic=intimacy_vs_epic,
+                max_dev=max(band_override or 0.26, 0.30),
+            )
+        else:
+            chosen = drop_reading_band_outliers(
+                chosen,
+                book_energy=book_energy,
+                intimacy_vs_epic=intimacy_vs_epic,
+            )
     if smooth and chosen:
         chosen = smooth_playlist_order(chosen, drop_jarring=True)
     return chosen
@@ -517,9 +541,10 @@ def select_tracks_for_analysis(
     # Longer listening requests need more search wall-clock (still capped)
     base_budget = settings.chapterscore_spotify_collection_budget
     if min_hours and min_hours >= 2.0:
-        budget_seconds = min(600.0, base_budget * max(1.0, float(min_hours) / 1.5))
+        # 2.4h ≈ need ~40+ keepers; give search room for playlist harvest + fill
+        budget_seconds = min(720.0, base_budget * max(1.5, float(min_hours) / 1.2))
     elif min_hours and min_hours >= 1.0:
-        budget_seconds = min(420.0, base_budget * 1.25)
+        budget_seconds = min(480.0, base_budget * 1.5)
     else:
         budget_seconds = base_budget
     session = start_search_session(
@@ -645,6 +670,7 @@ def _select_overall(
         return not session.budget_exhausted()
 
     def _finalize(pool: list[RankedTrack], *, label: str) -> list[RankedTrack]:
+        # Probe without duration relax first; if hours still short, re-pick with fill mode
         chosen = _pick_quality(
             pool,
             target,
@@ -654,7 +680,34 @@ def _select_overall(
             intimacy_vs_epic=analysis.intimacy_vs_epic,
             cohesive=True,
             smooth=True,
+            duration_fill=False,
+            min_hours=min_hours,
         )
+        if (
+            min_hours
+            and min_hours > 0
+            and (
+                not chosen
+                or _playlist_hours(chosen) < min_hours * _DURATION_FILL_RATIO
+                or len(chosen) < max(8, int(target * 0.5))
+            )
+        ):
+            fill_pick = _pick_quality(
+                pool,
+                target,
+                max_per_artist=max(max_art, 3),
+                lyrics=lyrics,
+                book_energy=analysis.overall_energy,
+                intimacy_vs_epic=analysis.intimacy_vs_epic,
+                cohesive=True,
+                smooth=True,
+                duration_fill=True,
+                min_hours=min_hours,
+            )
+            if len(fill_pick) > len(chosen) or (
+                fill_pick and _playlist_hours(fill_pick) > _playlist_hours(chosen)
+            ):
+                chosen = fill_pick
         if chosen:
             hrs = _playlist_hours(chosen)
             progress(
@@ -745,7 +798,7 @@ def _select_overall(
         limit_q = 40 if long_session else 30
     else:
         primary_specs = expand_queries_from_analysis(
-            analysis, lyrics, max_queries=18 if long_session else 14, cohesive_overall=True
+            analysis, lyrics, max_queries=22 if long_session else 14, cohesive_overall=True
         )
         if personal_specs and taste.prefs.exploration <= 55:
             primary_specs = personal_specs[:6] + primary_specs
@@ -753,8 +806,9 @@ def _select_overall(
             primary_specs = personal_specs[:3] + primary_specs
         progress(f"Stage 1 — {len(primary_specs)} book-vibe + taste queries (cohesive overall)")
         strict1 = InstrumentalStrictness.PERMISSIVE
-        early1 = max(160 if long_session else 100, target * (8 if long_session else 6))
-        limit_q = 30 if long_session else None
+        # Long vocal requests (e.g. romance @ 2.4h) need the same per-query depth
+        early1 = max(200 if long_session else 100, target * (9 if long_session else 6))
+        limit_q = 40 if long_session else 30
 
     pool1 = _search_pool(
         sp,
@@ -772,6 +826,97 @@ def _select_overall(
     chosen = _finalize(pool, label="Stage 1")
     if chosen and not _should_search_more(chosen, target, min_hours, quality_floor=q_floor):
         return chosen
+
+    # ── Stage 1b: harvest tracks from diverse Spotify reference playlists ──
+    # Widens the candidate universe beyond keyword track-search (cafe / piano /
+    # guitar / R&B / country / soft pop / soundtrack / …) so book vibes diverge.
+    # Runs early for any min_hours≥1.0 so long requests (e.g. 2.4h) get a fat pool
+    # before later stages burn budget.
+    def _ingest_reference_harvest(
+        *,
+        label: str,
+        max_playlists: int,
+        tracks_per_playlist: int,
+        max_raw_tracks: int,
+        max_pools: int = 6,
+        max_queries: int | None = None,
+    ) -> list[RankedTrack]:
+        nonlocal pool
+        if not _stage_ok() or session.rate_limited:
+            return []
+        ref_raw = harvest_reference_playlist_tracks(
+            sp,
+            analysis,
+            lyrics,
+            max_playlists=max_playlists,
+            tracks_per_playlist=tracks_per_playlist,
+            max_raw_tracks=max_raw_tracks,
+            max_pools=max_pools,
+            max_queries=max_queries,
+            progress=progress,
+            session=session,
+        )
+        if not ref_raw:
+            return []
+        ids = [t["id"] for t in ref_raw if t.get("id")]
+        features = get_audio_features(sp, ids, session=session) if ids else {}
+        ref_spec = SearchQuerySpec(
+            query=analysis.overall_mood or "reading companion",
+            energy=analysis.overall_energy,
+            reason="reference-playlist",
+        )
+        ref_strict = (
+            InstrumentalStrictness.MODERATE
+            if lyrics.is_instrumental_only
+            else InstrumentalStrictness.PERMISSIVE
+        )
+        ref_ranked = _rank_raw(
+            ref_raw,
+            features,
+            ref_spec,
+            lyrics,
+            matched_query="spotify:reference-playlist",
+            strictness=ref_strict,
+            taste=taste,
+            analysis=analysis,
+        )
+        pool = _merge_unique(pool, ref_ranked)
+        progress(
+            f"Stage [{label}]: {len(ref_raw)} raw → {len(ref_ranked)} after filters"
+        )
+        return ref_ranked
+
+    if _stage_ok() and not session.rate_limited:
+        need_refs = (not chosen) or _should_search_more(
+            chosen, target, min_hours, quality_floor=q_floor
+        )
+        if need_refs or (min_hours and min_hours >= 1.0):
+            progress(
+                f"Stage 1b — reference playlist harvest "
+                f"({len(chosen)}/~{target}"
+                + (f", aim {min_hours:g} h" if min_hours else "")
+                + ")"
+            )
+            # 2.4h ≈ ~40 keepers: harvest more playlists / tracks up front
+            if long_session:
+                ref_limit, per_pl, raw_cap, pools_n, q_n = 16, 45, 420, 7, 22
+            elif min_hours and min_hours >= 1.0:
+                ref_limit, per_pl, raw_cap, pools_n, q_n = 12, 40, 320, 6, 16
+            else:
+                ref_limit, per_pl, raw_cap, pools_n, q_n = 8, 30, 200, 5, 12
+            _ingest_reference_harvest(
+                label="1b/refs",
+                max_playlists=ref_limit,
+                tracks_per_playlist=per_pl,
+                max_raw_tracks=raw_cap,
+                max_pools=pools_n,
+                max_queries=q_n,
+            )
+            chosen = _finalize(pool, label="Stage 1b")
+            if chosen and not _should_search_more(
+                chosen, target, min_hours, quality_floor=q_floor
+            ):
+                return chosen
 
     # ── Stage 2: relax instrumental threshold ─────────────────────────────
     if lyrics.is_instrumental_only and _stage_ok():
@@ -813,7 +958,8 @@ def _select_overall(
             strictness=strictness3,
             progress=progress,
             label="3/broad",
-            early_stop_raw=60,
+            early_stop_raw=100 if long_session else 60,
+            limit_per_query=40 if long_session else None,
             taste=taste,
             analysis=analysis,
         )
@@ -852,8 +998,8 @@ def _select_overall(
                 strictness=strictness3,
                 progress=progress,
                 label="4/pastoral" if patience_world else "4/cinematic",
-                early_stop_raw=120 if (min_hours and min_hours >= 2) else 80,
-                limit_per_query=30 if (min_hours and min_hours >= 2) else None,
+                early_stop_raw=140 if long_session else 80,
+                limit_per_query=40 if long_session else None,
                 taste=taste,
                 analysis=analysis,
             )
@@ -866,9 +1012,10 @@ def _select_overall(
                 return chosen
 
     # ── Stage 5: in-style deep fill (same universe; no spectacle pad) ──────
-    # Keep searching adjacent pastoral / era-correct artists until duration
-    # is near min_hours or the in-style pool stops growing.
-    max_fill_rounds = 4 if (min_hours and min_hours >= 2.0) else 2
+    # Keep searching adjacent in-genre artists until duration is near min_hours
+    # or the in-style pool stops growing. Also expands reference-playlist harvest
+    # when hours are still short (more queries / playlists / track search).
+    max_fill_rounds = 5 if (min_hours and min_hours >= 2.0) else 2
     prev_n = len(chosen)
     for fill_round in range(1, max_fill_rounds + 1):
         if not _should_search_more(chosen, target, min_hours, quality_floor=q_floor):
@@ -882,11 +1029,30 @@ def _select_overall(
             + (f" / aim {min_hours:g} h" if min_hours else "")
             + "; same style band only)"
         )
+        # Extra playlist harvest mid-fill when duration still short
+        if (
+            min_hours
+            and min_hours >= 1.5
+            and fill_round in (1, 3)
+            and _playlist_hours(chosen) < min_hours * _DURATION_FILL_RATIO
+        ):
+            progress(
+                f"Stage 5 — expanding reference pools for duration fill "
+                f"(round {fill_round})"
+            )
+            _ingest_reference_harvest(
+                label=f"5/refs-r{fill_round}",
+                max_playlists=10 if long_session else 6,
+                tracks_per_playlist=45 if long_session else 35,
+                max_raw_tracks=280 if long_session else 160,
+                max_pools=7 if long_session else 6,
+                max_queries=18 if long_session else 12,
+            )
         fill_specs = in_style_deep_fill_queries(
             analysis,
             lyrics,
             fill_round=fill_round,
-            max_queries=14,
+            max_queries=18 if long_session else 14,
         )
         if not fill_specs and cinema:
             fill_specs = cinema[:8]
@@ -901,8 +1067,8 @@ def _select_overall(
             else InstrumentalStrictness.PERMISSIVE,
             progress=progress,
             label=f"5/in-style-r{fill_round}",
-            early_stop_raw=140 if (min_hours and min_hours >= 2) else 80,
-            limit_per_query=30,
+            early_stop_raw=160 if long_session else 80,
+            limit_per_query=40 if long_session else 30,
             taste=taste,
             analysis=analysis,
         )

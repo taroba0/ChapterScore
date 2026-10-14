@@ -1829,11 +1829,17 @@ def drop_reading_band_outliers(
     book_energy: float | None = None,
     intimacy_vs_epic: float | None = None,
     max_dev: float | None = None,
+    relax_when_features_missing: bool = True,
 ) -> list[RankedTrack]:
     """
     Hard-drop tracks outside the narrow reading energy band around the target.
 
     Prefer a shorter cohesive playlist over keeping a scene-matched intensity spike.
+
+    When Spotify audio-features are unavailable for most tracks, lexical energy
+    estimates cluster around ~0.45 and a tight ±0.14 band can collapse a long
+    request to a handful of intimate-titled tracks. In that case we widen the
+    band (and fall back to closest-N) so duration targeting can still work.
     """
     if not tracks:
         return []
@@ -1848,6 +1854,14 @@ def drop_reading_band_outliers(
         )
     except Exception:
         band = max_dev if max_dev is not None else 0.14
+
+    # Detect missing audio-features (common: HTTP 403 on /audio-features)
+    n_feat = sum(1 for t in tracks if t.features.get("energy") is not None)
+    feat_ratio = n_feat / max(1, len(tracks))
+    if relax_when_features_missing and feat_ratio < 0.35:
+        # Widen enough that default heuristic energy 0.45 survives intimate targets
+        band = max(band, 0.28)
+
     ceiling = reading_energy_ceiling()
     kept: list[RankedTrack] = []
     for t in tracks:
@@ -1857,10 +1871,26 @@ def drop_reading_band_outliers(
         if abs(te - target) > band:
             continue
         kept.append(t)
-    # If the band was too tight and wiped the list, keep the closest half by |e-target|
-    if not kept and tracks:
+    # If the band wiped most of the pool, keep the closest tracks by |e-target|
+    # (not only when kept is empty — tiny leftovers like 2–3 tracks are the bug)
+    min_keep = max(8, min(len(tracks), 20))
+    if len(kept) < min_keep and tracks:
         ranked = sorted(tracks, key=lambda t: abs(track_energy_estimate(t) - target))
-        kept = [t for t in ranked[: max(3, len(ranked) // 2)] if track_energy_estimate(t) <= ceiling]
+        widened: list[RankedTrack] = []
+        seen: set[str] = set()
+        for t in kept + ranked:
+            tid = t.id or id(t)
+            if tid in seen:
+                continue
+            if track_energy_estimate(t) > ceiling:
+                continue
+            seen.add(tid)
+            widened.append(t)
+            if len(widened) >= max(min_keep, len(kept)):
+                # Prefer at least min_keep; stop once we have enough closest
+                if len(widened) >= min_keep:
+                    break
+        kept = widened[: max(min_keep, len(kept))] if widened else kept
     return kept
 
 

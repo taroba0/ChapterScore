@@ -3,6 +3,7 @@
 from chapterscore.models import LyricsPreference, RankedTrack, SearchQuerySpec
 from chapterscore.spotify.ranking import (
     InstrumentalStrictness,
+    drop_reading_band_outliers,
     is_likely_instrumental,
     passes_lyrics_filter,
     score_track,
@@ -319,3 +320,49 @@ def test_mixed_lyrics_mode_passes_vocals():
         features={"instrumentalness": 0.05, "speechiness": 0.1},
     )
     assert passes_lyrics_filter(vocal, LyricsPreference.NO) is True
+
+
+def test_drop_reading_band_keeps_min_when_features_missing():
+    """Missing audio-features must not collapse long pools to <8 keepers."""
+    tracks = [
+        _track(
+            f"m{i}",
+            name="Quiet Piece" if i % 3 == 0 else f"Song {i}",
+            artists=["Artist"],
+            features={},  # no energy feature
+        )
+        for i in range(30)
+    ]
+    # Intimate book target with default band would wipe heuristic 0.45 energies
+    kept = drop_reading_band_outliers(
+        tracks,
+        book_energy=0.28,
+        intimacy_vs_epic=0.8,
+        max_dev=0.14,
+        relax_when_features_missing=True,
+    )
+    assert len(kept) >= 8
+
+
+def test_drop_reading_band_closest_n_when_band_too_tight():
+    """Even with features, tiny leftovers expand to closest-N (≥8)."""
+    # 2 in tight band; rest under reading ceiling but outside ±0.10 of target
+    tracks = []
+    for i in range(25):
+        e = 0.30 if i < 2 else 0.48
+        tracks.append(
+            _track(
+                f"e{i}",
+                name=f"Track {i}",
+                artists=["A"],
+                features={"energy": e},
+            )
+        )
+    kept = drop_reading_band_outliers(
+        tracks,
+        book_energy=0.30,
+        intimacy_vs_epic=0.7,
+        max_dev=0.10,
+        relax_when_features_missing=False,
+    )
+    assert len(kept) >= 8

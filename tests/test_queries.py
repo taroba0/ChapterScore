@@ -5,6 +5,7 @@ from chapterscore.spotify.queries import (
     broaden_specs,
     cinematic_fallback_queries,
     expand_queries_from_analysis,
+    in_style_deep_fill_queries,
 )
 from chapterscore.spotify.search import build_search_string, search_string_variants
 
@@ -93,3 +94,27 @@ def test_search_variants_simplify():
     variants = search_string_variants("dark ambient desert empire intrigue instrumental")
     assert variants[0].startswith("dark")
     assert any(len(v.split()) <= 4 for v in variants)
+
+
+def test_romance_deep_fill_stays_cafe_soft_pop():
+    a = _analysis(
+        book_title="The Deal",
+        authors=["Elle Kennedy"],
+        overall_mood="flirty campus romance",
+        overall_energy=0.48,
+        atmospheres=["romantic", "playful", "intimate"],
+        era_feel="contemporary campus",
+        intimacy_vs_epic=0.78,
+        realism_vs_dreaminess=0.35,
+        setting_texture="college dorms campus coffee shops",
+        suitable_styles=["soft pop", "chill r&b", "indie folk"],
+        suggested_genres=["pop", "r&b"],
+        anti_generic_notes=["NOT epic trailer", "NOT pastoral"],
+        key_themes=["romance", "college"],
+        overall_search_queries=[SearchQuerySpec(query="campus soft pop", energy=0.45)],
+    )
+    specs = in_style_deep_fill_queries(a, LyricsPreference.ALLOW_LYRICS, fill_round=1, max_queries=12)
+    texts = " ".join(s.query.lower() for s in specs)
+    assert any(k in texts for k in ("cafe", "soft pop", "r&b", "rnb", "folk", "coffee", "indie"))
+    assert "salinas" not in texts
+    assert "dust bowl" not in texts

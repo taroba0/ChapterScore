@@ -340,8 +340,9 @@ def search_tracks(
     session = session or get_search_session()
     settings = get_settings()
     desired = limit or settings.chapterscore_max_search_results
-    desired = max(1, min(int(desired), 20))
-    pages = min(_MAX_PAGES_DEFAULT, max(1, (desired + _SEARCH_PAGE_SIZE - 1) // _SEARCH_PAGE_SIZE))
+    # Cap raised so multi-hour fill can page more than 20 hits per query
+    desired = max(1, min(int(desired), 40))
+    pages = min(max(_MAX_PAGES_DEFAULT, 4), max(1, (desired + _SEARCH_PAGE_SIZE - 1) // _SEARCH_PAGE_SIZE))
 
     collected: list[dict[str, Any]] = []
     seen: set[str] = set()
