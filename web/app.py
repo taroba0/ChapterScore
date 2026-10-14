@@ -1111,7 +1111,7 @@ def main() -> None:
 
     st.markdown("# ChapterScore")
     st.markdown(
-        '<p class="subtitle">Soundtracks for the books you love — in two easy steps</p>',
+        '<p class="subtitle">Every book deserves its own soundtrack</p>',
         unsafe_allow_html=True,
     )
 
