@@ -231,21 +231,67 @@ def _inject_theme_css() -> None:
     color: var(--cs-primary-fg) !important;
     border: 1px solid var(--cs-primary-bg) !important;
   }
-  /* Disabled — dark fill, white text, opacity ≥ 0.7 (readable) */
+  /* Disabled — dark gray fill + white/light text (readable, not black-on-black) */
   .stButton > button:disabled,
   .stButton > button[disabled],
   .stButton > button[kind="primary"]:disabled,
   .stButton > button[kind="primary"][disabled],
   .stButton > button[data-testid="baseButton-primary"]:disabled,
-  button[data-testid="stBaseButton-primary"]:disabled {
+  .stButton > button[data-testid="baseButton-primary"][disabled],
+  button[data-testid="stBaseButton-primary"]:disabled,
+  button[data-testid="stBaseButton-primary"][disabled] {
     background-color: var(--cs-disabled-bg) !important;
     color: var(--cs-disabled-fg) !important;
     border: 1px solid var(--cs-disabled-bg) !important;
-    opacity: 0.7 !important;
+    opacity: 0.85 !important;
     cursor: not-allowed !important;
   }
 
-  /* Copy-feedback custom button — explicit B&W, never wash out */
+  /* Streamlit 1.61: button labels are stMarkdownContainer p/span.
+     Global --cs-fg pin would force black text inside black primary buttons.
+     Make all button descendants inherit the button's own color. */
+  .stButton > button [data-testid="stMarkdownContainer"],
+  .stButton > button [data-testid="stMarkdownContainer"] p,
+  .stButton > button [data-testid="stMarkdownContainer"] span,
+  .stButton > button [data-testid="stMarkdownContainer"] *,
+  .stButton > button *,
+  .stLinkButton > a [data-testid="stMarkdownContainer"],
+  .stLinkButton > a [data-testid="stMarkdownContainer"] p,
+  .stLinkButton > a [data-testid="stMarkdownContainer"] span,
+  .stLinkButton > a [data-testid="stMarkdownContainer"] *,
+  .stLinkButton > a * {
+    color: inherit !important;
+  }
+  /* Primary / disabled: re-pin descendants to explicit fg (beats inherit races) */
+  .stButton > button[kind="primary"] [data-testid="stMarkdownContainer"],
+  .stButton > button[kind="primary"] [data-testid="stMarkdownContainer"] *,
+  .stButton > button[data-testid="baseButton-primary"] [data-testid="stMarkdownContainer"],
+  .stButton > button[data-testid="baseButton-primary"] [data-testid="stMarkdownContainer"] *,
+  .stButton > button[data-testid="baseButton-primary"] *,
+  button[data-testid="stBaseButton-primary"] [data-testid="stMarkdownContainer"],
+  button[data-testid="stBaseButton-primary"] [data-testid="stMarkdownContainer"] *,
+  button[data-testid="stBaseButton-primary"] *,
+  .stLinkButton > a[data-testid="stBaseLinkButton-primary"] [data-testid="stMarkdownContainer"],
+  .stLinkButton > a[data-testid="stBaseLinkButton-primary"] [data-testid="stMarkdownContainer"] *,
+  .stLinkButton > a[data-testid="stBaseLinkButton-primary"] * {
+    color: var(--cs-primary-fg) !important;
+  }
+  .stButton > button:disabled [data-testid="stMarkdownContainer"],
+  .stButton > button:disabled [data-testid="stMarkdownContainer"] *,
+  .stButton > button:disabled *,
+  .stButton > button[disabled] [data-testid="stMarkdownContainer"],
+  .stButton > button[disabled] [data-testid="stMarkdownContainer"] *,
+  .stButton > button[disabled] *,
+  button[data-testid="stBaseButton-primary"]:disabled [data-testid="stMarkdownContainer"],
+  button[data-testid="stBaseButton-primary"]:disabled [data-testid="stMarkdownContainer"] *,
+  button[data-testid="stBaseButton-primary"]:disabled *,
+  button[data-testid="stBaseButton-primary"][disabled] [data-testid="stMarkdownContainer"],
+  button[data-testid="stBaseButton-primary"][disabled] [data-testid="stMarkdownContainer"] *,
+  button[data-testid="stBaseButton-primary"][disabled] * {
+    color: var(--cs-disabled-fg) !important;
+  }
+
+  /* Copy-feedback custom button — black bg + white text (and children) */
   #cs-copy-feedback {
     background-color: var(--cs-primary-bg) !important;
     color: var(--cs-primary-fg) !important;
@@ -254,6 +300,9 @@ def _inject_theme_css() -> None:
     font-family: "Inter", sans-serif !important;
     font-weight: 600 !important;
     opacity: 1 !important;
+  }
+  #cs-copy-feedback, #cs-copy-feedback * {
+    color: var(--cs-primary-fg) !important;
   }
   #cs-copy-feedback:hover {
     filter: brightness(1.08);
@@ -750,73 +799,19 @@ def _render_step2(settings) -> None:
         unsafe_allow_html=True,
     )
 
-    # ── Locked preview: defaults summary + Generate disabled + Personalize locked ──
+    # ── Locked shell: no Generate / Personalize until Step 1 confirmed ──
     if not unlocked:
         st.caption(
-            "🔒 Complete Step 1 and confirm the book to unlock generation."
+            "🔒 Complete Step 1 and confirm the book to unlock Personalize & Generate."
         )
         st.markdown(
             '<div class="cs-defaults-summary">'
-            "<strong>Defaults</strong> (used when you Generate)<br>"
-            "· Playlist length: recommended hours from reading estimate<br>"
-            "· Lyrics: Allow lyrics / vocals recommended for campus romance books "
-            "(not forced)"
+            "<strong>Step 2 is locked</strong><br>"
+            "Select and confirm a book in Step 1. Then you can personalize length, "
+            "lyrics, and taste, and generate your playlist."
             "</div>",
             unsafe_allow_html=True,
         )
-        st.button(
-            "Generate Playlist",
-            type="primary",
-            disabled=True,
-            use_container_width=True,
-            key="locked_generate",
-        )
-        with st.expander("Personalize", expanded=False):
-            st.caption("Unlock Step 1 to change length, lyrics, taste, and more.")
-            st.selectbox(
-                "Length preference",
-                options=[
-                    "Recommended",
-                    "Custom hours",
-                    "Track count instead",
-                    "No length target",
-                ],
-                disabled=True,
-                key="locked_length",
-            )
-            st.selectbox(
-                "Lyrics preference",
-                options=["Allow lyrics", "Prefer instrumental", "Instrumental only"],
-                disabled=True,
-                key="locked_lyrics",
-            )
-            st.selectbox(
-                "Personal taste (Top Artists)",
-                options=["disable", "top5", "top10", "top15"],
-                index=2,
-                disabled=True,
-                key="locked_taste",
-            )
-            st.slider(
-                "Comfort ↔ Explorative",
-                0,
-                100,
-                25,
-                disabled=True,
-                key="locked_explore",
-            )
-            st.toggle(
-                "Use Spotify Recommendations API",
-                value=True,
-                disabled=True,
-                key="locked_recs",
-            )
-            st.checkbox(
-                "Dry run (analyze / search plan only — no Spotify playlist write)",
-                value=False,
-                disabled=True,
-                key="locked_dry_run",
-            )
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
