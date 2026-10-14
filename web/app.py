@@ -83,64 +83,134 @@ st.set_page_config(
 
 st.markdown(
     """
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,400;6..72,600;6..72,700&display=swap" rel="stylesheet">
     <style>
+      /* Direction A — B&W minimal: white ground, black/gray type, hairline borders */
+      html, body, [data-testid="stAppViewContainer"], .stApp {
+        background: #ffffff !important;
+        color: #111111;
+        font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+      }
       .block-container {
-        padding-top: 2rem;
-        padding-bottom: 3rem;
+        padding-top: 2.5rem;
+        padding-bottom: 4rem;
         max-width: 740px;
       }
-      h1 {
-        font-weight: 700 !important;
+      h1, h2, h3, h4, h5, h6,
+      [data-testid="stMarkdownContainer"] h1,
+      [data-testid="stMarkdownContainer"] h2,
+      [data-testid="stMarkdownContainer"] h3 {
+        font-family: "Newsreader", "Times New Roman", Georgia, serif !important;
+        font-weight: 600 !important;
         letter-spacing: -0.02em;
-        margin-bottom: 0.25rem !important;
+        color: #000000 !important;
+      }
+      h1, [data-testid="stMarkdownContainer"] h1 {
+        text-align: left !important;
+        font-size: 2.35rem !important;
+        margin-bottom: 0.35rem !important;
+        font-weight: 700 !important;
       }
       .subtitle {
-        color: #6b7280;
+        font-family: "Inter", sans-serif !important;
+        color: #6b6b6b;
         font-size: 1.05rem;
-        margin-bottom: 1.25rem;
+        margin: 0 0 2rem 0;
+        text-align: left;
+        font-weight: 400;
+      }
+      /* Primary = solid black; secondary = outlined black */
+      .stButton > button[kind="primary"],
+      .stButton > button[data-testid="baseButton-primary"],
+      button[data-testid="stBaseButton-primary"],
+      .stLinkButton > a[data-testid="stBaseLinkButton-primary"] {
+        background-color: #000000 !important;
+        color: #ffffff !important;
+        border: 1px solid #000000 !important;
+      }
+      .stButton > button[kind="primary"]:hover,
+      .stButton > button[data-testid="baseButton-primary"]:hover,
+      button[data-testid="stBaseButton-primary"]:hover,
+      .stLinkButton > a[data-testid="stBaseLinkButton-primary"]:hover {
+        background-color: #222222 !important;
+        border-color: #222222 !important;
+        color: #ffffff !important;
       }
       .stButton > button, .stLinkButton > a {
         width: 100%;
+        font-family: "Inter", sans-serif !important;
         font-weight: 600;
         padding: 0.65rem 1rem;
-        border-radius: 0.6rem;
+        border-radius: 0.35rem;
+        border: 1px solid #000000 !important;
+        background-color: #ffffff !important;
+        color: #000000 !important;
       }
-      div[data-testid="stMetricValue"] { font-size: 1.35rem; }
+      .stButton > button:hover, .stLinkButton > a:hover {
+        background-color: #f5f5f5 !important;
+        border-color: #000000 !important;
+        color: #000000 !important;
+      }
+      /* Re-assert primary after the general rule */
+      .stButton > button[kind="primary"],
+      .stButton > button[data-testid="baseButton-primary"],
+      button[data-testid="stBaseButton-primary"],
+      .stLinkButton > a[data-testid="stBaseLinkButton-primary"] {
+        background-color: #000000 !important;
+        color: #ffffff !important;
+        border: 1px solid #000000 !important;
+      }
+      div[data-testid="stMetricValue"] {
+        font-size: 1.35rem;
+        font-family: "Inter", sans-serif !important;
+        color: #111111 !important;
+      }
       .result-card {
-        background: linear-gradient(145deg, #f8fafc 0%, #f1f5f9 100%);
-        border: 1px solid #e2e8f0;
-        border-radius: 1rem;
+        background: #ffffff;
+        border: 1px solid #e5e5e5;
+        border-radius: 0.5rem;
         padding: 1.25rem 1.5rem;
         margin-top: 0.5rem;
       }
       .step-card {
-        border: 1px solid #e2e8f0;
-        border-radius: 0.9rem;
-        padding: 1.1rem 1.25rem 1.25rem;
-        margin-bottom: 1rem;
+        border: 1px solid #e5e5e5;
+        border-radius: 0.5rem;
+        padding: 1.25rem 1.35rem 1.35rem;
+        margin-bottom: 1.25rem;
         background: #ffffff;
       }
       .step-card.locked {
         opacity: 0.55;
-        background: #f8fafc;
+        background: #fafafa;
       }
       .step-badge {
         display: inline-block;
+        font-family: "Inter", sans-serif !important;
         font-size: 0.75rem;
         font-weight: 700;
         letter-spacing: 0.04em;
         text-transform: uppercase;
-        color: #64748b;
+        color: #8a8a8a;
         margin-bottom: 0.35rem;
       }
-      .step-badge.active { color: #7c3aed; }
-      .step-badge.done { color: #059669; }
+      .step-badge.active { color: #000000; }
+      .step-badge.done { color: #444444; }
       .confirm-box {
-        background: #f0fdf4;
-        border: 1px solid #bbf7d0;
-        border-radius: 0.75rem;
+        background: #fafafa;
+        border: 1px solid #e5e5e5;
+        border-radius: 0.5rem;
         padding: 0.9rem 1rem;
         margin: 0.75rem 0;
+      }
+      /* Soften Streamlit accents toward grayscale */
+      [data-testid="stSidebar"] {
+        background: #fafafa !important;
+        border-right: 1px solid #e5e5e5;
+      }
+      hr, [data-testid="stDivider"] {
+        border-color: #e5e5e5 !important;
       }
       footer { visibility: hidden; }
     </style>
@@ -938,7 +1008,7 @@ def _render_results() -> None:
                   <div style="font-size:1.25rem;font-weight:700;margin-bottom:0.35rem;">
                     {pl.get("name", "Playlist")}
                   </div>
-                  <div style="color:#64748b;margin-bottom:0.75rem;">
+                  <div style="color:#6b6b6b;margin-bottom:0.75rem;">
                     {dur_bits}
                   </div>
                 </div>
